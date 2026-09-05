@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncGenerator
 
 import freezegun
@@ -33,6 +34,19 @@ async def test_key_expiry(local_coordination_service: CoordinationService) -> No
 
     with freezegun.freeze_time("2024-01-01 12:00:16"):
         assert await local_coordination_service.get_value("foo") is None
+
+
+async def test_pop_value_has_only_one_winner(
+    local_coordination_service: CoordinationService,
+) -> None:
+    await local_coordination_service.set_value("one-time", "secret", ttl=60)
+
+    results = await asyncio.gather(
+        *(local_coordination_service.pop_value("one-time") for _ in range(10))
+    )
+
+    assert results.count("secret") == 1
+    assert results.count(None) == 9
 
 
 async def test_increment(coordination_service: SqliteCoordinationService) -> None:

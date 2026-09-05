@@ -7,6 +7,7 @@ import SearchModal from './components/SearchModal.js';
 import TaskPanel from './components/TaskPanel.js';
 import FileCard from './components/FileCard.js';
 import LoginCard from './components/LoginCard.js';
+import OAuthConsentCard from './components/OAuthConsentCard.js';
 import FileViewer from './components/FileViewer.js';
 import SystemPanel from './components/SystemPanel.js';
 import MoveModal from './components/MoveModal.js';
@@ -80,6 +81,7 @@ createApp({
         TaskPanel,
         FileCard,
         LoginCard,
+        OAuthConsentCard,
         FileViewer,
         SystemPanel,
         MoveModal,
@@ -89,6 +91,10 @@ createApp({
         // Auth State
         const isLoggedIn = ref(false);
         const loginError = ref(null);
+        const oauthReturnTo = ref(null);
+        const oauthConsentRequest = ref(null);
+        const oauthConsentError = ref(null);
+        const isSubmittingOAuthConsent = ref(false);
         const showSystemPanel = ref(false);
 
         // Theme Mode
@@ -318,14 +324,98 @@ createApp({
             return true;
         }
 
+        function getOAuthReturnTo() {
+            const clean = (window.location.hash || '').replace(/^#\/?/, '');
+            if (!clean.startsWith('login?')) return null;
+
+            const returnTo = new URLSearchParams(clean.slice(clean.indexOf('?') + 1)).get('return_to');
+            if (!returnTo) return null;
+
+            try {
+                const target = new URL(returnTo, window.location.origin);
+                if (target.origin !== window.location.origin || target.pathname !== '/login-bridge') {
+                    return null;
+                }
+                return target.pathname + target.search;
+            } catch {
+                return null;
+            }
+        }
+
+        async function submitOAuthBridge(consent = null) {
+            if (!oauthReturnTo.value) return false;
+
+            const token = getToken();
+            if (!token) return false;
+            const options = {
+                method: 'POST',
+                headers: { 'x-access-token': token }
+            };
+            if (consent) {
+                options.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+                options.body = new URLSearchParams({ consent });
+            }
+
+            const response = await fetch(oauthReturnTo.value, options);
+            const result = await response.json();
+            if (response.status === 401) {
+                logout();
+                return true;
+            }
+            if (!response.ok) {
+                throw new Error(result.error_description || result.error || 'OAuth authorization failed');
+            }
+            if (result.redirect_url) {
+                window.location.assign(result.redirect_url);
+                return true;
+            }
+            if (result.consent_required) {
+                oauthConsentRequest.value = result;
+                return true;
+            }
+            throw new Error('OAuth authorization returned an invalid response');
+        }
+
+        async function resumeOAuthIfNeeded() {
+            oauthReturnTo.value = getOAuthReturnTo();
+            if (!oauthReturnTo.value) return false;
+            try {
+                oauthConsentError.value = null;
+                return await submitOAuthBridge();
+            } catch (e) {
+                oauthConsentError.value = e.message;
+                const target = new URL(oauthReturnTo.value, window.location.origin);
+                oauthConsentRequest.value = {
+                    client_id: target.searchParams.get('client_id') || 'OAuth client',
+                    scopes: []
+                };
+                return true;
+            }
+        }
+
+        async function handleOAuthDecision(consent) {
+            isSubmittingOAuthConsent.value = true;
+            oauthConsentError.value = null;
+            try {
+                await submitOAuthBridge(consent);
+            } catch (e) {
+                oauthConsentError.value = e.message;
+            } finally {
+                isSubmittingOAuthConsent.value = false;
+            }
+        }
+
         async function handleLogin({ email, password }) {
             loginError.value = null;
             try {
                 await login(email, password);
                 const loggedIn = await resumeSession();
                 if (loggedIn) {
-                    await syncFromUrl(true);
-                    updateUrl(true);
+                    const isOAuth = await resumeOAuthIfNeeded();
+                    if (!isOAuth) {
+                        await syncFromUrl(true);
+                        updateUrl(true);
+                    }
                 }
             } catch (e) {
                 loginError.value = e.message;
@@ -343,8 +433,11 @@ createApp({
             }
             const loggedIn = await resumeSession();
             if (loggedIn) {
-                await syncFromUrl(true);
-                updateUrl(true);
+                const isOAuth = await resumeOAuthIfNeeded();
+                if (!isOAuth) {
+                    await syncFromUrl(true);
+                    updateUrl(true);
+                }
             }
 
             window.addEventListener('popstate', () => syncFromUrl());
@@ -384,6 +477,10 @@ createApp({
             isLoggedIn,
             handleLogin,
             handleLogout,
+            oauthConsentRequest,
+            oauthConsentError,
+            isSubmittingOAuthConsent,
+            handleOAuthDecision,
             isDarkMode,
             toggleTheme,
             activeTab,

@@ -73,7 +73,10 @@
 
         <main class="flex-grow max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
             <template v-if="isLoggedIn">
-                <template v-if="activeTab === 'files' || activeTab === 'explorer' || activeTab === 'dashboard'">
+                <oauth-consent-card v-if="oauthConsentRequest" :request="oauthConsentRequest"
+                    :error="oauthConsentError" :is-submitting="isSubmittingOAuthConsent"
+                    @decision="handleOAuthDecision"></oauth-consent-card>
+                <template v-else-if="activeTab === 'files' || activeTab === 'explorer' || activeTab === 'dashboard'">
                 <!-- Breadcrumbs -->
                 <nav
                     class="flex mb-8 text-sm font-medium text-slate-500 items-center overflow-x-auto whitespace-nowrap pb-2">

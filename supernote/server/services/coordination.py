@@ -99,22 +99,24 @@ class SqliteCoordinationService(CoordinationService):
     async def pop_value(self, key: str) -> str | None:
         """Get and delete a value atomically."""
         async with self._session_manager.session() as session:
-            # Traditional Select then Delete to avoid issues with RETURNING in some sqlite/alchemy versions
-            stmt = select(KeyValueDO).where(KeyValueDO.key == key)
+            # A single DELETE ... RETURNING statement prevents two concurrent
+            # consumers from both observing the same one-time value.
+            stmt = (
+                delete(KeyValueDO)
+                .where(KeyValueDO.key == key)
+                .returning(KeyValueDO.value, KeyValueDO.expiry)
+            )
             result = await session.execute(stmt)
-            kv = result.scalar_one_or_none()
+            row = result.one_or_none()
 
-            if not kv:
+            if not row:
                 return None
 
-            value = kv.value
-            expiry = kv.expiry
-            await session.delete(kv)
             await session.commit()
 
-            if time.time() > expiry:
+            if time.time() > row.expiry:
                 return None
-            return str(value)
+            return str(row.value)
 
     async def increment(self, key: str, amount: int = 1, ttl: int | None = None) -> int:
         """Atomically increment a value. Returns the new value.
