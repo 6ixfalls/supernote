@@ -26,6 +26,11 @@ DEFAULT_TIMEOUT: float = 5.0
 """Default timeout in seconds for Socket.IO request/response operations."""
 
 
+def _redact_socket_url(url: str) -> str:
+    """Avoid echoing device handshake credentials to debug logs."""
+    return url.split("?", 1)[0] + "?<credentials redacted>"
+
+
 class SupernoteSocketClient:
     """Async Socket.IO client for interacting with the Supernote real-time server."""
 
@@ -92,7 +97,7 @@ class SupernoteSocketClient:
         )
 
         url = f"{self.host}/?{query_string}"
-        logger.debug("Connecting to Socket.IO server at %s", url)
+        logger.debug("Connecting to Socket.IO server at %s", _redact_socket_url(url))
         await self._sio.connect(
             url,
             socketio_path="socket.io",

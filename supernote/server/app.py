@@ -61,7 +61,48 @@ from .utils.url_signer import UrlSigner
 
 logger = logging.getLogger(__name__)
 
-TRUNCATE_BODY_LOG = 10 * 1024
+TRACE_BODY_LOG_LIMIT = 2 * 1024
+REDACTED = "***"
+OMITTED_SENSITIVE_BODY = "<sensitive body omitted>"
+# Raw request targets (%r) and referrers can contain credentials.
+ACCESS_LOG_FORMAT = '%a %t %s %b "%{User-Agent}i" (%Tf)'
+
+# Bodies on these endpoints contain passwords, authentication proofs, session
+# tokens, password-reset material, or OAuth credentials. Do not rely on field
+# redaction alone: new fields added to these schemas must remain safe by default.
+SENSITIVE_TRACE_PATH_PREFIXES = (
+    "/api/equipment/",
+    "/api/official/user/",
+    "/api/terminal/",
+    "/api/user/",
+    "/authorize",
+    "/login-bridge",
+    "/socket.io",
+    "/token",
+)
+
+SENSITIVE_FIELD_NAMES = frozenset(
+    {
+        "access_token",
+        "authorization",
+        "bearer",
+        "client_secret",
+        "credential",
+        "id_token",
+        "jwt",
+        "password",
+        "password_proof",
+        "proof",
+        "refresh_token",
+        "secret",
+        "signature",
+        "token",
+    }
+)
+CANONICAL_SENSITIVE_FIELD_NAMES = frozenset(
+    "".join(character for character in name if character.isalnum())
+    for name in SENSITIVE_FIELD_NAMES
+)
 
 
 async def _write_trace_log(config: ServerConfig, log_entry: dict[str, Any]) -> None:
@@ -93,7 +134,9 @@ async def trace_middleware(
         response = await handler(request)
         # Capture Request Body (SAFELY AFTER HANDLER)
         req_body_str = None
-        if "/api/oss/upload" in request.path:
+        if _is_sensitive_trace_path(request.path):
+            req_body_str = OMITTED_SENSITIVE_BODY
+        elif "/api/oss/upload" in request.path:
             req_body_str = "<multipart upload skipped>"
         elif request.can_read_body and not request.content_type.startswith(
             "multipart/"
@@ -101,23 +144,21 @@ async def trace_middleware(
             try:
                 # aiohttp allows reading multiple times once buffered
                 body_bytes = await request.read()
-                req_body_str = body_bytes.decode("utf-8", errors="replace")
-                if len(req_body_str) > TRUNCATE_BODY_LOG:
-                    req_body_str = req_body_str[:2048] + "... (truncated)"
+                req_body_str = _trace_body(body_bytes)
             except Exception:
                 req_body_str = "<error reading body>"
 
         # Capture Response Body
         res_body_str = None
-        if isinstance(response, web.Response) and response.body:
+        if _is_sensitive_trace_path(request.path):
+            res_body_str = OMITTED_SENSITIVE_BODY
+        elif isinstance(response, web.Response) and response.body:
             if is_binary_content_type(response.content_type):
                 res_body_str = "<binary data>"
             else:
                 try:
                     if isinstance(response.body, bytes):
-                        res_body_str = response.body.decode("utf-8", errors="replace")
-                        if len(res_body_str) > TRUNCATE_BODY_LOG:
-                            res_body_str = res_body_str[:2048] + "... (truncated)"
+                        res_body_str = _trace_body(response.body)
                 except Exception:
                     res_body_str = "<error reading response>"
 
@@ -128,27 +169,31 @@ async def trace_middleware(
                 "method": request.method,
                 "url": str(_redact_url(request.url)),
                 "headers": _sanitize_headers(dict(request.headers)),
-                "body": try_parse_json(req_body_str),
+                "body": _sanitize_body(req_body_str),
             },
             "response": {
                 "status": response.status,
                 "headers": _sanitize_headers(dict(response.headers)),
-                "body": try_parse_json(res_body_str),
+                "body": _sanitize_body(res_body_str),
             },
         }
         await _write_trace_log(request.app["config"], log_entry)
         return response
 
     except Exception as e:
-        logger.exception(f"Error handling request: {e}")
+        logger.error("Error handling request (%s)", type(e).__name__)
         # Try to capture body even on error
-        req_body_str = "<unknown>"
-        try:
-            if request.can_read_body:
-                body_bytes = await request.read()
-                req_body_str = body_bytes.decode("utf-8", errors="replace")
-        except Exception:
-            pass
+        req_body_str = (
+            OMITTED_SENSITIVE_BODY
+            if _is_sensitive_trace_path(request.path)
+            else "<unknown>"
+        )
+        if req_body_str != OMITTED_SENSITIVE_BODY:
+            try:
+                if request.can_read_body:
+                    req_body_str = _trace_body(await request.read())
+            except Exception:
+                pass
 
         log_entry = {
             "timestamp": time.time(),
@@ -156,9 +201,10 @@ async def trace_middleware(
                 "method": request.method,
                 "url": str(_redact_url(request.url)),
                 "headers": _sanitize_headers(dict(request.headers)),
-                "body": try_parse_json(req_body_str),
+                "body": _sanitize_body(req_body_str),
             },
-            "error": str(e),
+            # Exception messages can echo attacker-controlled input or secrets.
+            "error": type(e).__name__,
             "status": 500,
         }
         await _write_trace_log(request.app["config"], log_entry)
@@ -226,6 +272,65 @@ def try_parse_json(body: str | None) -> Any:
         return body
 
 
+def _bounded_body(body: bytes) -> str:
+    """Decode at most the configured number of bytes for a trace entry."""
+    truncated = len(body) > TRACE_BODY_LOG_LIMIT
+    value = body[:TRACE_BODY_LOG_LIMIT].decode("utf-8", errors="replace")
+    return value + ("... (truncated)" if truncated else "")
+
+
+def _trace_body(body: bytes) -> Any:
+    """Sanitize a body as structured JSON before enforcing the size limit."""
+    decoded = body.decode("utf-8", errors="replace")
+    parsed = try_parse_json(decoded)
+    sanitized = _redact_sensitive_fields(parsed)
+    if len(body) <= TRACE_BODY_LOG_LIMIT:
+        return sanitized
+
+    # Serialize redacted structured data before truncating so a credential near
+    # the start of a large, valid JSON document cannot bypass schema redaction.
+    if not isinstance(sanitized, str):
+        decoded = json.dumps(sanitized, separators=(",", ":"))
+    return _bounded_body(decoded.encode("utf-8"))
+
+
+def _is_sensitive_trace_path(path: str) -> bool:
+    path = path.lower()
+    return any(path.startswith(prefix) for prefix in SENSITIVE_TRACE_PATH_PREFIXES)
+
+
+def _normalized_field_name(name: Any) -> str:
+    return str(name).strip().lower().replace("-", "_")
+
+
+def _is_sensitive_field(name: Any) -> bool:
+    normalized = _normalized_field_name(name)
+    canonical = "".join(character for character in normalized if character.isalnum())
+    return (
+        normalized in SENSITIVE_FIELD_NAMES
+        or canonical in CANONICAL_SENSITIVE_FIELD_NAMES
+        or canonical.endswith("token")
+    )
+
+
+def _redact_sensitive_fields(value: Any) -> Any:
+    """Recursively redact credential-bearing JSON fields."""
+    if isinstance(value, dict):
+        return {
+            key: (
+                REDACTED if _is_sensitive_field(key) else _redact_sensitive_fields(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive_fields(item) for item in value]
+    return value
+
+
+def _sanitize_body(body: Any) -> Any:
+    return _redact_sensitive_fields(try_parse_json(body))
+
+
 def is_binary_content_type(content_type: str) -> bool:
     """Check if content type is likely binary."""
     binary_types = [
@@ -240,28 +345,30 @@ def is_binary_content_type(content_type: str) -> bool:
 
 
 def _sanitize_headers(headers: dict[str, Any]) -> dict[str, Any]:
-    new_headers = headers.copy()
-    if "x-access-token" in new_headers:
-        new_headers["x-access-token"] = "***"
-    if "Authorization" in new_headers:
-        new_headers["Authorization"] = "***"
-    return new_headers
+    return {
+        key: REDACTED if _is_sensitive_header(key) else value
+        for key, value in headers.items()
+    }
+
+
+def _is_sensitive_header(name: Any) -> bool:
+    normalized = _normalized_field_name(name)
+    return (
+        normalized in {"authorization", "cookie", "proxy_authorization", "set_cookie"}
+        or "token" in normalized
+        or normalized.endswith("_api_key")
+    )
 
 
 def _redact_url(url: Any) -> str:
     """Redact sensitive query parameters from URL."""
-    # Handle yarl.URL or string
     url_str = str(url)
-    if "signature=" not in url_str and "token=" not in url_str:
-        return url_str
-
     try:
         u = URL(url_str)
-        query = u.query.copy()
-        if "signature" in query:
-            query["signature"] = "***"
-        if "token" in query:
-            query["token"] = "***"
+        query = [
+            (key, REDACTED if _is_sensitive_field(key) else value)
+            for key, value in u.query.items()
+        ]
         return str(u.with_query(query))
     except Exception:
         return url_str
@@ -451,7 +558,8 @@ def create_app(config: ServerConfig) -> web.Application:
         app.middlewares.append(socketio_compat_middleware)
         if config.metrics_enabled:
             app.middlewares.append(metrics_middleware)
-        app.middlewares.append(trace_middleware)
+        if config.trace_log_file:
+            app.middlewares.append(trace_middleware)
         app.middlewares.append(jwt_auth_middleware)
 
         logger.info("Running database migrations...")
@@ -534,9 +642,6 @@ def run(args: Any) -> None:
     config_dir = getattr(args, "config_dir", None)
     config = ServerConfig.load(config_dir)
     app = create_app(config)
-
-    # Standard access log format for aiohttp
-    ACCESS_LOG_FORMAT = '%a %t "%r" %s %b "%{Referer}i" "%{User-Agent}i" (%Tf)'
 
     web.run_app(
         app,

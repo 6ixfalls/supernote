@@ -10,7 +10,8 @@ port: 8080
 # Directory where uploaded files and databases will be stored.
 storage_dir: storage
 
-# Optional: Path to trace log file for debugging (default: storage/system/trace.log)
+# Optional: Path to trace log file for debugging (disabled by default).
+# Trace bodies are sanitized, but the file should still be access-controlled.
 # trace_log_file: storage/system/trace.log
 
 # Proxy header handling mode (optional, defaults to 'relaxed')

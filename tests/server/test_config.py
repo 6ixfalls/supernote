@@ -28,6 +28,7 @@ def test_server_config_defaults(tmp_path: Path) -> None:
     assert config.storage_dir == "storage"
     assert config.auth.secret_key != ""  # Should be generated in-memory
     assert config.auth.allow_unauthenticated_binds is False
+    assert config.trace_log_file is None
 
 
 def test_server_config_load_from_file(tmp_path: Path) -> None:
@@ -72,6 +73,22 @@ def test_server_config_env_var_override(tmp_path: Path) -> None:
         assert config.host == "1.2.3.4"
         assert config.port == 5555
         assert config.auth.allow_unauthenticated_binds is True
+
+
+def test_trace_log_file_env_enables_and_disables_logging(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("trace_log_file: configured-trace.log\n")
+
+    with patch.dict(
+        os.environ,
+        {"SUPERNOTE_TRACE_LOG_FILE": "environment-trace.log"},
+    ):
+        config = ServerConfig.load(config_file=config_file)
+        assert config.trace_log_file == "environment-trace.log"
+
+    with patch.dict(os.environ, {"SUPERNOTE_TRACE_LOG_FILE": ""}):
+        config = ServerConfig.load(config_file=config_file)
+        assert config.trace_log_file is None
 
 
 def test_example_config_is_valid() -> None:

@@ -34,7 +34,8 @@ Direct access to files (uploads/downloads) is secured using **Signed URLs**.
     - **Benefit**: Prevents replay attacks where an intercepted signed URL could be reused.
 
 ### Log Redaction
-- **Trace Logs**: The request tracing middleware automatically redacts sensitive query parameters (`signature`, `token`) from logs to prevent credentials from leaking into log files.
+- **Trace Logs**: Request tracing is disabled by default and can be explicitly enabled with `trace_log_file` or `SUPERNOTE_TRACE_LOG_FILE`. Sensitive routes omit bodies, credential fields and headers are redacted case-insensitively, and captured bodies are bounded.
+- **Access Logs**: Access logs omit raw request targets and referrers so Socket.IO query-string credentials cannot be recorded. Client debug logs redact the complete handshake query string.
 
 ## Data Storage & Integrity
 

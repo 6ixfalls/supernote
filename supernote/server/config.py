@@ -94,7 +94,7 @@ class ServerConfig(DataClassYAMLMixin):
     trace_log_file: str | None = None
     """Path to trace log file.
 
-    This will default to a file in the storage directory if unset.
+    Trace logging is disabled when unset.
 
     Env Var: `SUPERNOTE_TRACE_LOG_FILE`
     """
@@ -273,6 +273,14 @@ BaseConfig
             config.storage_dir = os.getenv("SUPERNOTE_STORAGE_DIR", config.storage_dir)
             logger.info(f"Using SUPERNOTE_STORAGE_DIR: {config.storage_dir}")
 
+        if "SUPERNOTE_TRACE_LOG_FILE" in os.environ:
+            trace_log_file = os.environ["SUPERNOTE_TRACE_LOG_FILE"].strip()
+            config.trace_log_file = trace_log_file or None
+            logger.info(
+                "Trace logging %s via SUPERNOTE_TRACE_LOG_FILE",
+                "enabled" if config.trace_log_file else "disabled",
+            )
+
         if os.getenv("SUPERNOTE_BASE_URL"):
             config._base_url = os.getenv("SUPERNOTE_BASE_URL")
             logger.info(f"Using SUPERNOTE_BASE_URL: {config._base_url}")
@@ -361,11 +369,6 @@ BaseConfig
         if metrics_path := os.getenv("SUPERNOTE_METRICS_PATH"):
             config.metrics_path = metrics_path
             logger.info(f"Using SUPERNOTE_METRICS_PATH: {config.metrics_path}")
-
-        if config.trace_log_file is None:
-            config.trace_log_file = str(
-                Path(config.storage_dir) / "system" / "trace.log"
-            )
 
         if not config_file.exists():
             logger.info(f"Saving config to {config_file}")
