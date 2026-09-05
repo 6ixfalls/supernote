@@ -47,6 +47,14 @@ class AuthConfig(DataClassYAMLMixin):
     Env Var: `SUPERNOTE_ENABLE_REMOTE_PASSWORD_RESET`
     """
 
+    allow_unauthenticated_binds: bool = False
+    """Allow legacy clients to bind devices without a valid session.
+
+    When disabled, unauthenticated bind attempts require approval in the web UI.
+
+    Env Var: `SUPERNOTE_ALLOW_UNAUTHENTICATED_BINDS`
+    """
+
     class Config(BaseConfig):
         omit_none = True
         code_generation_options = [TO_DICT_ADD_OMIT_NONE_FLAG]  # type: ignore[list-item]
@@ -294,6 +302,16 @@ BaseConfig
             )
             logger.info(
                 f"Remote Password Reset Enabled: {config.auth.enable_remote_password_reset}"
+            )
+
+        if os.getenv("SUPERNOTE_ALLOW_UNAUTHENTICATED_BINDS"):
+            config.auth.allow_unauthenticated_binds = _get_bool_env(
+                "SUPERNOTE_ALLOW_UNAUTHENTICATED_BINDS",
+                config.auth.allow_unauthenticated_binds,
+            )
+            logger.info(
+                "Unauthenticated Device Binds Enabled: %s",
+                config.auth.allow_unauthenticated_binds,
             )
 
         if os.getenv("SUPERNOTE_PROXY_MODE"):

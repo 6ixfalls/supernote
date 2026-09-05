@@ -34,13 +34,16 @@ async def _login(client: TestClient, equipment_no: str) -> Any:
 
 
 async def test_device_binding_lifecycle(
-    create_test_user: Any, client: TestClient
+    create_test_user: Any, client: TestClient, server_config: Any
 ) -> None:
+    # Exercise the scraped legacy protocol in its explicit compatibility mode.
+    server_config.auth.allow_unauthenticated_binds = True
     equipment_a = "SN-A"
 
     # 1. Login WITHOUT binding
     data = await _login(client, equipment_a)
     assert data["success"] is True
+    equipment_a_token = data["token"]
     # Should not be bound yet
     assert data["isBind"] == "N"
     assert data["isBindEquipment"] == "N"
@@ -75,6 +78,7 @@ async def test_device_binding_lifecycle(
     # 5. Unlink Device A
     resp = await client.post(
         "/api/terminal/equipment/unlink",
+        headers={"x-access-token": equipment_a_token},
         json={"equipmentNo": equipment_a},
     )
     assert resp.status == 200

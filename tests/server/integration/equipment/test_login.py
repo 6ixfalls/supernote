@@ -42,8 +42,8 @@ async def test_query_server(client: TestClient) -> None:
 
 
 async def test_equipment_unlink(login_client: LoginClient) -> None:
-    res = await login_client.unlink_equipment(equipment_no="SN123456")
-    assert res.success
+    with pytest.raises(UnauthorizedException):
+        await login_client.unlink_equipment(equipment_no="SN123456")
 
 
 async def test_check_user_exists(
@@ -94,7 +94,9 @@ async def test_invalid_password(login_client: LoginClient) -> None:
         )
 
 
-async def test_bind_equipment(login_client: LoginClient) -> None:
+async def test_bind_equipment(
+    login_client: LoginClient, create_test_user: None
+) -> None:
     res = await login_client.bind_equipment(
         account=TEST_USERNAME,
         equipment_no="SN123456",

@@ -69,7 +69,6 @@ async def handle_activate_equipment(request: web.Request) -> web.Response:
 
 
 @routes.post("/api/terminal/equipment/unlink")
-@public_route
 async def handle_equipment_unlink(request: web.Request) -> web.Response:
     # Endpoint: POST /api/terminal/equipment/unlink
     # Purpose: Device requests to unlink itself from the account/server.
@@ -83,7 +82,14 @@ async def handle_equipment_unlink(request: web.Request) -> web.Response:
         )
 
     user_service: UserService = request.app["user_service"]
-    await user_service.unlink_equipment(unlink_req.equipment_no)
+    account = request.get("user")
+    if not account or not await user_service.unlink_equipment(
+        str(account), unlink_req.equipment_no
+    ):
+        return web.json_response(
+            create_error_response("Device is not bound to this account").to_dict(),
+            status=403,
+        )
     return web.json_response(BaseResponse().to_dict())
 
 
@@ -189,7 +195,83 @@ async def handle_bind_equipment(request: web.Request) -> web.Response:
         )
 
     user_service: UserService = request.app["user_service"]
-    await user_service.bind_equipment(bind_req.account, bind_req.equipment_no)
+    config = request.app["config"].auth
+
+    if config.allow_unauthenticated_binds:
+        if not await user_service.bind_equipment(
+            bind_req.account, bind_req.equipment_no
+        ):
+            return web.json_response(
+                create_error_response(
+                    "Device is already bound to another account"
+                ).to_dict()
+            )
+        return web.json_response(BaseResponse().to_dict())
+
+    if not await user_service.request_equipment_bind(
+        bind_req.account,
+        bind_req.equipment_no,
+        bind_req.name,
+        bind_req.total_capacity,
+    ):
+        return web.json_response(create_error_response("User not found").to_dict())
+
+    # Preserve the official device response contract while deferring the
+    # state-changing operation until the account owner approves it.
+    return web.json_response(BaseResponse().to_dict())
+
+
+@routes.get("/web/device-bind-requests")
+async def handle_list_equipment_bind_requests(request: web.Request) -> web.Response:
+    """List bind attempts awaiting approval by the authenticated account."""
+    account = str(request["user"])
+    user_service: UserService = request.app["user_service"]
+    pending = await user_service.list_equipment_bind_requests(account)
+    return web.json_response(
+        {
+            "success": True,
+            "requests": [
+                {
+                    "id": item.id,
+                    "equipmentNo": item.equipment_no,
+                    "name": item.name,
+                    "totalCapacity": item.total_capacity,
+                    "createTime": item.create_time,
+                }
+                for item in pending
+            ],
+        }
+    )
+
+
+@routes.post(r"/web/device-bind-requests/{request_id:\d+}/approve")
+async def handle_approve_equipment_bind_request(request: web.Request) -> web.Response:
+    """Approve a bind attempt for the authenticated account."""
+    user_service: UserService = request.app["user_service"]
+    try:
+        approved = await user_service.approve_equipment_bind_request(
+            str(request["user"]), int(request.match_info["request_id"])
+        )
+    except ValueError as err:
+        return web.json_response(create_error_response(str(err)).to_dict(), status=409)
+    if not approved:
+        return web.json_response(
+            create_error_response("Bind request not found").to_dict(), status=404
+        )
+    return web.json_response(BaseResponse().to_dict())
+
+
+@routes.post(r"/web/device-bind-requests/{request_id:\d+}/reject")
+async def handle_reject_equipment_bind_request(request: web.Request) -> web.Response:
+    """Reject a bind attempt for the authenticated account."""
+    user_service: UserService = request.app["user_service"]
+    rejected = await user_service.reject_equipment_bind_request(
+        str(request["user"]), int(request.match_info["request_id"])
+    )
+    if not rejected:
+        return web.json_response(
+            create_error_response("Bind request not found").to_dict(), status=404
+        )
     return web.json_response(BaseResponse().to_dict())
 
 

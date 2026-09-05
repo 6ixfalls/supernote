@@ -53,7 +53,17 @@ Direct access to files (uploads/downloads) is secured using **Signed URLs**.
 - **Remote Reset (Self-Service)**: The public `/api/official/user/retrieve/password` endpoint is **DISABLED** by default.
     - **Configuration**: Controlled by `SUPERNOTE_ENABLE_REMOTE_PASSWORD_RESET` (env) or `auth.enable_remote_password_reset` (yaml).
     - **Risk**: The legacy protocol allows resetting passwords with just an email/phone, which is insecure for a public endpoint.
-    - **Secure Alternative**: Administrators should use the CLI to reset user passwords.
+- **Secure Alternative**: Administrators should use the CLI to reset user passwords.
+
+### Device Binding
+
+- **Unauthenticated binding**: Disabled by default. Legacy bind attempts are stored
+  for the target account to approve or reject in the web UI.
+- **Configuration**: Controlled by `SUPERNOTE_ALLOW_UNAUTHENTICATED_BINDS` (env)
+  or `auth.allow_unauthenticated_binds` (YAML). Enabling it is intended only for
+  compatibility on trusted networks.
+- **Unlinking**: Requires a valid session and can only remove a device owned by
+  that session's account.
 
 ## Administration (CLI)
 

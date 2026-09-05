@@ -336,6 +336,43 @@ export async function fetchCapacity() {
     return await response.json();
 }
 
+/** Fetch device bind attempts awaiting approval. */
+export async function fetchDeviceBindRequests() {
+    const currentToken = getToken();
+    if (!currentToken) throw new Error("Unauthorized");
+
+    const response = await fetch('/web/device-bind-requests', {
+        headers: { 'x-access-token': currentToken }
+    });
+    if (!response.ok) {
+        throw new Error(`Failed to fetch device bind requests: ${response.statusText}`);
+    }
+    return await response.json();
+}
+
+/** Approve or reject a pending device bind. */
+export async function resolveDeviceBindRequest(requestId, decision) {
+    const currentToken = getToken();
+    if (!currentToken) throw new Error("Unauthorized");
+    if (decision !== 'approve' && decision !== 'reject') {
+        throw new Error("Invalid bind decision");
+    }
+
+    const response = await fetch(`/web/device-bind-requests/${requestId}/${decision}`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'x-access-token': currentToken
+        },
+        body: '{}'
+    });
+    const data = await response.json();
+    if (!response.ok) {
+        throw new Error(data.errorMsg || `Failed to ${decision} device bind`);
+    }
+    return data;
+}
+
 /**
  * Create a new folder.
  */

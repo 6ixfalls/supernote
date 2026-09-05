@@ -4,6 +4,7 @@ from unittest.mock import patch
 import jwt
 import pytest
 from aiohttp.test_utils import TestClient
+from sqlalchemy import select
 
 from supernote.client.admin import AdminClient
 from supernote.client.auth import AbstractAuth
@@ -11,7 +12,10 @@ from supernote.client.client import Client
 from supernote.client.exceptions import ApiException, UnauthorizedException
 from supernote.client.login_client import LoginClient
 from supernote.client.web import WebClient
+from supernote.models.user import UserRegisterDTO
 from supernote.server.config import ServerConfig
+from supernote.server.db.models.device import DeviceDO
+from supernote.server.db.models.device_bind_request import DeviceBindRequestDO
 from supernote.server.db.session import DatabaseSessionManager
 from supernote.server.exceptions import SupernoteError
 from supernote.server.services.coordination import CoordinationService
@@ -31,18 +35,53 @@ async def test_empty_token(
     }
 
 
-async def test_equipment_unlink(client: TestClient) -> None:
+async def test_equipment_unlink(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    session_manager: DatabaseSessionManager,
+    create_test_user: None,
+) -> None:
     resp = await client.post("/api/terminal/equipment/unlink", json={})
-    assert resp.status == 400
-    data = await resp.json()
-    assert data["errorMsg"] == "Invalid request format"
+    assert resp.status == 401
 
     resp = await client.post(
         "/api/terminal/equipment/unlink", json={"equipmentNo": "EQ123"}
     )
+    assert resp.status == 401
+
+    assert await client.app["user_service"].bind_equipment("test@example.com", "EQ123")
+    resp = await client.post(
+        "/api/terminal/equipment/unlink",
+        json={"equipmentNo": "EQ123"},
+        headers=auth_headers,
+    )
     assert resp.status == 200
     data = await resp.json()
     assert data["success"] is True
+
+    async with session_manager.session() as session:
+        device = await session.scalar(
+            select(DeviceDO).where(DeviceDO.equipment_no == "EQ123")
+        )
+        assert device is None
+
+    # Authentication alone is insufficient to unlink another account's device.
+    other = await client.app["user_service"].create_user(
+        UserRegisterDTO(
+            email="other@example.com",
+            password=hashlib.md5(b"password").hexdigest(),
+            user_name="Other",
+        )
+    )
+    async with session_manager.session() as session:
+        session.add(DeviceDO(user_id=other.id, equipment_no="OTHER-EQ"))
+        await session.commit()
+    resp = await client.post(
+        "/api/terminal/equipment/unlink",
+        json={"equipmentNo": "OTHER-EQ"},
+        headers=auth_headers,
+    )
+    assert resp.status == 403
 
 
 async def test_check_user_exists(client: TestClient, create_test_user: None) -> None:
@@ -68,7 +107,12 @@ async def test_login_invalid_credentials(login_client: LoginClient) -> None:
         await login_client.login("test@example.com", "wrongpassword")
 
 
-async def test_bind_equipment(client: TestClient, create_test_user: None) -> None:
+async def test_bind_equipment(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    session_manager: DatabaseSessionManager,
+    create_test_user: None,
+) -> None:
     resp = await client.post("/api/terminal/user/bindEquipment", json={})
     assert resp.status == 400
     data = await resp.json()
@@ -86,6 +130,129 @@ async def test_bind_equipment(client: TestClient, create_test_user: None) -> Non
     assert resp.status == 200
     data = await resp.json()
     assert data["success"] is True
+
+    async with session_manager.session() as session:
+        assert (
+            await session.scalar(
+                select(DeviceDO).where(DeviceDO.equipment_no == "EQ123")
+            )
+            is None
+        )
+        pending = await session.scalar(
+            select(DeviceBindRequestDO).where(
+                DeviceBindRequestDO.equipment_no == "EQ123"
+            )
+        )
+        assert pending is not None
+        request_id = pending.id
+
+    resp = await client.get("/web/device-bind-requests", headers=auth_headers)
+    assert resp.status == 200
+    requests = (await resp.json())["requests"]
+    assert requests[0]["equipmentNo"] == "EQ123"
+
+    resp = await client.post(
+        f"/web/device-bind-requests/{request_id}/approve",
+        headers=auth_headers,
+        json={},
+    )
+    assert resp.status == 200
+    async with session_manager.session() as session:
+        assert (
+            await session.scalar(
+                select(DeviceDO).where(DeviceDO.equipment_no == "EQ123")
+            )
+            is not None
+        )
+        assert (
+            await session.scalar(
+                select(DeviceBindRequestDO).where(DeviceBindRequestDO.id == request_id)
+            )
+            is None
+        )
+
+    # Rejected attempts disappear without creating a binding.
+    resp = await client.post(
+        "/api/terminal/user/bindEquipment",
+        json={
+            "account": "test@example.com",
+            "equipmentNo": "EQ456",
+            "name": "Rejected Device",
+            "totalCapacity": "1000",
+        },
+    )
+    assert resp.status == 200
+    async with session_manager.session() as session:
+        rejected = await session.scalar(
+            select(DeviceBindRequestDO).where(
+                DeviceBindRequestDO.equipment_no == "EQ456"
+            )
+        )
+        assert rejected is not None
+        rejected_id = rejected.id
+    resp = await client.post(
+        f"/web/device-bind-requests/{rejected_id}/reject",
+        headers=auth_headers,
+        json={},
+    )
+    assert resp.status == 200
+    async with session_manager.session() as session:
+        assert (
+            await session.scalar(
+                select(DeviceDO).where(DeviceDO.equipment_no == "EQ456")
+            )
+            is None
+        )
+
+
+async def test_unauthenticated_bind_compatibility_option(
+    client: TestClient,
+    server_config: ServerConfig,
+    session_manager: DatabaseSessionManager,
+    create_test_user: None,
+) -> None:
+    server_config.auth.allow_unauthenticated_binds = True
+    resp = await client.post(
+        "/api/terminal/user/bindEquipment",
+        json={
+            "account": "test@example.com",
+            "equipmentNo": "LEGACY-EQ",
+            "name": "Legacy Device",
+            "totalCapacity": "1000",
+        },
+    )
+    assert resp.status == 200
+    async with session_manager.session() as session:
+        assert (
+            await session.scalar(
+                select(DeviceDO).where(DeviceDO.equipment_no == "LEGACY-EQ")
+            )
+            is not None
+        )
+
+
+async def test_bind_never_reassigns_an_owned_device(
+    client: TestClient,
+    session_manager: DatabaseSessionManager,
+    create_test_user: None,
+) -> None:
+    user_service = client.app["user_service"]
+    other = await user_service.create_user(
+        UserRegisterDTO(
+            email="other@example.com",
+            password=hashlib.md5(b"password").hexdigest(),
+            user_name="Other",
+        )
+    )
+    assert await user_service.bind_equipment("test@example.com", "OWNED-EQ")
+    assert not await user_service.bind_equipment("other@example.com", "OWNED-EQ")
+
+    async with session_manager.session() as session:
+        device = await session.scalar(
+            select(DeviceDO).where(DeviceDO.equipment_no == "OWNED-EQ")
+        )
+        assert device is not None
+        assert device.user_id != other.id
 
 
 async def test_user_query(
