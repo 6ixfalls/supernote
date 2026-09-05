@@ -3,7 +3,9 @@ from collections.abc import AsyncGenerator
 
 import freezegun
 import pytest
+from sqlalchemy import func, select
 
+from supernote.server.db.models.kv import KeyValueDO
 from supernote.server.db.session import DatabaseSessionManager
 from supernote.server.services.coordination import (
     CoordinationService,
@@ -34,6 +36,24 @@ async def test_key_expiry(local_coordination_service: CoordinationService) -> No
 
     with freezegun.freeze_time("2024-01-01 12:00:16"):
         assert await local_coordination_service.get_value("foo") is None
+
+
+async def test_set_value_removes_abandoned_expired_keys(
+    local_coordination_service: CoordinationService,
+) -> None:
+    """Expired unique keys are reclaimed even when they are never read."""
+    with freezegun.freeze_time("2024-01-01 12:00:00"):
+        await local_coordination_service.set_value("challenge:one", "first", ttl=15)
+        await local_coordination_service.set_value("challenge:two", "second", ttl=15)
+
+    with freezegun.freeze_time("2024-01-01 12:00:16"):
+        await local_coordination_service.set_value("current", "value", ttl=15)
+
+    service = local_coordination_service
+    assert isinstance(service, SqliteCoordinationService)
+    async with service._session_manager.session() as session:
+        key_count = await session.scalar(select(func.count()).select_from(KeyValueDO))
+        assert key_count == 1
 
 
 async def test_pop_value_has_only_one_winner(

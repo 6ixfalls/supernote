@@ -1,4 +1,7 @@
 import hashlib
+import hmac
+import time
+from unittest.mock import patch
 
 import jwt
 import pytest
@@ -169,6 +172,59 @@ async def test_register_login_flow(user_service: UserService) -> None:
     )
     assert total == 1
     assert records[0].ip == "127.0.0.1"
+
+
+async def test_login_challenges_are_independent_and_one_time(
+    user_service: UserService,
+    server_config: ServerConfig,
+    coordination_service: CoordinationService,
+    session_manager: DatabaseSessionManager,
+) -> None:
+    email = "challenge@example.com"
+    password_md5 = hashlib.md5(b"password").hexdigest()
+    await user_service.register(UserRegisterDTO(email=email, password=password_md5))
+
+    # Issuing a second challenge in the same millisecond must not overwrite
+    # the first one or change the timestamp field's epoch-millisecond semantics.
+    now = time.time()
+    expected_timestamp_ms = int(now * 1000)
+    second_user_service = UserService(
+        server_config.auth, coordination_service, session_manager
+    )
+    with patch("supernote.server.services.user.time.time", return_value=now):
+        first_code, first_timestamp = await user_service.generate_random_code(email)
+        second_code, second_timestamp = (
+            await second_user_service.generate_random_code(email)
+        )
+    assert first_timestamp == str(expected_timestamp_ms)
+    assert second_timestamp == str(expected_timestamp_ms + 1)
+
+    first_proof = hash_with_salt(password_md5, first_code)
+    second_proof = hash_with_salt(password_md5, second_code)
+    with patch(
+        "supernote.server.services.user.hmac.compare_digest",
+        wraps=hmac.compare_digest,
+    ) as compare_digest:
+        assert await user_service.verify_login_hash(
+            email, first_proof, first_timestamp
+        )
+        compare_digest.assert_called_once()
+
+    # A captured proof cannot be replayed after the atomic consume.
+    assert not await user_service.verify_login_hash(email, first_proof, first_timestamp)
+    assert await user_service.verify_login_hash(email, second_proof, second_timestamp)
+
+
+async def test_failed_login_proof_consumes_challenge(user_service: UserService) -> None:
+    email = "failed-challenge@example.com"
+    password_md5 = hashlib.md5(b"password").hexdigest()
+    await user_service.register(UserRegisterDTO(email=email, password=password_md5))
+    code, timestamp = await user_service.generate_random_code(email)
+
+    assert not await user_service.verify_login_hash(email, "wrong", timestamp)
+    assert not await user_service.verify_login_hash(
+        email, hash_with_salt(password_md5, code), timestamp
+    )
 
 
 async def test_update_password(user_service: UserService) -> None:

@@ -19,7 +19,12 @@ from supernote.server.db.models.device_bind_request import DeviceBindRequestDO
 from supernote.server.db.session import DatabaseSessionManager
 from supernote.server.exceptions import SupernoteError
 from supernote.server.services.coordination import CoordinationService
-from supernote.server.utils.rate_limit import LIMIT_LOGIN_IP_MAX, LIMIT_PW_RESET_MAX
+from supernote.server.utils.rate_limit import (
+    LIMIT_CHALLENGE_ACCOUNT_MAX,
+    LIMIT_CHALLENGE_IP_MAX,
+    LIMIT_LOGIN_IP_MAX,
+    LIMIT_PW_RESET_MAX,
+)
 
 
 async def test_empty_token(
@@ -455,6 +460,38 @@ async def test_login_rate_limit(
         assert resp.status == 429
         data = await resp.json()
         assert "Rate limit exceeded" in data["errorMsg"]
+
+
+async def test_challenge_issuance_rate_limit(client: Client) -> None:
+    url = "/api/official/user/query/random/code"
+
+    with patch(
+        "supernote.server.utils.rate_limit.time.time", return_value=1600000000.0
+    ):
+        for i in range(LIMIT_CHALLENGE_IP_MAX):
+            # Distinct accounts isolate the IP limit from the lower account limit.
+            resp = await client.post(url, json={"account": f"challenge{i}@example.com"})
+            assert resp.status == 200
+
+        resp = await client.post(url, json={"account": "blocked@example.com"})
+        assert resp.status == 429
+        assert "Rate limit exceeded" in (await resp.json())["errorMsg"]
+
+
+async def test_challenge_issuance_rate_limits_account(client: Client) -> None:
+    url = "/api/official/user/query/random/code"
+    account = "target@example.com"
+
+    with patch(
+        "supernote.server.utils.rate_limit.time.time", return_value=1600000000.0
+    ):
+        for _ in range(LIMIT_CHALLENGE_ACCOUNT_MAX):
+            resp = await client.post(url, json={"account": account})
+            assert resp.status == 200
+
+        resp = await client.post(url, json={"account": account})
+        assert resp.status == 429
+        assert "Rate limit exceeded" in (await resp.json())["errorMsg"]
 
 
 async def test_password_retrieve_rate_limit(

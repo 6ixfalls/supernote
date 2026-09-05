@@ -1,4 +1,5 @@
 import datetime
+import hmac
 import logging
 import re
 import secrets
@@ -185,15 +186,17 @@ class UserService:
     async def generate_random_code(self, account: str) -> tuple[str, str]:
         """Generate a random code for login challenge."""
         random_code = secrets.token_hex(4)  # 8 chars
-        timestamp = str(int(time.time() * 1000))
+        timestamp_ms = int(time.time() * 1000)
+        ttl = int(RANDOM_CODE_TTL.total_seconds())
 
-        # Store in coordination service with short TTL (e.g. 5 mins)
-        value = f"{random_code}|{timestamp}"
-        await self._coordination_service.set_value(
-            f"challenge:{account}", value, ttl=int(RANDOM_CODE_TTL.total_seconds())
-        )
+        # Reserve the timestamp in shared state so separate server instances
+        # cannot overwrite challenges issued in the same millisecond.
+        while not await self._coordination_service.set_value_if_absent(
+            f"challenge:{account}:{timestamp_ms}", random_code, ttl=ttl
+        ):
+            timestamp_ms += 1
 
-        return random_code, timestamp
+        return random_code, str(timestamp_ms)
 
     async def _get_user_do(self, account: str) -> UserDO | None:
         async with self._session_manager.session() as session:
@@ -218,18 +221,19 @@ class UserService:
         if not user or not user.is_active:
             return False
 
-        stored_value = await self._coordination_service.get_value(
-            f"challenge:{account}"
+        # Consume before validating the proof. A challenge is one-time even
+        # when the submitted proof is incorrect, and pop_value is atomic so
+        # concurrent requests cannot both authenticate with the same proof.
+        random_code = await self._coordination_service.pop_value(
+            f"challenge:{account}:{timestamp}"
         )
-        if not stored_value:
-            return False
-
-        random_code, stored_timestamp = stored_value.split("|")
-        if stored_timestamp != timestamp:
+        if not random_code:
             return False
 
         expected_hash = hash_with_salt(user.password_md5, random_code)
-        return expected_hash == client_hash
+        return hmac.compare_digest(
+            expected_hash.encode("ascii"), str(client_hash).encode("utf-8")
+        )
 
     async def login(
         self,

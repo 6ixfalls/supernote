@@ -3,6 +3,7 @@ import time
 from abc import ABC, abstractmethod
 
 from sqlalchemy import delete, select, text
+from sqlalchemy.dialects.sqlite import insert
 
 from supernote.server.db.models.kv import KeyValueDO
 from supernote.server.db.session import DatabaseSessionManager
@@ -23,6 +24,12 @@ class CoordinationService(ABC):
     @abstractmethod
     async def set_value(self, key: str, value: str, ttl: int | None = None) -> None:
         """Set a key-value pair with optional TTL."""
+
+    @abstractmethod
+    async def set_value_if_absent(
+        self, key: str, value: str, ttl: int | None = None
+    ) -> bool:
+        """Set a key only if it does not exist, returning whether it was set."""
 
     @abstractmethod
     async def get_value(self, key: str) -> str | None:
@@ -55,7 +62,13 @@ class SqliteCoordinationService(CoordinationService):
     async def set_value(self, key: str, value: str, ttl: int | None = None) -> None:
         """Set a key-value pair with optional TTL."""
         async with self._session_manager.session() as session:
-            expiry = time.time() + (ttl if ttl else DEFAULT_TTL)
+            now = time.time()
+            expiry = now + (ttl if ttl else DEFAULT_TTL)
+
+            # Some short-lived values (such as abandoned login challenges) use
+            # unique keys and will never be read again. Reclaim all expired
+            # entries on writes so those values cannot accumulate indefinitely.
+            await session.execute(delete(KeyValueDO).where(KeyValueDO.expiry < now))
 
             # Upsert
             stmt = select(KeyValueDO).where(KeyValueDO.key == key)
@@ -70,6 +83,26 @@ class SqliteCoordinationService(CoordinationService):
                 session.add(new_kv)
 
             await session.commit()
+
+    async def set_value_if_absent(
+        self, key: str, value: str, ttl: int | None = None
+    ) -> bool:
+        """Set a key only if it does not exist, returning whether it was set."""
+        async with self._session_manager.session() as session:
+            now = time.time()
+            expiry = now + (ttl if ttl else DEFAULT_TTL)
+
+            await session.execute(delete(KeyValueDO).where(KeyValueDO.expiry < now))
+            stmt = (
+                insert(KeyValueDO)
+                .values(key=key, value=value, expiry=expiry)
+                .on_conflict_do_nothing(index_elements=[KeyValueDO.key])
+                .returning(KeyValueDO.key)
+            )
+            result = await session.execute(stmt)
+            inserted = result.scalar_one_or_none() is not None
+            await session.commit()
+            return inserted
 
     async def get_value(self, key: str) -> str | None:
         """Get a value by key."""

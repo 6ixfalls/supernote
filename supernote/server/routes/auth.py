@@ -30,6 +30,12 @@ from supernote.models.user import (
 from supernote.server.exceptions import SupernoteError
 from supernote.server.services.user import UserService
 from supernote.server.utils.rate_limit import (
+    CHALLENGE_KEY_ACCOUNT,
+    CHALLENGE_KEY_IP,
+    LIMIT_CHALLENGE_ACCOUNT_MAX,
+    LIMIT_CHALLENGE_ACCOUNT_WINDOW,
+    LIMIT_CHALLENGE_IP_MAX,
+    LIMIT_CHALLENGE_IP_WINDOW,
     LIMIT_LOGIN_ACCOUNT_MAX,
     LIMIT_LOGIN_ACCOUNT_WINDOW,
     LIMIT_LOGIN_IP_MAX,
@@ -123,6 +129,23 @@ async def handle_random_code(request: web.Request) -> web.Response:
     # Purpose: Get challenge for password hashing
     req_data = await request.json()
     code_req = RandomCodeDTO.from_dict(req_data)
+
+    rate_limiter = request.app["rate_limiter"]
+    ip = request.remote or "unknown"
+    try:
+        await rate_limiter.check(
+            f"{CHALLENGE_KEY_IP}:{ip}",
+            limit=LIMIT_CHALLENGE_IP_MAX,
+            window=LIMIT_CHALLENGE_IP_WINDOW,
+        )
+        await rate_limiter.check(
+            f"{CHALLENGE_KEY_ACCOUNT}:{code_req.account}",
+            limit=LIMIT_CHALLENGE_ACCOUNT_MAX,
+            window=LIMIT_CHALLENGE_ACCOUNT_WINDOW,
+        )
+    except RateLimitExceeded as e:
+        return e.to_response()
+
     user_service: UserService = request.app["user_service"]
     random_code, timestamp = await user_service.generate_random_code(code_req.account)
     return web.json_response(
