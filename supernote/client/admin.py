@@ -35,6 +35,11 @@ class AdminClient:
         await self.client.post_json("/api/user/unregister", BaseResponse)
         logger.info("Unregistered user")
 
+    async def logout(self) -> None:
+        """Invalidate the current access token."""
+        await self.client.post_json("/api/user/logout", BaseResponse)
+        logger.info("Logged out")
+
     async def update_password(self, new_password: str) -> None:
         """Update password for currently logged in user."""
         dto = UpdatePasswordDTO(password=new_password)

@@ -8,12 +8,12 @@ import pytest
 from sqlalchemy import select
 
 from supernote.models.auth import Equipment
-from supernote.models.user import UpdatePasswordDTO, UserRegisterDTO
+from supernote.models.user import UpdateEmailDTO, UpdatePasswordDTO, UserRegisterDTO
 from supernote.server.config import AuthConfig, ServerConfig
 from supernote.server.db.models.user import UserDO
 from supernote.server.db.session import DatabaseSessionManager
 from supernote.server.services.coordination import CoordinationService
-from supernote.server.services.user import UserService
+from supernote.server.services.user import JWT_ALGORITHM, UserService
 from supernote.server.utils.hashing import hash_with_salt
 
 
@@ -193,8 +193,8 @@ async def test_login_challenges_are_independent_and_one_time(
     )
     with patch("supernote.server.services.user.time.time", return_value=now):
         first_code, first_timestamp = await user_service.generate_random_code(email)
-        second_code, second_timestamp = (
-            await second_user_service.generate_random_code(email)
+        second_code, second_timestamp = await second_user_service.generate_random_code(
+            email
         )
     assert first_timestamp == str(expected_timestamp_ms)
     assert second_timestamp == str(expected_timestamp_ms + 1)
@@ -205,9 +205,7 @@ async def test_login_challenges_are_independent_and_one_time(
         "supernote.server.services.user.hmac.compare_digest",
         wraps=hmac.compare_digest,
     ) as compare_digest:
-        assert await user_service.verify_login_hash(
-            email, first_proof, first_timestamp
-        )
+        assert await user_service.verify_login_hash(email, first_proof, first_timestamp)
         compare_digest.assert_called_once()
 
     # A captured proof cannot be replayed after the atomic consume.
@@ -227,16 +225,43 @@ async def test_failed_login_proof_consumes_challenge(user_service: UserService) 
     )
 
 
-async def test_update_password(user_service: UserService) -> None:
+async def test_update_password(
+    user_service: UserService, coordination_service: CoordinationService
+) -> None:
     """Update a user's password."""
     # Register
     old_md5 = hashlib.md5(b"old").hexdigest()
     await user_service.register(UserRegisterDTO(email="pw@test.com", password=old_md5))
+    await coordination_service.set_value(
+        "session:web-token",
+        f"pw@test.com|v3|{Equipment.WEB.value}|WEB|1",
+        ttl=3600,
+    )
+    await coordination_service.set_value(
+        "session:device-token",
+        f"pw@test.com|v3|{Equipment.TERMINAL.value}|device|1",
+        ttl=3600,
+    )
+    await coordination_service.set_value(
+        "session:legacy-ambiguous-token", "pw@test.com|", ttl=3600
+    )
+    await coordination_service.set_value(
+        "session:legacy-device-token", "pw@test.com|SN123", ttl=3600
+    )
 
     # Update
     new_md5 = hashlib.md5(b"new").hexdigest()
     await user_service.update_password(
         "pw@test.com", UpdatePasswordDTO(password=new_md5)
+    )
+    assert await coordination_service.get_value("session:web-token") is None
+    assert await coordination_service.get_value("session:device-token") is not None
+    assert (
+        await coordination_service.get_value("session:legacy-ambiguous-token")
+        is not None
+    )
+    assert (
+        await coordination_service.get_value("session:legacy-device-token") is not None
     )
 
     # Login with old fails (we'd need a full login flow to test, strictly speaking)
@@ -250,6 +275,123 @@ async def test_update_password(user_service: UserService) -> None:
     assert login_vo is not None
 
 
+async def test_update_email_preserves_device_session(
+    user_service: UserService,
+    coordination_service: CoordinationService,
+    server_config: ServerConfig,
+) -> None:
+    old_email = "old-email@test.com"
+    new_email = "new-email@test.com"
+    password_md5 = hashlib.md5(b"password").hexdigest()
+    await user_service.register(UserRegisterDTO(email=old_email, password=password_md5))
+
+    code, timestamp = await user_service.generate_random_code(old_email)
+    login = await user_service.login(
+        old_email,
+        hash_with_salt(password_md5, code),
+        timestamp,
+        equipment=Equipment.TERMINAL,
+        equipment_no="SN123",
+    )
+    assert login is not None
+
+    legacy_token = jwt.encode(
+        {"sub": old_email},
+        server_config.auth.secret_key,
+        algorithm=JWT_ALGORITHM,
+    )
+    await coordination_service.set_value(
+        f"session:{legacy_token}", f"{old_email}|SN-LEGACY", ttl=3600
+    )
+
+    v2_token = jwt.encode(
+        {"sub": old_email, "equipment_no": "SN-V2", "nonce": "v2"},
+        server_config.auth.secret_key,
+        algorithm=JWT_ALGORITHM,
+    )
+    await coordination_service.set_value(
+        f"session:{v2_token}",
+        f"{old_email}|v2|{Equipment.TERMINAL.value}|SN-V2",
+        ttl=3600,
+    )
+
+    await user_service.update_email(old_email, UpdateEmailDTO(email=new_email))
+
+    for token, equipment_no in (
+        (login.token, "SN123"),
+        (legacy_token, "SN-LEGACY"),
+        (v2_token, "SN-V2"),
+    ):
+        device_session = await user_service.verify_token(token)
+        assert device_session is not None
+        assert device_session.email == new_email
+        assert device_session.equipment_no == equipment_no
+
+
+async def test_update_email_publishes_alias_before_revoking_web_sessions(
+    user_service: UserService,
+    coordination_service: CoordinationService,
+    server_config: ServerConfig,
+) -> None:
+    old_email = "rename-old@test.com"
+    new_email = "rename-new@test.com"
+    password_md5 = hashlib.md5(b"password").hexdigest()
+    await user_service.register(UserRegisterDTO(email=old_email, password=password_md5))
+
+    token = jwt.encode(
+        {"sub": old_email},
+        server_config.auth.secret_key,
+        algorithm=JWT_ALGORITHM,
+    )
+    await coordination_service.set_value(
+        f"session:{token}", f"{old_email}|SN-LEGACY", ttl=3600
+    )
+
+    original_revoke = user_service.revoke_web_sessions
+
+    async def assert_device_session_is_valid(account: str) -> None:
+        device_session = await user_service.verify_token(token)
+        assert device_session is not None
+        assert device_session.email == new_email
+        await original_revoke(account)
+
+    with patch.object(
+        user_service,
+        "revoke_web_sessions",
+        side_effect=assert_device_session_is_valid,
+    ):
+        await user_service.update_email(old_email, UpdateEmailDTO(email=new_email))
+
+
+async def test_update_email_does_not_reassign_an_existing_alias(
+    user_service: UserService,
+    coordination_service: CoordinationService,
+    server_config: ServerConfig,
+) -> None:
+    old_email = "reused@test.com"
+    first_email = "first-renamed@test.com"
+    second_email = "second-renamed@test.com"
+    password_md5 = hashlib.md5(b"password").hexdigest()
+    await user_service.register(UserRegisterDTO(email=old_email, password=password_md5))
+
+    legacy_token = jwt.encode(
+        {"sub": old_email, "owner": "first"},
+        server_config.auth.secret_key,
+        algorithm=JWT_ALGORITHM,
+    )
+    await coordination_service.set_value(
+        f"session:{legacy_token}", f"{old_email}|SN-LEGACY", ttl=3600
+    )
+
+    await user_service.update_email(old_email, UpdateEmailDTO(email=first_email))
+    await user_service.register(UserRegisterDTO(email=old_email, password=password_md5))
+    await user_service.update_email(old_email, UpdateEmailDTO(email=second_email))
+
+    session = await user_service.verify_token(legacy_token)
+    assert session is not None
+    assert session.email == first_email
+
+
 async def test_unregister(user_service: UserService) -> None:
     """Unregister a user."""
     pw_md5 = hashlib.md5(b"pw").hexdigest()
@@ -258,6 +400,125 @@ async def test_unregister(user_service: UserService) -> None:
 
     await user_service.unregister("del@test.com")
     assert not await user_service.check_user_exists("del@test.com")
+
+
+async def test_unregister_revokes_renamed_sessions_before_id_reuse(
+    user_service: UserService,
+    coordination_service: CoordinationService,
+    server_config: ServerConfig,
+) -> None:
+    old_email = "deleted-old@test.com"
+    current_email = "deleted-current@test.com"
+    password_md5 = hashlib.md5(b"password").hexdigest()
+    deleted_user = await user_service.register(
+        UserRegisterDTO(email=old_email, password=password_md5)
+    )
+    legacy_token = jwt.encode(
+        {"sub": old_email},
+        server_config.auth.secret_key,
+        algorithm=JWT_ALGORITHM,
+    )
+    await coordination_service.set_value(
+        f"session:{legacy_token}", f"{old_email}|SN-LEGACY", ttl=3600
+    )
+
+    await user_service.update_email(old_email, UpdateEmailDTO(email=current_email))
+    assert await user_service.verify_token(legacy_token) is not None
+
+    await user_service.unregister(current_email)
+    assert await coordination_service.get_value(f"session:{legacy_token}") is None
+    assert await coordination_service.get_value(f"account-alias:{old_email}") is None
+
+    replacement = await user_service.register(
+        UserRegisterDTO(email="replacement@test.com", password=password_md5)
+    )
+    assert replacement.id == deleted_user.id
+    assert await user_service.verify_token(legacy_token) is None
+
+
+async def test_unregister_does_not_revoke_new_owner_of_reused_email(
+    user_service: UserService,
+    coordination_service: CoordinationService,
+    server_config: ServerConfig,
+) -> None:
+    old_email = "shared-history@test.com"
+    renamed_email = "original-owner@test.com"
+    password_md5 = hashlib.md5(b"password").hexdigest()
+    original = await user_service.register(
+        UserRegisterDTO(email=old_email, password=password_md5)
+    )
+
+    original_token = jwt.encode(
+        {"sub": old_email, "owner": "original"},
+        server_config.auth.secret_key,
+        algorithm=JWT_ALGORITHM,
+    )
+    await coordination_service.set_value(
+        f"session:{original_token}", f"{old_email}|SN-LEGACY", ttl=3600
+    )
+    await user_service.update_email(old_email, UpdateEmailDTO(email=renamed_email))
+
+    replacement = await user_service.register(
+        UserRegisterDTO(email=old_email, password=password_md5)
+    )
+    replacement_token = jwt.encode(
+        {"sub": old_email, "owner": "replacement"},
+        server_config.auth.secret_key,
+        algorithm=JWT_ALGORITHM,
+    )
+    await coordination_service.set_value(
+        f"session:{replacement_token}",
+        f"{old_email}|v3|{Equipment.TERMINAL.value}|SN-NEW|{replacement.id}",
+        ttl=3600,
+    )
+
+    await user_service.unregister(renamed_email)
+
+    assert await user_service.verify_token(original_token) is None
+    replacement_session = await user_service.verify_token(replacement_token)
+    assert replacement_session is not None
+    assert replacement_session.user_id == replacement.id
+    assert replacement.id != original.id
+
+
+async def test_unregister_revokes_v3_session_with_alias_owned_by_another_user(
+    user_service: UserService,
+    coordination_service: CoordinationService,
+) -> None:
+    shared_email = "reused-alias@test.com"
+    password_md5 = hashlib.md5(b"password").hexdigest()
+
+    await user_service.register(
+        UserRegisterDTO(email=shared_email, password=password_md5)
+    )
+    await user_service.update_email(
+        shared_email, UpdateEmailDTO(email="first-owner@test.com")
+    )
+
+    second_owner = await user_service.register(
+        UserRegisterDTO(email=shared_email, password=password_md5)
+    )
+    code, timestamp = await user_service.generate_random_code(shared_email)
+    login = await user_service.login(
+        shared_email,
+        hash_with_salt(password_md5, code),
+        timestamp,
+        equipment=Equipment.TERMINAL,
+        equipment_no="SN-SECOND",
+    )
+    assert login is not None
+    await user_service.update_email(
+        shared_email, UpdateEmailDTO(email="second-owner@test.com")
+    )
+
+    await user_service.unregister("second-owner@test.com")
+
+    assert await coordination_service.get_value(f"session:{login.token}") is None
+    replacement = await user_service.register(
+        UserRegisterDTO(email="replacement@test.com", password=password_md5)
+    )
+    assert replacement.id == second_owner.id
+    assert await user_service.verify_token(login.token) is None
 
 
 async def test_token_expiration_by_equipment(user_service: UserService) -> None:
@@ -297,7 +558,6 @@ async def test_token_expiration_by_equipment(user_service: UserService) -> None:
     exp_term = payload_term["exp"]
     iat_term = payload_term["iat"]
 
-    # Should be 10 years
     ten_years_seconds = 10 * 365 * 24 * 3600
     assert (exp_term - iat_term) == ten_years_seconds
 
@@ -314,7 +574,6 @@ async def test_token_expiration_by_equipment(user_service: UserService) -> None:
     exp_app = payload_app["exp"]
     iat_app = payload_app["iat"]
 
-    # Should also be 10 years
     assert (exp_app - iat_app) == ten_years_seconds
 
 

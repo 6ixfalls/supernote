@@ -40,6 +40,19 @@ async def test_empty_token(
     }
 
 
+async def test_logout_revokes_session(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    create_test_user: None,
+) -> None:
+    resp = await client.post("/api/user/logout", headers=auth_headers)
+    assert resp.status == 200
+    assert await resp.json() == {"success": True}
+
+    resp = await client.get("/api/user/query", headers=auth_headers)
+    assert resp.status == 401
+
+
 async def test_equipment_unlink(
     client: TestClient,
     auth_headers: dict[str, str],
@@ -342,7 +355,7 @@ async def test_user_unregister(
     await admin_client.unregister()
 
 
-async def test_update_password_and_email(
+async def test_update_password_authorization(
     client: TestClient,
     admin_client: AdminClient,
 ) -> None:
@@ -358,9 +371,22 @@ async def test_update_password_and_email(
     with pytest.raises(ApiException):
         await unauth_admin.update_email("new@example.com")
 
-    # Success paths
+    # Success path; changing a password intentionally revokes this session.
     pwd_hash = hashlib.md5(b"newpassword").hexdigest()
     await admin_client.update_password(pwd_hash)
+
+
+async def test_update_email_authorization(
+    client: TestClient,
+    admin_client: AdminClient,
+) -> None:
+    base_url = str(client.make_url(""))
+    unauth_client = Client(client.session, host=base_url)
+    unauth_admin = AdminClient(unauth_client)
+
+    with pytest.raises(ApiException):
+        await unauth_admin.update_email("new@example.com")
+
     await admin_client.update_email("new@example.com")
 
 

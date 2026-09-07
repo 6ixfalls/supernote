@@ -14,6 +14,18 @@ export function getToken() {
 }
 
 export function logout() {
+    const token = authToken;
+    if (token) {
+        // Keep the OpenAPI-compatible device endpoint as the single logout
+        // contract. `keepalive` lets revocation finish after the page reloads.
+        void fetch('/api/user/logout', {
+            method: 'POST',
+            headers: { 'x-access-token': token },
+            keepalive: true
+        }).catch(() => {
+            // Local logout must still complete if the server is unavailable.
+        });
+    }
     authToken = null;
     localStorage.removeItem('supernote_token');
     window.location.reload();

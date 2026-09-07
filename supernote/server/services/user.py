@@ -45,6 +45,7 @@ MD5_REGEX = r"^[a-f0-9]{32}$"
 class SessionState(DataClassJSONMixin):
     token: str
     email: str
+    user_id: int
     equipment_no: str | None = None
     created_at: float = field(default_factory=time.time)
     last_active_at: float = field(default_factory=time.time)
@@ -176,6 +177,14 @@ class UserService:
             if not user:
                 return
 
+            # Remove every credential that can resolve to this numeric ID before
+            # deleting the row. SQLite can reuse deleted integer primary keys, so
+            # leaving an alias behind could authorize an old token as a later user.
+            await self._coordination_service.delete_user_sessions(
+                account,
+                user.id,
+            )
+
             await session.execute(delete(DeviceDO).where(DeviceDO.user_id == user.id))
             await session.execute(
                 delete(LoginRecordDO).where(LoginRecordDO.user_id == user.id)
@@ -201,6 +210,12 @@ class UserService:
     async def _get_user_do(self, account: str) -> UserDO | None:
         async with self._session_manager.session() as session:
             stmt = select(UserDO).where(UserDO.email == account)
+            result = await session.execute(stmt)
+            return result.scalar_one_or_none()
+
+    async def _get_user_do_by_id(self, user_id: int) -> UserDO | None:
+        async with self._session_manager.session() as session:
+            stmt = select(UserDO).where(UserDO.id == user_id)
             result = await session.execute(stmt)
             return result.scalar_one_or_none()
 
@@ -294,7 +309,10 @@ class UserService:
         token = jwt.encode(payload, self._config.secret_key, algorithm=JWT_ALGORITHM)
 
         # Persist session in CoordinationService
-        session_val = f"{account}|{equipment_no or ''}"
+        # Keep enough client metadata to revoke browser sessions without
+        # invalidating credentials held by unmanaged apps and devices. The
+        # leading account preserves compatibility with bulk account deletion.
+        session_val = f"{account}|v3|{equipment.value}|{equipment_no or ''}|{user.id}"
         await self._coordination_service.set_value(
             f"session:{token}", session_val, ttl=ttl
         )
@@ -321,7 +339,21 @@ class UserService:
 
             session_val_parts = session_val.split("|")
             username = session_val_parts[0]
-            equipment_no = session_val_parts[1] if len(session_val_parts) > 1 else None
+            session_user_id: int | None = None
+            if len(session_val_parts) >= 5 and session_val_parts[1] == "v3":
+                equipment_no = session_val_parts[3] or None
+                try:
+                    session_user_id = int(session_val_parts[4])
+                except ValueError:
+                    return None
+            elif len(session_val_parts) >= 4 and session_val_parts[1] == "v2":
+                equipment_no = session_val_parts[3] or None
+            else:
+                # Sessions issued before client-type metadata was added used
+                # the format ``account|equipment_no``.
+                equipment_no = (
+                    session_val_parts[1] if len(session_val_parts) > 1 else None
+                )
 
             # 2. Decode and verify JWT
             payload = jwt.decode(
@@ -330,14 +362,56 @@ class UserService:
             if payload.get("sub") != username:
                 return None
 
+            if session_user_id is None:
+                # Email addresses were the only identity stored in sessions
+                # issued before v3. Resolve renamed accounts through the stable
+                # user ID recorded when the email was changed.
+                alias_user_id = await self._coordination_service.get_value(
+                    f"account-alias:{username}"
+                )
+                if alias_user_id is not None:
+                    try:
+                        session_user_id = int(alias_user_id)
+                    except ValueError:
+                        return None
+
+            if session_user_id is not None:
+                user = await self._get_user_do_by_id(session_user_id)
+            else:
+                user = await self._get_user_do(username)
+            if not user or not user.is_active:
+                logger.warning(
+                    "Session belongs to a missing or inactive user: %s", username
+                )
+                return None
+
             return SessionState(
                 token=token,
-                email=username,
+                email=user.email,
+                user_id=user.id,
                 equipment_no=equipment_no,
             )
         except jwt.PyJWTError as e:
             logger.warning("Token verification failed: %s", e)
             return None
+
+    async def revoke_session(self, token: str) -> None:
+        """Revoke one persisted login session."""
+        await self._coordination_service.delete_value(f"session:{token}")
+
+    async def revoke_user_sessions(self, account: str) -> None:
+        """Revoke every persisted login session belonging to an account."""
+        await self._coordination_service.delete_values("session:", f"{account}|")
+
+    async def revoke_web_sessions(self, account: str) -> None:
+        """Revoke browser sessions without logging out apps or devices."""
+        # Legacy ``account|equipment_no`` records cannot distinguish a browser
+        # from a terminal that omitted the optional equipment number, so only
+        # versioned sessions with explicit client metadata are safe to revoke.
+        for version in ("v2", "v3"):
+            await self._coordination_service.delete_values(
+                "session:", f"{account}|{version}|{Equipment.WEB.value}|"
+            )
 
     async def get_user_profile(self, account: str) -> UserVO | None:
         user = await self._get_user_do(account)
@@ -515,15 +589,41 @@ class UserService:
                 .values(password_md5=dto.password)
             )
             await session.commit()
+        await self.revoke_web_sessions(account)
         return True
 
     async def update_email(self, account: str, dto: UpdateEmailDTO) -> bool:
         """Update user email."""
         async with self._session_manager.session() as session:
+            result = await session.execute(
+                select(UserDO.id).where(UserDO.email == account)
+            )
+            user_id = result.scalar_one_or_none()
+            if user_id is None:
+                return False
+
+        # Publish the stable identity mapping before changing the email so
+        # legacy device sessions remain valid throughout the transition.
+        alias_created = await self._coordination_service.set_value_if_absent(
+            f"account-alias:{account}",
+            str(user_id),
+            ttl=self._config.device_expiration_hours * 3600,
+        )
+        if not alias_created:
+            existing_alias = await self._coordination_service.get_value(
+                f"account-alias:{account}"
+            )
+            if existing_alias != str(user_id):
+                logger.warning(
+                    "Preserving account alias owned by another user: %s", account
+                )
+
+        async with self._session_manager.session() as session:
             await session.execute(
                 update(UserDO).where(UserDO.email == account).values(email=dto.email)
             )
             await session.commit()
+        await self.revoke_web_sessions(account)
         return True
 
     async def admin_reset_password(self, email: str, password_md5: str) -> None:
@@ -539,6 +639,7 @@ class UserService:
 
             user.password_md5 = password_md5
             await session.commit()
+        await self.revoke_web_sessions(email)
 
     async def retrieve_password(self, account: str, password_md5: str) -> bool:
         """Retrieve/Reset password."""
@@ -562,6 +663,7 @@ class UserService:
 
             user.password_md5 = password_md5
             await session.commit()
+        await self.revoke_web_sessions(user.email)
         return True
 
     async def query_login_records(

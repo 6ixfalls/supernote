@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncGenerator, Callable
+from unittest.mock import patch
 
 import jwt
 import pytest
@@ -16,8 +17,10 @@ from supernote.models.socket import (
     SocketIoMessageType,
     SocketMessageData,
 )
+from supernote.models.user import UpdateEmailDTO
 from supernote.server.app import create_app
 from supernote.server.config import ServerConfig
+from supernote.server.services.coordination import CoordinationService
 from supernote.server.services.user import JWT_ALGORITHM
 from supernote.server.socket import SocketIOServerManager
 from supernote.server.socket_auth import compute_handshake_signature
@@ -31,6 +34,19 @@ def _make_handshake_params(
         type=conn_type,
         random=random_val,
         sign=compute_handshake_signature(token, conn_type, random_val),
+    )
+
+
+async def _register_session(
+    server: TestServer,
+    token: str,
+    user_id: str,
+    ttl: int = 3600,
+    equipment_no: str = "",
+) -> None:
+    coordination: CoordinationService = server.app["coordination_service"]
+    await coordination.set_value(
+        f"session:{token}", f"{user_id}|{equipment_no}", ttl=ttl
     )
 
 
@@ -70,11 +86,13 @@ def socket_client(
 
 @pytest.mark.asyncio
 async def test_socketio_ping_pong(
+    socketio_server: TestServer,
     socket_client: SupernoteSocketClient,
     server_config: ServerConfig,
 ) -> None:
     secret = server_config.auth.secret_key
     token_a = jwt.encode({"sub": "test@example.com"}, secret, algorithm=JWT_ALGORITHM)
+    await _register_session(socketio_server, token_a, "test@example.com")
     params_a = _make_handshake_params(token_a)
 
     await socket_client.connect(params_a)
@@ -89,11 +107,13 @@ async def test_socketio_ping_pong(
 
 @pytest.mark.asyncio
 async def test_socketio_status_heartbeat(
+    socketio_server: TestServer,
     socket_client: SupernoteSocketClient,
     server_config: ServerConfig,
 ) -> None:
     secret = server_config.auth.secret_key
     token_a = jwt.encode({"sub": "test@example.com"}, secret, algorithm=JWT_ALGORITHM)
+    await _register_session(socketio_server, token_a, "test@example.com")
     params_a = _make_handshake_params(token_a)
 
     await socket_client.connect(params_a)
@@ -123,6 +143,8 @@ async def test_socketio_multi_user_message_isolation(
 
     token_a = jwt.encode({"sub": user_a}, secret, algorithm=JWT_ALGORITHM)
     token_b = jwt.encode({"sub": user_b}, secret, algorithm=JWT_ALGORITHM)
+    await _register_session(socketio_server, token_a, user_a)
+    await _register_session(socketio_server, token_b, user_b)
 
     params_a = _make_handshake_params(token_a)
     params_b = _make_handshake_params(token_b)
@@ -156,7 +178,14 @@ async def test_socketio_multi_user_message_isolation(
         ],
     )
 
-    await manager.send_message(user_a, msg_data_a)
+    user_service = socketio_server.app["user_service"]
+    with patch.object(
+        user_service, "verify_token", wraps=user_service.verify_token
+    ) as verify_token:
+        await manager.send_message(user_a, msg_data_a)
+
+    # Delivery only revalidates sockets belonging to the target account.
+    assert verify_token.await_count == 1
 
     # User A receives the targeted message
     received_a = await anext(client_a.messages())
@@ -204,12 +233,101 @@ async def test_socketio_connect_invalid_token(
 
 
 @pytest.mark.asyncio
+async def test_socketio_rejects_valid_jwt_without_server_session(
+    socket_client: SupernoteSocketClient,
+    server_config: ServerConfig,
+) -> None:
+    token = jwt.encode(
+        {"sub": "test@example.com"},
+        server_config.auth.secret_key,
+        algorithm=JWT_ALGORITHM,
+    )
+
+    with pytest.raises(SocketIOConnectionError):
+        await socket_client.connect(_make_handshake_params(token))
+
+
+@pytest.mark.asyncio
+async def test_socketio_rejects_session_for_missing_user(
+    socketio_server: TestServer,
+    socket_client: SupernoteSocketClient,
+    server_config: ServerConfig,
+) -> None:
+    user_id = "deleted@example.com"
+    token = jwt.encode(
+        {"sub": user_id}, server_config.auth.secret_key, algorithm=JWT_ALGORITHM
+    )
+    await _register_session(socketio_server, token, user_id)
+
+    with pytest.raises(SocketIOConnectionError):
+        await socket_client.connect(_make_handshake_params(token))
+
+
+@pytest.mark.asyncio
+async def test_socketio_revoked_session_cannot_receive_messages(
+    socketio_server: TestServer,
+    socket_client: SupernoteSocketClient,
+    server_config: ServerConfig,
+) -> None:
+    user_id = "test@example.com"
+    token = jwt.encode(
+        {"sub": user_id}, server_config.auth.secret_key, algorithm=JWT_ALGORITHM
+    )
+    await _register_session(socketio_server, token, user_id)
+    await socket_client.connect(_make_handshake_params(token))
+
+    coordination: CoordinationService = socketio_server.app["coordination_service"]
+    await coordination.delete_value(f"session:{token}")
+    manager: SocketIOServerManager = socketio_server.app["socketio_manager"]
+    await manager.send_message(user_id, SocketMessageData(code="0", msg="revoked"))
+
+    for _ in range(50):
+        if not socket_client.is_connected:
+            break
+        await asyncio.sleep(0.01)
+    assert not socket_client.is_connected
+
+
+@pytest.mark.asyncio
+async def test_socketio_device_session_survives_email_change(
+    socketio_server: TestServer,
+    socket_client: SupernoteSocketClient,
+    server_config: ServerConfig,
+) -> None:
+    old_email = "test@example.com"
+    new_email = "renamed@example.com"
+    token = jwt.encode(
+        {"sub": old_email}, server_config.auth.secret_key, algorithm=JWT_ALGORITHM
+    )
+    await _register_session(socketio_server, token, old_email, equipment_no="SN123")
+    await socket_client.connect(_make_handshake_params(token))
+
+    await socketio_server.app["user_service"].update_email(
+        old_email, UpdateEmailDTO(email=new_email)
+    )
+
+    manager: SocketIOServerManager = socketio_server.app["socketio_manager"]
+    await manager.send_message(
+        new_email, SocketMessageData(code="0", msg="email changed")
+    )
+
+    received = await anext(socket_client.messages())
+    assert received.msg == "email changed"
+    assert socket_client.is_connected
+
+    await socket_client.ping(timeout=5.0)
+    await socket_client.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_socketio_client_received_ack(
+    socketio_server: TestServer,
     socket_client: SupernoteSocketClient,
     server_config: ServerConfig,
 ) -> None:
     secret = server_config.auth.secret_key
     token_a = jwt.encode({"sub": "test@example.com"}, secret, algorithm=JWT_ALGORITHM)
+    await _register_session(socketio_server, token_a, "test@example.com")
     params_a = _make_handshake_params(token_a)
 
     await socket_client.connect(params_a)
@@ -230,6 +348,7 @@ async def test_socketio_client_messages_async_iterator(
     secret = server_config.auth.secret_key
     user_id = "test@example.com"
     token_a = jwt.encode({"sub": user_id}, secret, algorithm=JWT_ALGORITHM)
+    await _register_session(socketio_server, token_a, user_id)
     params_a = _make_handshake_params(token_a)
 
     await socket_client.connect(params_a)

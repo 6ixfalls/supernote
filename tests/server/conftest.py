@@ -25,6 +25,7 @@ from supernote.client.device import DeviceClient
 from supernote.client.login_client import LoginClient
 from supernote.client.summary import SummaryClient
 from supernote.client.web import WebClient
+from supernote.models.auth import Equipment
 from supernote.models.user import UserRegisterDTO
 from supernote.server.app import create_app
 from supernote.server.config import AuthConfig, ServerConfig
@@ -201,7 +202,7 @@ async def auth_headers_fixture(
     token = jwt.encode({"sub": TEST_USERNAME}, secret, algorithm=JWT_ALGORITHM)
 
     # 1. Store as regular Session (for login bridge / user service)
-    session_val = f"{TEST_USERNAME}|"
+    session_val = f"{TEST_USERNAME}|v2|{Equipment.WEB.value}|"
     await coordination_service.set_value(f"session:{token}", session_val, ttl=3600)
 
     # 2. Store as MCP token (for MCP resource server verification)

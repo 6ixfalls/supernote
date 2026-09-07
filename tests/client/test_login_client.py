@@ -10,7 +10,7 @@ from supernote.client import Client
 from supernote.client.exceptions import ApiException, SmsVerificationRequired
 from supernote.client.hashing import hash_password
 from supernote.client.login_client import LoginClient
-from supernote.models.auth import LoginVO, RandomCodeVO
+from supernote.models.auth import Equipment, LoginVO, RandomCodeVO
 
 
 async def handler_csrf(request: web.Request) -> web.Response:
@@ -98,11 +98,13 @@ async def test_login_client_equipment_email_and_phone(
     assert isinstance(res1, LoginVO)
     assert res1.token == "eq-token-456"
     assert recorded_logins[-1]["loginMethod"] in (2, "2")
+    assert recorded_logins[-1]["equipment"] == Equipment.TERMINAL.value
 
     # 2. Phone login equipment
     res2 = await login_client.login_equipment("1234567890", "pass123", "EQ002")
     assert isinstance(res2, LoginVO)
     assert recorded_logins[-1]["loginMethod"] in (1, "1")
+    assert recorded_logins[-1]["equipment"] == Equipment.TERMINAL.value
     assert recorded_logins[-1]["equipmentNo"] == "EQ002"
 
 

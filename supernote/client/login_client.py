@@ -6,6 +6,7 @@ from typing import TypeVar
 from mashumaro.mixins.json import DataClassJSONMixin
 
 from supernote.models.auth import (
+    Equipment,
     LoginDTO,
     LoginMethod,
     LoginVO,
@@ -68,6 +69,7 @@ class LoginClient:
             password=encoded_password,
             login_method=LoginMethod.PHONE if email.isdigit() else LoginMethod.EMAIL,
             timestamp=random_code_response.timestamp,
+            equipment=Equipment.TERMINAL,
             equipment_no=equipment_no,
         ).to_dict()
 

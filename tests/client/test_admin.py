@@ -25,6 +25,10 @@ async def test_admin_client_endpoints(aiohttp_client: AiohttpClient) -> None:
         recorded_requests.append(("unregister", None))
         return web.json_response({"success": True})
 
+    async def handler_logout(request: web.Request) -> web.Response:
+        recorded_requests.append(("logout", await request.read()))
+        return web.json_response({"success": True})
+
     async def handler_password(request: web.Request) -> web.Response:
         data = await request.json()
         recorded_requests.append(("password", data))
@@ -78,6 +82,7 @@ async def test_admin_client_endpoints(aiohttp_client: AiohttpClient) -> None:
     app.router.add_get("/api/csrf", handler_csrf)
     app.router.add_post("/api/user/register", handler_register)
     app.router.add_post("/api/user/unregister", handler_unregister)
+    app.router.add_post("/api/user/logout", handler_logout)
     app.router.add_put("/api/user/password", handler_password)
     app.router.add_put("/api/user/email", handler_email)
     app.router.add_post(
@@ -109,50 +114,56 @@ async def test_admin_client_endpoints(aiohttp_client: AiohttpClient) -> None:
     req, data = recorded_requests[-1]
     assert req == "unregister"
 
-    # 3. update_password
+    # 3. logout (the public API specifies an empty request body)
+    await admin.logout()
+    req, data = recorded_requests[-1]
+    assert req == "logout"
+    assert data == b""
+
+    # 4. update_password
     await admin.update_password("newpass123")
     req, data = recorded_requests[-1]
     assert req == "password"
     assert data["password"] == "newpass123"
 
-    # 4. update_email
+    # 5. update_email
     await admin.update_email("newemail@example.com")
     req, data = recorded_requests[-1]
     assert req == "email"
     assert data["email"] == "newemail@example.com"
 
-    # 5. retrieve_password
+    # 6. retrieve_password
     await admin.retrieve_password("user@example.com", "resetpass")
     req, data = recorded_requests[-1]
     assert req == "retrieve_password"
     assert data["email"] == "user@example.com"
     assert data["password"] == "resetpass"
 
-    # 6. admin_create_user
+    # 7. admin_create_user
     await admin.admin_create_user("adminuser@example.com", "adminpass", "Admin User")
     req, data = recorded_requests[-1]
     assert req == "admin_create_user"
     assert data["email"] == "adminuser@example.com"
     assert data["password"] == "adminpass"
 
-    # 7. admin_reset_password
+    # 8. admin_reset_password
     await admin.admin_reset_password("target@example.com", "md5hash123")
     req, data = recorded_requests[-1]
     assert req == "admin_reset_password"
     assert data["email"] == "target@example.com"
     assert data["password"] == "md5hash123"
 
-    # 8. stop_queue
+    # 9. stop_queue
     await admin.stop_queue()
     req, data = recorded_requests[-1]
     assert req == "queue_stop"
 
-    # 9. start_queue
+    # 10. start_queue
     await admin.start_queue()
     req, data = recorded_requests[-1]
     assert req == "queue_start"
 
-    # 10. get_queue_status
+    # 11. get_queue_status
     status = await admin.get_queue_status()
     req, data = recorded_requests[-1]
     assert req == "queue_status"
@@ -162,13 +173,13 @@ async def test_admin_client_endpoints(aiohttp_client: AiohttpClient) -> None:
     assert status.queue_size == 5
     assert status.processing_files == [1, 2]
 
-    # 11. admin_reprocess without file_id
+    # 12. admin_reprocess without file_id
     await admin.admin_reprocess("ocr")
     req, data = recorded_requests[-1]
     assert req == "reprocess"
     assert data == {"task_type": "ocr"}
 
-    # 12. admin_reprocess with file_id
+    # 13. admin_reprocess with file_id
     await admin.admin_reprocess("transcribe", file_id=42)
     req, data = recorded_requests[-1]
     assert req == "reprocess"

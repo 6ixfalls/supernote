@@ -415,6 +415,20 @@ async def handle_unregister(request: web.Request) -> web.Response:
     return web.json_response(BaseResponse().to_dict())
 
 
+@routes.post("/api/user/logout")
+async def handle_logout(request: web.Request) -> web.Response:
+    """Revoke the authenticated session."""
+    token = request.get("auth_token")
+    if not token:
+        return web.json_response(
+            create_error_response("Unauthorized").to_dict(), status=401
+        )
+
+    user_service: UserService = request.app["user_service"]
+    await user_service.revoke_session(str(token))
+    return web.json_response(BaseResponse().to_dict())
+
+
 @routes.put("/api/user/password")
 async def handle_update_password(request: web.Request) -> web.Response:
     """Update user password."""

@@ -69,6 +69,52 @@ async def test_pop_value_has_only_one_winner(
     assert results.count(None) == 9
 
 
+async def test_delete_values_matches_literal_prefixes(
+    local_coordination_service: CoordinationService,
+) -> None:
+    await local_coordination_service.set_value(
+        "session:one", "user_name@example.com|device", ttl=60
+    )
+    await local_coordination_service.set_value(
+        "session:two", "userXname@example.com|device", ttl=60
+    )
+    await local_coordination_service.set_value(
+        "session:three", "User_name@example.com|device", ttl=60
+    )
+    await local_coordination_service.set_value(
+        "unrelated", "user_name@example.com|device", ttl=60
+    )
+
+    deleted = await local_coordination_service.delete_values(
+        "session:", "user_name@example.com|"
+    )
+
+    assert deleted == ["session:one"]
+    assert await local_coordination_service.get_value("session:one") is None
+    assert await local_coordination_service.get_value("session:two") is not None
+    assert await local_coordination_service.get_value("session:three") is not None
+    assert await local_coordination_service.get_value("unrelated") is not None
+
+
+async def test_delete_values_can_match_an_exact_value(
+    local_coordination_service: CoordinationService,
+) -> None:
+    await local_coordination_service.set_value(
+        "session:web", "user@example.com|", ttl=60
+    )
+    await local_coordination_service.set_value(
+        "session:device", "user@example.com|SN123", ttl=60
+    )
+
+    deleted = await local_coordination_service.delete_values(
+        "session:", "user@example.com|", exact_value=True
+    )
+
+    assert deleted == ["session:web"]
+    assert await local_coordination_service.get_value("session:web") is None
+    assert await local_coordination_service.get_value("session:device") is not None
+
+
 async def test_increment(coordination_service: SqliteCoordinationService) -> None:
     key = "incr:test"
 
