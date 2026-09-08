@@ -114,6 +114,7 @@ class GeminiOcrModule(ProcessorModule):
             model=model_id,
             contents=[
                 types.Content(
+                    role="user",
                     parts=parts,
                 )
             ],

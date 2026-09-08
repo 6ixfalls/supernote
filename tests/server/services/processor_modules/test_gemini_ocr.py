@@ -96,6 +96,7 @@ async def test_process_ocr_success(
     assert kwargs["model"] == "gemini-2.0-flash-exp"
 
     content_obj = kwargs["contents"][0]
+    assert content_obj.role == "user"
     parts = content_obj.parts
     assert len(parts) == 2
     assert "Transcribe this page." in parts[0].text

@@ -120,7 +120,7 @@ async def run_ocr_for_page(
 
     response = await gemini_service.generate_content(
         model=model,
-        contents=[types.Content(parts=parts)],
+        contents=[types.Content(role="user", parts=parts)],
         config={"media_resolution": types.MediaResolution.MEDIA_RESOLUTION_HIGH},
     )
 
