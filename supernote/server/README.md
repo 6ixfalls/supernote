@@ -17,7 +17,7 @@ See the main [README.md](../../README.md) for a quick start guide.
 
 -   A Supernote device (Nomad, A5 X, A6 X, etc.)
 -   Python 3.13+ or Docker.
--   (Recommended) **Gemini API Key** for OCR and Summarization.
+-   (Recommended) **Vercel AI Gateway API key** for OCR and Summarization.
 
 ### Configuration
 
@@ -26,10 +26,26 @@ The server is configured via `config/config.yaml` or environment variables.
 For a comprehensive reference, see the [ServerConfig documentation](https://allenporter.github.io/supernote/supernote/server.html#ServerConfig).
 
 #### AI Configuration
-To enable AI features, set the Gemini API key:
+
+AI features are served by Gemini models routed through the
+[Vercel AI SDK](https://ai-python.dev/) and the AI Gateway. To enable them, set
+an AI Gateway API key:
 ```bash
-export SUPERNOTE_GEMINI_API_KEY="your-api-key"
+export SUPERNOTE_AI_API_KEY="your-ai-gateway-api-key"
+# Alternatively, the SDK-native AI_GATEWAY_API_KEY is honored as a fallback.
 ```
+
+Additional AI settings:
+
+| Setting | Env Var | Default | Description |
+| --- | --- | --- | --- |
+| `ai.provider` | `SUPERNOTE_AI_PROVIDER` | `google` | Gateway serving provider (`google` for the Gemini API or `vertex` for Vertex AI). |
+| `ai.ocr_model` | `SUPERNOTE_AI_OCR_MODEL` | `gemini-3.6-flash` | Model used for OCR and summarization. |
+| `ai.embedding_model` | `SUPERNOTE_AI_EMBEDDING_MODEL` | `gemini-embedding-001` | Model used for embeddings. |
+| `ai.flex` | `SUPERNOTE_AI_FLEX` | `false` | Use the Flex service tier for lower-cost, batch-tolerant generation. |
+| `ai.zdr` | `SUPERNOTE_AI_ZDR` | `false` | Require zero-data-retention routing for generation and embeddings. |
+| `ai.max_concurrency` | `SUPERNOTE_AI_MAX_CONCURRENCY` | `5` | Maximum number of concurrent AI API calls. |
+| `ai.prompts_dir` | `SUPERNOTE_AI_PROMPTS_DIR` | unset | Directory containing custom OCR and summarization prompts. |
 
 ### Running the Server
 
@@ -58,7 +74,7 @@ docker build -t supernote .
 docker run -d \
   -p 8080:8080 \
   -v $(pwd)/storage:/storage \
-  -e SUPERNOTE_GEMINI_API_KEY="your-key" \
+  -e SUPERNOTE_AI_API_KEY="your-ai-gateway-key" \
   --name supernote-server \
   supernote serve
 ```

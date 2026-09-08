@@ -13,19 +13,19 @@ from aiohttp.test_utils import TestClient
 from supernote.models.file_device import FileUploadApplyLocalDTO
 
 
-def test_import_does_not_load_google_genai() -> None:
-    """Importing the server bootstrap module should not eagerly import
-    `google-genai` (see issue #106).
+def test_import_does_not_load_ai_sdk() -> None:
+    """Importing the server bootstrap module should not eagerly import the
+    Vercel AI SDK `ai` package (see issue #106).
 
-    `google-genai` is only needed once a Gemini API key is configured. Run
-    in a subprocess so the check isn't polluted by other tests in this
-    session having already imported the module.
+    The SDK is only needed once an API key is configured. Run in a subprocess
+    so the check isn't polluted by other tests in this session having already
+    imported the module.
     """
     check = (
         "import sys; import supernote.server.app; "
         "loaded = sorted("
         "m for m in sys.modules "
-        "if m == 'google.genai' or m.startswith('google.genai.')"
+        "if m == 'ai' or m.startswith('ai.')"
         "); "
         "print(','.join(loaded))"
     )
@@ -36,7 +36,7 @@ def test_import_does_not_load_google_genai() -> None:
         check=True,
     )
     assert result.stdout.strip() == "", (
-        f"google-genai modules unexpectedly loaded: {result.stdout.strip()}"
+        f"AI SDK modules unexpectedly loaded: {result.stdout.strip()}"
     )
 
 

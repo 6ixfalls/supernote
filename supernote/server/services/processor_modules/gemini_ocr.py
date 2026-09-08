@@ -1,4 +1,5 @@
 import logging
+from typing import Any
 
 from supernote.server.config import ServerConfig
 from supernote.server.constants import CACHE_BUCKET
@@ -7,13 +8,15 @@ from supernote.server.db.session import DatabaseSessionManager
 from supernote.server.services.file import FileService
 from supernote.server.services.gemini import GeminiService
 from supernote.server.services.processor_modules import ProcessorModule
-from supernote.server.utils.gemini_content import PageMetadata, create_gemini_content
+from supernote.server.utils.gemini_content import PageMetadata, build_ocr_prompt
 from supernote.server.utils.note_content import (
     get_page_content_by_id,
 )
 from supernote.server.utils.paths import get_page_png_path
 
 logger = logging.getLogger(__name__)
+
+HIGH_MEDIA_RESOLUTION: dict[str, Any] = {"mediaResolution": "MEDIA_RESOLUTION_HIGH"}
 
 
 class GeminiOcrModule(ProcessorModule):
@@ -80,9 +83,6 @@ class GeminiOcrModule(ProcessorModule):
             logger.error(f"Page ID required for OCR processing of file {file_id}")
             return
 
-        # Deferred: google-genai is only needed once OCR actually runs.
-        from google.genai import types  # noqa: PLC0415
-
         # Get PNG Content
         png_path = get_page_png_path(file_id, page_id)
         png_data = b""
@@ -108,19 +108,16 @@ class GeminiOcrModule(ProcessorModule):
             page_id=page_id,
             notebook_create_time=notebook_create_time,
         )
-        model_id = self.config.gemini_ocr_model
-        parts = create_gemini_content(page_metadata, png_data)
+        model_id = self.config.ai.ocr_model
+        prompt = build_ocr_prompt(page_metadata)
         response = await self.gemini_service.generate_content(
             model=model_id,
-            contents=[
-                types.Content(
-                    parts=parts,
-                )
-            ],
-            config={"media_resolution": types.MediaResolution.MEDIA_RESOLUTION_HIGH},
+            prompt=prompt,
+            image=png_data,
+            provider_options=HIGH_MEDIA_RESOLUTION,
         )
 
-        text_content = response.text if response.text else ""
+        text_content = response.text or ""
 
         # Save Result
         async with session_manager.session() as session:

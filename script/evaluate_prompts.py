@@ -5,7 +5,6 @@ import argparse
 import asyncio
 import io
 import json
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -13,12 +12,10 @@ from pathlib import Path
 # Add project root to sys.path so we can import supernote
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from google.genai import types
-from mashumaro.jsonschema import build_json_schema
-
 from supernote.notebook import Notebook, PngConverter, load_notebook
 from supernote.server.config import ServerConfig
 from supernote.server.services.gemini import GeminiService
+from supernote.server.services.processor_modules.gemini_ocr import HIGH_MEDIA_RESOLUTION
 from supernote.server.services.processor_modules.summary import SummaryResponse
 from supernote.server.utils.note_content import format_page_metadata
 from supernote.server.utils.prompt_loader import PromptId, PromptLoader
@@ -53,7 +50,7 @@ def parse_args() -> argparse.Namespace:
         "--api-key",
         type=str,
         default=None,
-        help="Gemini API Key (overrides env SUPERNOTE_GEMINI_API_KEY).",
+        help="AI Gateway API key (overrides SUPERNOTE_AI_API_KEY and AI_GATEWAY_API_KEY).",
     )
     parser.add_argument(
         "--ocr-model", type=str, default=None, help="OCR model override."
@@ -114,18 +111,14 @@ async def run_ocr_for_page(
 
     print(f"Running OCR on Page {page_idx + 1} (ID: {page_id})...")
 
-    parts = [
-        types.Part.from_text(text=full_ocr_prompt),
-        types.Part.from_bytes(data=png_data, mime_type="image/png"),
-    ]
-
     response = await gemini_service.generate_content(
         model=model,
-        contents=[types.Content(parts=parts)],
-        config={"media_resolution": types.MediaResolution.MEDIA_RESOLUTION_HIGH},
+        prompt=full_ocr_prompt,
+        image=png_data,
+        provider_options=HIGH_MEDIA_RESOLUTION,
     )
 
-    text_content = response.text if response.text else ""
+    text_content = response.text or ""
     formatted_page_transcript = f"{metadata_block}\n{text_content}"
 
     # Save individual page transcript
@@ -203,18 +196,14 @@ async def run_summary_pipeline(
     full_summary_prompt = f"{summary_prompt_template}\n\nTRANSCRIPT:\n{full_transcript}"
 
     print("Running Summary Generation...")
-    schema = build_json_schema(SummaryResponse).to_dict()
 
     summary_response = await gemini_service.generate_content(
         model=model,
-        contents=full_summary_prompt,
-        config={
-            "response_mime_type": "application/json",
-            "response_json_schema": schema,
-        },
+        prompt=full_summary_prompt,
+        output_type=SummaryResponse,
     )
 
-    summary_text = summary_response.text if summary_response.text else "{}"
+    summary_text = summary_response.text or "{}"
     (out_dir / "summary_raw.json").write_text(summary_text, encoding="utf-8")
 
     # Format summary markdown
@@ -281,23 +270,27 @@ async def main_async() -> None:
 
     # Determine api key
     api_key = (
-        args.api_key or os.getenv("SUPERNOTE_GEMINI_API_KEY") or config.gemini_api_key
+        args.api_key
+        or config.ai.api_key
     )
     if not api_key:
         print(
-            "Error: Gemini API Key is required. Please set SUPERNOTE_GEMINI_API_KEY, use --api-key, or configure gemini_api_key in config/config.yaml.",
+            "Error: AI Gateway API key is required. Please set SUPERNOTE_AI_API_KEY "
+            "(or AI_GATEWAY_API_KEY), use --api-key, or configure ai.api_key in "
+            "config/config.yaml.",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    ocr_model = args.ocr_model or config.gemini_ocr_model
+    ocr_model = args.ocr_model or config.ai.ocr_model
     summary_model = args.summary_model or ocr_model
 
     print(f"OCR Model: {ocr_model}")
     print(f"Summary Model: {summary_model}")
 
     # Initialize Gemini service
-    gemini_service = GeminiService(api_key=api_key)
+    config.ai.api_key = api_key
+    gemini_service = GeminiService(config)
 
     # Set up prompt loader
     if args.prompt_dir:

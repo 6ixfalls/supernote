@@ -34,15 +34,16 @@ def server_config_gemini(tmp_path: Path) -> ServerConfig:
         storage_dir=str(tmp_path),
         # db_url is a property, not an init arg. We mock session_manager anyway.
     )
-    conf.gemini_api_key = "fake-key"
-    conf.gemini_ocr_model = "gemini-2.0-flash-exp"
-    conf.gemini_embedding_model = "text-embedding-004"
+    conf.ai.api_key = "fake-key"
+    conf.ai.provider = "google"
+    conf.ai.ocr_model = "gemini-2.0-flash-exp"
+    conf.ai.embedding_model = "text-embedding-004"
     return conf
 
 
 @pytest.fixture
 def gemini_service(server_config_gemini: ServerConfig) -> GeminiService:
-    return GeminiService(api_key=server_config_gemini.gemini_api_key)
+    return GeminiService(server_config_gemini)
 
 
 @pytest.fixture

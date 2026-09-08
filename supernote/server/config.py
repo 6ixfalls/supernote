@@ -3,8 +3,9 @@ import os
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
+import yaml
 from mashumaro.config import TO_DICT_ADD_OMIT_NONE_FLAG, BaseConfig
 from mashumaro.mixins.yaml import DataClassYAMLMixin
 
@@ -53,6 +54,65 @@ class AuthConfig(DataClassYAMLMixin):
     When disabled, unauthenticated bind attempts require approval in the web UI.
 
     Env Var: `SUPERNOTE_ALLOW_UNAUTHENTICATED_BINDS`
+    """
+
+    class Config(BaseConfig):
+        omit_none = True
+        code_generation_options = [TO_DICT_ADD_OMIT_NONE_FLAG]  # type: ignore[list-item]
+
+
+@dataclass
+class AIConfig(DataClassYAMLMixin):
+    """Configuration for AI features served through Vercel AI Gateway."""
+
+    api_key: str | None = None
+    """Vercel AI Gateway API key.
+
+    Falls back to the `AI_GATEWAY_API_KEY` environment variable when unset.
+
+    Env Var: `SUPERNOTE_AI_API_KEY`
+    """
+
+    provider: str = "google"
+    """Gateway serving provider for Gemini models (`google` or `vertex`).
+
+    Env Var: `SUPERNOTE_AI_PROVIDER`
+    """
+
+    ocr_model: str = "gemini-3.6-flash"
+    """Gemini model to use for OCR and summarization.
+
+    Env Var: `SUPERNOTE_AI_OCR_MODEL`
+    """
+
+    embedding_model: str = "gemini-embedding-001"
+    """Gemini model to use for embeddings.
+
+    Env Var: `SUPERNOTE_AI_EMBEDDING_MODEL`
+    """
+
+    max_concurrency: int = 5
+    """Maximum number of concurrent AI API calls.
+
+    Env Var: `SUPERNOTE_AI_MAX_CONCURRENCY`
+    """
+
+    flex: bool = False
+    """Use Gemini Flex inference for lower-cost batch-tolerant processing.
+
+    Env Var: `SUPERNOTE_AI_FLEX`
+    """
+
+    zdr: bool = False
+    """Restrict Gateway routing to zero-data-retention providers.
+
+    Env Var: `SUPERNOTE_AI_ZDR`
+    """
+
+    prompts_dir: str | None = None
+    """Directory containing custom AI prompts.
+
+    Env Var: `SUPERNOTE_AI_PROMPTS_DIR`
     """
 
     class Config(BaseConfig):
@@ -120,36 +180,7 @@ class ServerConfig(DataClassYAMLMixin):
     """
 
     auth: AuthConfig = field(default_factory=AuthConfig)
-
-    gemini_api_key: str | None = None
-    """Google Gemini API Key for OCR and Embeddings.
-
-    Env Var: `SUPERNOTE_GEMINI_API_KEY`
-    """
-
-    gemini_ocr_model: str = "gemini-3.6-flash"
-    """Gemini model to use for OCR.
-
-    Env Var: `SUPERNOTE_GEMINI_OCR_MODEL`
-    """
-
-    gemini_embedding_model: str = "gemini-embedding-001"
-    """Gemini model to use for Embeddings.
-BaseConfig
-    Env Var: `SUPERNOTE_GEMINI_EMBEDDING_MODEL`
-    """
-
-    gemini_max_concurrency: int = 5
-    """Maximum number of concurrent Gemini API calls.
-
-    Env Var: `SUPERNOTE_GEMINI_MAX_CONCURRENCY`
-    """
-
-    prompts_dir: str | None = None
-    """Directory where custom Gemini prompts are located.
-
-    Env Var: `SUPERNOTE_PROMPTS_DIR`
-    """
+    ai: AIConfig = field(default_factory=AIConfig)
 
     metrics_enabled: bool = True
     """Whether to enable the Prometheus metrics endpoint and logging middleware.
@@ -232,7 +263,8 @@ BaseConfig
         if config_file.exists():
             try:
                 with open(config_file, "r") as f:
-                    config = cls.from_yaml(f.read())
+                    config_data = yaml.safe_load(f) or {}
+                config = cls.from_dict(_migrate_legacy_ai_config(config_data))
             except Exception as e:
                 logger.warning(f"Failed to load config file {config_file}: {e}")
 
@@ -331,34 +363,74 @@ BaseConfig
             config.trusted_proxies = [p.strip() for p in val.split(",") if p.strip()]
             logger.info(f"Using SUPERNOTE_TRUSTED_PROXIES: {config.trusted_proxies}")
 
-        if gemini_api_key := os.getenv("SUPERNOTE_GEMINI_API_KEY"):
-            config.gemini_api_key = gemini_api_key
-            logger.info(
-                f"Using SUPERNOTE_GEMINI_API_KEY: xxx...{config.gemini_api_key[-3:]}"
+        ai_api_key = os.getenv("SUPERNOTE_AI_API_KEY")
+        if ai_api_key:
+            config.ai.api_key = ai_api_key
+            logger.info(f"Using AI API key: xxx...{config.ai.api_key[-3:]}")
+        elif not config.ai.api_key and (
+            gateway_api_key := os.getenv("AI_GATEWAY_API_KEY")
+        ):
+            config.ai.api_key = gateway_api_key
+            logger.info("Using AI_GATEWAY_API_KEY")
+
+        if os.getenv("SUPERNOTE_GEMINI_API_KEY"):
+            logger.warning(
+                "SUPERNOTE_GEMINI_API_KEY is a Google Gemini credential and cannot "
+                "authenticate with Vercel AI Gateway; configure SUPERNOTE_AI_API_KEY "
+                "or AI_GATEWAY_API_KEY instead"
             )
 
-        if gemini_ocr_model := os.getenv("SUPERNOTE_GEMINI_OCR_MODEL"):
-            config.gemini_ocr_model = gemini_ocr_model
-            logger.info(f"Using SUPERNOTE_GEMINI_OCR_MODEL: {config.gemini_ocr_model}")
+        if ai_provider := os.getenv("SUPERNOTE_AI_PROVIDER") or os.getenv(
+            "SUPERNOTE_GEMINI_PROVIDER"
+        ):
+            config.ai.provider = ai_provider
+            logger.info(f"Using AI provider: {config.ai.provider}")
 
-        if gemini_embedding_model := os.getenv("SUPERNOTE_GEMINI_EMBEDDING_MODEL"):
-            config.gemini_embedding_model = gemini_embedding_model
-            logger.info(
-                f"Using SUPERNOTE_GEMINI_EMBEDDING_MODEL: {config.gemini_embedding_model}"
-            )
+        if ai_ocr_model := os.getenv("SUPERNOTE_AI_OCR_MODEL") or os.getenv(
+            "SUPERNOTE_GEMINI_OCR_MODEL"
+        ):
+            config.ai.ocr_model = ai_ocr_model
+            logger.info(f"Using AI OCR model: {config.ai.ocr_model}")
 
-        if gemini_max_concurrency := os.getenv("SUPERNOTE_GEMINI_MAX_CONCURRENCY"):
+        if ai_embedding_model := os.getenv("SUPERNOTE_AI_EMBEDDING_MODEL") or os.getenv(
+            "SUPERNOTE_GEMINI_EMBEDDING_MODEL"
+        ):
+            config.ai.embedding_model = ai_embedding_model
+            logger.info(f"Using AI embedding model: {config.ai.embedding_model}")
+
+        ai_max_concurrency = os.getenv("SUPERNOTE_AI_MAX_CONCURRENCY") or os.getenv(
+            "SUPERNOTE_GEMINI_MAX_CONCURRENCY"
+        )
+        if ai_max_concurrency:
             try:
-                config.gemini_max_concurrency = int(gemini_max_concurrency)
-                logger.info(
-                    f"Using SUPERNOTE_GEMINI_MAX_CONCURRENCY: {config.gemini_max_concurrency}"
-                )
+                config.ai.max_concurrency = int(ai_max_concurrency)
+                logger.info(f"Using AI max concurrency: {config.ai.max_concurrency}")
             except ValueError:
                 pass
 
-        if prompts_dir := os.getenv("SUPERNOTE_PROMPTS_DIR"):
-            config.prompts_dir = prompts_dir
-            logger.info(f"Using SUPERNOTE_PROMPTS_DIR: {config.prompts_dir}")
+        ai_flex_env = (
+            "SUPERNOTE_AI_FLEX"
+            if "SUPERNOTE_AI_FLEX" in os.environ
+            else "SUPERNOTE_GEMINI_FLEX"
+        )
+        if ai_flex_env in os.environ:
+            config.ai.flex = _get_bool_env(ai_flex_env, config.ai.flex)
+            logger.info(f"Using AI Flex inference: {config.ai.flex}")
+
+        ai_zdr_env = (
+            "SUPERNOTE_AI_ZDR"
+            if "SUPERNOTE_AI_ZDR" in os.environ
+            else "SUPERNOTE_GEMINI_ZDR"
+        )
+        if ai_zdr_env in os.environ:
+            config.ai.zdr = _get_bool_env(ai_zdr_env, config.ai.zdr)
+            logger.info(f"Using AI zero data retention: {config.ai.zdr}")
+
+        if ai_prompts_dir := os.getenv("SUPERNOTE_AI_PROMPTS_DIR") or os.getenv(
+            "SUPERNOTE_PROMPTS_DIR"
+        ):
+            config.ai.prompts_dir = ai_prompts_dir
+            logger.info(f"Using AI prompts directory: {config.ai.prompts_dir}")
 
         if os.getenv("SUPERNOTE_METRICS_ENABLED"):
             config.metrics_enabled = _get_bool_env(
@@ -380,3 +452,34 @@ BaseConfig
     class Config(BaseConfig):
         omit_none = True
         code_generation_options = [TO_DICT_ADD_OMIT_NONE_FLAG]  # type: ignore[list-item]
+
+
+_LEGACY_AI_CONFIG_KEYS = {
+    "gemini_provider": "provider",
+    "gemini_ocr_model": "ocr_model",
+    "gemini_embedding_model": "embedding_model",
+    "gemini_max_concurrency": "max_concurrency",
+    "gemini_flex": "flex",
+    "gemini_zdr": "zdr",
+    "prompts_dir": "prompts_dir",
+}
+
+
+def _migrate_legacy_ai_config(config_data: Any) -> dict[str, Any]:
+    """Move compatible legacy Gemini settings into the unified AI block."""
+    if not isinstance(config_data, dict):
+        raise ValueError("Server configuration must be a mapping")
+    migrated = dict(config_data)
+    ai_config = dict(migrated.get("ai") or {})
+    if migrated.pop("gemini_api_key", None) is not None:
+        logger.warning(
+            "Ignoring legacy gemini_api_key because Google Gemini credentials "
+            "cannot authenticate with Vercel AI Gateway; configure ai.api_key instead"
+        )
+    for legacy_key, ai_key in _LEGACY_AI_CONFIG_KEYS.items():
+        legacy_value = migrated.pop(legacy_key, None)
+        if legacy_value is not None and ai_key not in ai_config:
+            ai_config[ai_key] = legacy_value
+    if ai_config:
+        migrated["ai"] = ai_config
+    return migrated

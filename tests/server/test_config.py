@@ -75,6 +75,81 @@ def test_server_config_env_var_override(tmp_path: Path) -> None:
         assert config.auth.allow_unauthenticated_binds is True
 
 
+def test_unified_ai_config_from_env(tmp_path: Path) -> None:
+    config_dir = tmp_path / "config"
+    with patch.dict(
+        os.environ,
+        {
+            "SUPERNOTE_AI_API_KEY": "gateway-key",
+            "SUPERNOTE_AI_PROVIDER": "vertex",
+            "SUPERNOTE_AI_OCR_MODEL": "gemini-test",
+            "SUPERNOTE_AI_EMBEDDING_MODEL": "embedding-test",
+            "SUPERNOTE_AI_MAX_CONCURRENCY": "7",
+            "SUPERNOTE_AI_FLEX": "true",
+            "SUPERNOTE_AI_ZDR": "true",
+            "SUPERNOTE_AI_PROMPTS_DIR": "/tmp/prompts",
+        },
+    ):
+        config = ServerConfig.load(config_dir)
+
+    assert config.ai.api_key == "gateway-key"
+    assert config.ai.provider == "vertex"
+    assert config.ai.ocr_model == "gemini-test"
+    assert config.ai.embedding_model == "embedding-test"
+    assert config.ai.max_concurrency == 7
+    assert config.ai.flex is True
+    assert config.ai.zdr is True
+    assert config.ai.prompts_dir == "/tmp/prompts"
+
+
+def test_ai_gateway_key_is_configuration_fallback(tmp_path: Path) -> None:
+    with patch.dict(
+        os.environ,
+        {"AI_GATEWAY_API_KEY": "sdk-key"},
+        clear=True,
+    ):
+        config = ServerConfig.load(tmp_path / "config")
+
+    assert config.ai.api_key == "sdk-key"
+
+
+def test_legacy_gemini_yaml_migrates_compatible_ai_config(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "gemini_api_key: old-key\n"
+        "gemini_provider: vertex\n"
+        "gemini_ocr_model: old-ocr\n"
+        "gemini_embedding_model: old-embedding\n"
+        "gemini_max_concurrency: 9\n"
+        "gemini_flex: true\n"
+        "gemini_zdr: true\n"
+        "prompts_dir: /old/prompts\n"
+    )
+
+    with patch.dict(os.environ, {}, clear=True):
+        config = ServerConfig.load(config_file=config_file)
+
+    assert config.ai.api_key is None
+    assert config.ai.provider == "vertex"
+    assert config.ai.ocr_model == "old-ocr"
+    assert config.ai.embedding_model == "old-embedding"
+    assert config.ai.max_concurrency == 9
+    assert config.ai.flex is True
+    assert config.ai.zdr is True
+    assert config.ai.prompts_dir == "/old/prompts"
+
+
+def test_legacy_gemini_env_key_is_not_used_for_gateway(tmp_path: Path) -> None:
+    with patch.dict(
+        os.environ,
+        {"SUPERNOTE_GEMINI_API_KEY": "old-google-key"},
+        clear=True,
+    ):
+        config = ServerConfig.load(tmp_path / "config")
+
+    assert config.ai.api_key is None
+
+
 def test_trace_log_file_env_enables_and_disables_logging(tmp_path: Path) -> None:
     config_file = tmp_path / "config.yaml"
     config_file.write_text("trace_log_file: configured-trace.log\n")

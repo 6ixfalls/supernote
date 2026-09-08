@@ -87,17 +87,17 @@ class GeminiEmbeddingModule(ProcessorModule):
         if not self.gemini_service.is_configured:
             raise ValueError("Gemini API key not configured")
 
-        model_id = self.config.gemini_embedding_model
-        response = await self.gemini_service.embed_content(
+        model_id = self.config.ai.embedding_model
+        embeddings = await self.gemini_service.embed_content(
             model=model_id,
-            contents=text_content,
+            contents=[text_content],
         )
 
-        if not response.embeddings:
+        if not embeddings:
             raise ValueError("No embeddings returned from Gemini API")
 
         # Assuming single embedding for the whole text block for now
-        embedding_values = response.embeddings[0].values
+        embedding_values = embeddings[0]
         embedding_json = json.dumps(embedding_values)
 
         # Save Result

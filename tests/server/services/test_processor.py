@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from sqlalchemy import select
 
+from supernote.server.config import ServerConfig
 from supernote.server.constants import CACHE_BUCKET
 from supernote.server.db.models.file import UserFileDO
 from supernote.server.db.models.note_processing import NotePageContentDO, SystemTaskDO
@@ -427,12 +428,13 @@ async def test_page_parallelism(
 
 async def test_gemini_concurrency_limit() -> None:
     max_concurrency = 2
+    config = ServerConfig()
+    config.ai.api_key = "fake-key"
+    config.ai.max_concurrency = max_concurrency
 
     # Use patch to avoid actually calling the API
-    with patch("google.genai.Client") as mock_client_cls:
-        service = GeminiService(api_key="fake-key", max_concurrency=max_concurrency)
-        mock_client = mock_client_cls.return_value
-        service._client = mock_client
+    with patch("ai.experimental_generate") as mock_generate:
+        service = GeminiService(config)
 
         active_calls = 0
         max_active_seen = 0
@@ -447,9 +449,11 @@ async def test_gemini_concurrency_limit() -> None:
             finally:
                 active_calls -= 1
 
-        mock_client.aio.models.generate_content = AsyncMock(side_effect=slow_call)
+        mock_generate.side_effect = slow_call
 
-        tasks = [service.generate_content("model", "content") for _ in range(4)]
+        tasks = [
+            service.generate_content(model="model", prompt="content") for _ in range(4)
+        ]
         await asyncio.gather(*tasks)
 
         assert max_active_seen == 2, (
