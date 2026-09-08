@@ -238,8 +238,8 @@ async def handle_extended_ai_status(request: web.Request) -> web.Response:
     # Endpoint: GET /api/extended/ai/status
     # Purpose: Returns server AI processing configuration and API key health status.
     config = request.app.get("config")
-    ai_key = config.ai.api_key if config else None
-    has_api_key = bool(ai_key and ai_key.strip())
+    gemini_key = getattr(config, "gemini_api_key", None) if config else None
+    has_api_key = bool(gemini_key and gemini_key.strip())
 
     return web.json_response(
         {
@@ -247,7 +247,6 @@ async def handle_extended_ai_status(request: web.Request) -> web.Response:
             "hasApiKey": has_api_key,
             "ocrEnabled": has_api_key,
             "vectorSearchEnabled": has_api_key,
-            "provider": config.ai.provider if config else None,
-            "model": config.ai.ocr_model if config else None,
+            "model": getattr(config, "gemini_ocr_model", None) if config else None,
         }
     )

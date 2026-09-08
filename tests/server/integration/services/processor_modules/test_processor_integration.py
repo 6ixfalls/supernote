@@ -119,7 +119,9 @@ async def test_full_processing_pipeline_with_real_file(
     mock_response.text = "Handwritten text content"
     mock_gemini_service.generate_content.return_value = mock_response
 
-    mock_gemini_service.embed_content.return_value = [[0.1, 0.2, 0.3]]
+    mock_embed = MagicMock()
+    mock_embed.values = [0.1, 0.2, 0.3]
+    mock_gemini_service.embed_content.return_value = MagicMock(embeddings=[mock_embed])
 
     # Execute Pipeline
     await processor_service.process_file(file_id)

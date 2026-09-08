@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+from google.genai import types
 from sqlalchemy import select
 
 from supernote.server.config import ServerConfig
@@ -10,10 +11,7 @@ from supernote.server.db.models.note_processing import NotePageContentDO, System
 from supernote.server.db.session import DatabaseSessionManager
 from supernote.server.services.blob import BlobStorage
 from supernote.server.services.file import FileService
-from supernote.server.services.processor_modules.gemini_ocr import (
-    HIGH_MEDIA_RESOLUTION,
-    GeminiOcrModule,
-)
+from supernote.server.services.processor_modules.gemini_ocr import GeminiOcrModule
 from supernote.server.utils.paths import get_page_png_path
 from supernote.server.utils.prompt_loader import PromptId
 
@@ -97,12 +95,16 @@ async def test_process_ocr_success(
     _, kwargs = call_args
     assert kwargs["model"] == "gemini-2.0-flash-exp"
 
-    prompt_text = kwargs["prompt"]
-    assert "Transcribe this page." in prompt_text
-    assert "Notebook Filename: real.note" in prompt_text
-    assert kwargs["image"] == png_content
-    # Verify media resolution option passed
-    assert kwargs["provider_options"] == HIGH_MEDIA_RESOLUTION
+    content_obj = kwargs["contents"][0]
+    parts = content_obj.parts
+    assert len(parts) == 2
+    assert "Transcribe this page." in parts[0].text
+    assert "Notebook Filename: real.note" in parts[0].text
+    assert parts[1].inline_data.data == png_content
+    # Verify config passed
+    assert kwargs["config"] == {
+        "media_resolution": types.MediaResolution.MEDIA_RESOLUTION_HIGH
+    }
 
     # Verify DB Updates
     async with session_manager.session() as session:
@@ -199,7 +201,7 @@ async def test_ocr_with_inferred_date(
     # Verify Prompt
     call_args = mock_gemini_service.generate_content.call_args
     _, kwargs = call_args
-    prompt_text = kwargs["prompt"]
+    prompt_text = kwargs["contents"][0].parts[0].text
     assert "--- Page 1 ---" in prompt_text
     assert "Notebook Filename: test.note" in prompt_text
     assert "Page ID: P20231027123456" in prompt_text

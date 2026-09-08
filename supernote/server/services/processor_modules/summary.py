@@ -1,9 +1,11 @@
 import hashlib
 import json
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 
-import pydantic
+from mashumaro.jsonschema import build_json_schema
+from mashumaro.mixins.json import DataClassJSONMixin
 from sqlalchemy import select
 
 from supernote.models.summary import (
@@ -34,35 +36,36 @@ logger = logging.getLogger(__name__)
 
 
 # Define structured output schema
-class SummarySegment(pydantic.BaseModel):
-    date_range: str = pydantic.Field(
-        description=(
-            "The date range covered by this segment (e.g., '2023-10-27', "
-            "'Week of Oct 27')."
-        )
+@dataclass
+class SummarySegment(DataClassJSONMixin):
+    date_range: str = field(
+        metadata={
+            "description": "The date range covered by this segment (e.g., '2023-10-27', 'Week of Oct 27')."
+        }
     )
-    summary: str = pydantic.Field(
-        description=(
-            "A concise summary of the events, tasks, and notes for this period."
-        )
+    summary: str = field(
+        metadata={
+            "description": "A concise summary of the events, tasks, and notes for this period."
+        }
     )
-    extracted_dates: list[str] = pydantic.Field(
-        description=(
-            "List of specific dates derived from the content in ISO 8601 format "
-            "(YYYY-MM-DD)."
-        )
+    extracted_dates: list[str] = field(
+        metadata={
+            "description": "List of specific dates derived from the content in ISO 8601 format (YYYY-MM-DD)."
+        }
     )
-    page_refs: list[int] = pydantic.Field(
-        description=(
-            "List of 1-indexed page numbers typically found in the text as "
-            "'--- Page X ---'."
-        )
+    page_refs: list[int] = field(
+        metadata={
+            "description": "List of 1-indexed page numbers typically found in the text as '--- Page X ---'."
+        }
     )
 
 
-class SummaryResponse(pydantic.BaseModel):
-    segments: list[SummarySegment] = pydantic.Field(
-        description="List of summary segments extracted from the transcript."
+@dataclass
+class SummaryResponse(DataClassJSONMixin):
+    segments: list[SummarySegment] = field(
+        metadata={
+            "description": "List of summary segments extracted from the transcript."
+        }
     )
 
 
@@ -213,9 +216,14 @@ class SummaryModule(ProcessorModule):
 
         try:
             response = await self.gemini_service.generate_content(
-                model=self.config.ai.ocr_model,
-                prompt=prompt,
-                output_type=SummaryResponse,
+                model=self.config.gemini_ocr_model,
+                contents=prompt,
+                config={
+                    "response_mime_type": "application/json",
+                    "response_json_schema": build_json_schema(
+                        SummaryResponse
+                    ).to_dict(),
+                },
             )
         except Exception as e:
             logger.error(f"Failed to generate AI summary for file {file_id}: {e}")

@@ -48,15 +48,3 @@ auth:
   # When disabled, the public password reset endpoint returns 403.
   enable_remote_password_reset: false
 
-# Optional AI features, served through Vercel AI Gateway.
-# The API key can also be supplied with SUPERNOTE_AI_API_KEY or
-# AI_GATEWAY_API_KEY instead of storing it in this file.
-ai:
-  # api_key: "your-ai-gateway-api-key"
-  provider: google # "google" (Gemini API) or "vertex" (Vertex AI)
-  ocr_model: gemini-3.6-flash
-  embedding_model: gemini-embedding-001
-  max_concurrency: 5
-  flex: false
-  zdr: false
-  # prompts_dir: "path/to/your/prompts"

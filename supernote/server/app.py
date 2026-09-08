@@ -464,11 +464,13 @@ def create_app(config: ServerConfig) -> web.Application:
     app["file_service"] = file_service
     app["url_signer"] = UrlSigner(config.auth.secret_key, coordination_service)
     app["schedule_service"] = ScheduleService(session_manager)
-    gemini_service = GeminiService(config)
+    gemini_service = GeminiService(
+        config.gemini_api_key, max_concurrency=config.gemini_max_concurrency
+    )
     app["gemini_service"] = gemini_service
 
-    if config.ai.prompts_dir:
-        PROMPT_LOADER.configure(Path(config.ai.prompts_dir))
+    if config.prompts_dir:
+        PROMPT_LOADER.configure(Path(config.prompts_dir))
 
     summary_service = SummaryService(user_service, session_manager)
     app["summary_service"] = summary_service

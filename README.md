@@ -75,11 +75,11 @@ No API keys or external services required. Runs locally with SQLite.
     ```
 
 #### Option B: AI & Knowledge Hub (With Gemini)
-Enables handwriting transcription, summarization, and semantic search. Requires a [Vercel AI Gateway](https://vercel.com/ai-gateway) API key.
+Enables handwriting transcription, summarization, and semantic search. Requires a Google Gemini API Key.
 
 *   **Using Python**:
     ```bash
-    export SUPERNOTE_AI_API_KEY="your-ai-gateway-api-key"
+    export SUPERNOTE_GEMINI_API_KEY="your-gemini-api-key"
     pip install "supernote[all]"
     supernote serve
     ```
@@ -88,19 +88,14 @@ Enables handwriting transcription, summarization, and semantic search. Requires 
     # Build the docker image locally
     docker build -t supernote .
 
-    # Run the container with your AI Gateway API key
+    # Run the container with your Gemini API key
     docker run -d \
       -p 8080:8080 \
       -v $(pwd)/storage:/data \
-      -e SUPERNOTE_AI_API_KEY="your-ai-gateway-api-key" \
+      -e SUPERNOTE_GEMINI_API_KEY="your-gemini-api-key" \
       --name supernote-server \
       supernote
     ```
-
-Optional AI settings (see [ServerConfig](supernote/server/README.md) for details):
-`SUPERNOTE_AI_PROVIDER` (`google` or `vertex`), `SUPERNOTE_AI_OCR_MODEL`,
-`SUPERNOTE_AI_EMBEDDING_MODEL`, `SUPERNOTE_AI_FLEX`, `SUPERNOTE_AI_ZDR`, and
-`SUPERNOTE_AI_PROMPTS_DIR`.
 
 ### 2. Bootstrap Your User
 
@@ -250,12 +245,11 @@ You can customize the prompts used for Gemini OCR (transcription) and Summarizat
 Set the custom prompts directory using either:
 *   **Environment Variable**:
     ```bash
-    export SUPERNOTE_AI_PROMPTS_DIR="path/to/your/prompts"
+    export SUPERNOTE_PROMPTS_DIR="path/to/your/prompts"
     ```
 *   **Config File (`config.yaml`)**:
     ```yaml
-    ai:
-      prompts_dir: "path/to/your/prompts"
+    prompts_dir: "path/to/your/prompts"
     ```
 
 ### 2. Directory Structure

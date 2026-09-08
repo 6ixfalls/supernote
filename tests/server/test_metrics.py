@@ -1,5 +1,5 @@
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 from aiohttp.test_utils import TestClient
@@ -93,9 +93,13 @@ async def test_db_session_metrics(client: TestClient) -> None:
 
 async def test_gemini_service_metrics() -> None:
     """Verify that GeminiService tracks api call counts and durations."""
-    config = ServerConfig()
-    config.ai.api_key = "mock-api-key"
-    gemini = GeminiService(config)
+    gemini = GeminiService(api_key="mock-api-key")
+
+    # Mock model API client
+    mock_response = AsyncMock()
+    gemini._client = AsyncMock()
+    gemini._client.aio.models.generate_content = AsyncMock(return_value=mock_response)
+    gemini._client.aio.models.embed_content = AsyncMock(return_value=mock_response)
 
     before_calls = (
         REGISTRY.get_sample_value(
@@ -105,8 +109,7 @@ async def test_gemini_service_metrics() -> None:
         or 0.0
     )
 
-    with patch("ai.experimental_generate", new=AsyncMock(return_value=AsyncMock())):
-        await gemini.generate_content(model="gemini-3-flash-preview", prompt="hello")
+    await gemini.generate_content(model="gemini-3-flash-preview", contents="hello")
 
     after_calls = (
         REGISTRY.get_sample_value(
@@ -119,6 +122,8 @@ async def test_gemini_service_metrics() -> None:
     assert after_calls == before_calls + 1.0
 
     # Test error tracking
+    gemini._client.aio.models.generate_content.side_effect = Exception("API failure")
+
     before_fail_calls = (
         REGISTRY.get_sample_value(
             "supernote_gemini_api_calls_total",
@@ -127,11 +132,8 @@ async def test_gemini_service_metrics() -> None:
         or 0.0
     )
 
-    with (
-        patch("ai.experimental_generate", new=AsyncMock(side_effect=Exception())),
-        pytest.raises(Exception),
-    ):
-        await gemini.generate_content(model="gemini-3-flash-preview", prompt="hello")
+    with pytest.raises(Exception):
+        await gemini.generate_content(model="gemini-3-flash-preview", contents="hello")
 
     after_fail_calls = (
         REGISTRY.get_sample_value(

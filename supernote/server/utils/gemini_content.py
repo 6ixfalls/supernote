@@ -1,12 +1,16 @@
-"""Library for preparing Gemini request content."""
+"""Library for preparing Gemini Content requests."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .note_content import format_page_metadata
 from .prompt_loader import PROMPT_LOADER, PromptId
+
+if TYPE_CHECKING:
+    from google.genai import types
 
 
 @dataclass
@@ -23,10 +27,11 @@ class PageMetadata:
         return None
 
 
-def build_ocr_prompt(
+def create_gemini_content(
     page_metadata: PageMetadata,
-) -> str:
-    """Build the OCR prompt for a notebook page."""
+    png_data: bytes,
+) -> list[types.Part]:
+    from google.genai import types  # noqa: PLC0415
 
     prompt = PROMPT_LOADER.get_prompt(
         PromptId.OCR_TRANSCRIPTION, custom_type=page_metadata.file_name_basis
@@ -39,4 +44,9 @@ def build_ocr_prompt(
         notebook_create_time=page_metadata.notebook_create_time,
         include_section_divider=True,
     )
-    return f"{metadata_block}\n\n{prompt}"
+    prompt = f"{metadata_block}\n\n{prompt}"
+
+    return [
+        types.Part.from_text(text=prompt),
+        types.Part.from_bytes(data=png_data, mime_type="image/png"),
+    ]

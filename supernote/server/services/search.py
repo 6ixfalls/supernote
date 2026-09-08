@@ -77,18 +77,18 @@ class SearchService:
             return []
 
         # 1. Embed Query
-        model_id = self.config.ai.embedding_model
+        model_id = self.config.gemini_embedding_model
         try:
-            embeddings = await self.gemini_service.embed_content(
+            response = await self.gemini_service.embed_content(
                 model=model_id,
-                contents=[query],
+                contents=query,
             )
-            if not embeddings:
+            if not response.embeddings:
                 logger.error("No embeddings returned for query")
                 return []
 
             # Process the embedding values
-            query_embedding = np.array(embeddings[0])
+            query_embedding = np.array(response.embeddings[0].values)
         except (ValueError, RuntimeError, TypeError) as e:
             logger.error(f"Failed to fetch or process query embedding: {e}")
             return []

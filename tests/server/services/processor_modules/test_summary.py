@@ -137,9 +137,9 @@ async def test_summary_success(
         call_args = mock_gemini_service.generate_content.call_args
         assert call_args is not None
         _, kwargs = call_args
-        assert "Page 1 text" in kwargs["prompt"]
-        assert "Page 2 text" in kwargs["prompt"]
-        assert "Generate" in kwargs["prompt"]
+        assert "Page 1 text" in kwargs["contents"]
+        assert "Page 2 text" in kwargs["contents"]
+        assert "Generate" in kwargs["contents"]
 
     # 1. Group Upsert
     group_call = mock_summary_service.add_group.call_args_list[0]

@@ -24,7 +24,7 @@ def search_service(
     mock_gemini_service: MagicMock,
     server_config: ServerConfig,
 ) -> SearchService:
-    server_config.ai.embedding_model = "text-embedding-004"
+    server_config.gemini_embedding_model = "text-embedding-004"
     return SearchService(
         session_manager=session_manager,
         gemini_service=mock_gemini_service,
@@ -80,7 +80,11 @@ async def test_search_chunks_success(
         await session.commit()
 
     # Mock Gemini Embedding for query "cats"
-    mock_gemini_service.embed_content.return_value = [[1.0, 0.0, 0.0]]
+    mock_response = MagicMock()
+    mock_embedding = MagicMock()
+    mock_embedding.values = [1.0, 0.0, 0.0]
+    mock_response.embeddings = [mock_embedding]
+    mock_gemini_service.embed_content.return_value = mock_response
 
     # Run Search
     results = await search_service.search_chunks(user_id=user_id, query="cats", top_n=5)
@@ -140,7 +144,11 @@ async def test_search_chunks_with_name_filter(
         await session.commit()
 
     # Mock Gemini Embedding
-    mock_gemini_service.embed_content.return_value = [[1.0, 0.0]]
+    mock_response = MagicMock()
+    mock_embedding = MagicMock()
+    mock_embedding.values = [1.0, 0.0]
+    mock_response.embeddings = [mock_embedding]
+    mock_gemini_service.embed_content.return_value = mock_response
 
     # Run Search with name filter "Monthly"
     results = await search_service.search_chunks(
@@ -256,7 +264,11 @@ async def test_search_chunks_with_date_filter_inferred(
         await session.commit()
 
     # Mock Gemini
-    mock_gemini_service.embed_content.return_value = [[1.0, 0.0]]
+    mock_response = MagicMock()
+    mock_embedding = MagicMock()
+    mock_embedding.values = [1.0, 0.0]
+    mock_response.embeddings = [mock_embedding]
+    mock_gemini_service.embed_content.return_value = mock_response
 
     # Filter for Oct 27
     results = await search_service.search_chunks(

@@ -61,7 +61,11 @@ async def test_process_embedding_success(
         await session.commit()
 
     # Mock Gemini API Response
-    mock_gemini_service.embed_content.return_value = [[0.1, 0.2, 0.3]]
+    mock_response = MagicMock()
+    mock_embedding = MagicMock()
+    mock_embedding.values = [0.1, 0.2, 0.3]
+    mock_response.embeddings = [mock_embedding]
+    mock_gemini_service.embed_content.return_value = mock_response
 
     # Run full module lifecycle
     await gemini_embedding_module.run(
@@ -74,7 +78,7 @@ async def test_process_embedding_success(
     assert call_args is not None
     _, kwargs = call_args
     assert kwargs["model"] == "text-embedding-004"
-    assert kwargs["contents"] == ["This is the text to embed."]
+    assert kwargs["contents"] == "This is the text to embed."
 
     # Verify DB Updates
     async with session_manager.session() as session:

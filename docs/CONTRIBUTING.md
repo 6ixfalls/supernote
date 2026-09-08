@@ -62,7 +62,7 @@ For rapid iteration, run an ephemeral server. It starts with a clean state and a
 
 ```bash
 # Enable AI features for development
-export SUPERNOTE_AI_API_KEY="your_api_key"
+export SUPERNOTE_GEMINI_API_KEY="your_api_key"
 
 # Start the ephemeral server
 supernote serve --ephemeral
