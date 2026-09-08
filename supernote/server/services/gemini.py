@@ -14,6 +14,11 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_PROVIDERS = frozenset({"google", "vertex"})
 
+VERTEX_FLEX_HEADERS = {
+    "X-Vertex-AI-LLM-Request-Type": "shared",
+    "X-Vertex-AI-LLM-Shared-Request-Type": "flex",
+}
+
 
 class GeminiService:
     """Shared service for interacting with Google Gemini models.
@@ -47,8 +52,16 @@ class GeminiService:
                     "vertexai": True,
                     "project": self.project,
                 }
-                if self.location:
-                    kwargs["location"] = self.location
+                location = self.location
+                if not location and self.flex:
+                    # Flex PayGo is only served on the global endpoint.
+                    location = "global"
+                if location:
+                    kwargs["location"] = location
+                if self.flex:
+                    # Vertex AI selects Flex PayGo via request headers
+                    # instead of the service_tier config field.
+                    kwargs["http_options"] = {"headers": dict(VERTEX_FLEX_HEADERS)}
                 self._client = genai.Client(**kwargs)
         elif self.api_key:
             # Deferred: google-genai is a heavy import (pulls in ~300
@@ -83,8 +96,12 @@ class GeminiService:
     def _apply_config_defaults(
         self, config: "types.GenerateContentConfigOrDict | None"
     ) -> "types.GenerateContentConfigOrDict | None":
-        """Merge the configured Flex service tier into a request config."""
-        if not self.flex:
+        """Merge the configured Flex service tier into a request config.
+
+        Only applies to the `google` provider; Vertex AI selects Flex
+        PayGo through request headers set on the client instead.
+        """
+        if not self.flex or self.provider != "google":
             return config
         # google-genai is only needed once a client is configured, which is
         # guaranteed by the time a request is built.
