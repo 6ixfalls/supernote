@@ -2,7 +2,6 @@
 
 from . import (
     device,
-    device_bind_request,
     file,
     kv,
     login_record,
@@ -14,7 +13,6 @@ from . import (
 
 __all__ = [
     "device",
-    "device_bind_request",
     "file",
     "kv",
     "login_record",

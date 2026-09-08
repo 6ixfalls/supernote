@@ -48,10 +48,6 @@ auth:
   # When disabled, the public password reset endpoint returns 403.
   enable_remote_password_reset: false
 
-  # Whether legacy clients may bind devices without authenticating.
-  # Keep disabled to require approval from the target account in the web UI.
-  allow_unauthenticated_binds: false
-
 # Optional AI features, served through Vercel AI Gateway.
 # The API key can also be supplied with SUPERNOTE_AI_API_KEY or
 # AI_GATEWAY_API_KEY instead of storing it in this file.

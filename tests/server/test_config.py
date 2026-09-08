@@ -27,7 +27,6 @@ def test_server_config_defaults(tmp_path: Path) -> None:
     assert config.port == 8080
     assert config.storage_dir == "storage"
     assert config.auth.secret_key != ""  # Should be generated in-memory
-    assert config.auth.allow_unauthenticated_binds is False
     assert config.trace_log_file is None
 
 
@@ -65,14 +64,12 @@ def test_server_config_env_var_override(tmp_path: Path) -> None:
             "SUPERNOTE_JWT_SECRET": "env-secret",
             "SUPERNOTE_HOST": "1.2.3.4",
             "SUPERNOTE_PORT": "5555",
-            "SUPERNOTE_ALLOW_UNAUTHENTICATED_BINDS": "true",
         },
     ):
         config = ServerConfig.load(config_dir)
         assert config.auth.secret_key == "env-secret"
         assert config.host == "1.2.3.4"
         assert config.port == 5555
-        assert config.auth.allow_unauthenticated_binds is True
 
 
 def test_unified_ai_config_from_env(tmp_path: Path) -> None:
@@ -178,7 +175,6 @@ def test_example_config_is_valid() -> None:
     assert config.storage_dir == "storage"
     assert config.auth.secret_key == "CHANGE_ME_TO_A_SECURE_RANDOM_STRING"
     assert config.auth.enable_registration is False
-    assert config.auth.allow_unauthenticated_binds is False
 
 
 def test_configured_base_url_none_when_unset() -> None:

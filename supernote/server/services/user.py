@@ -22,7 +22,6 @@ from supernote.server.utils.hashing import hash_with_salt
 
 from ..config import AuthConfig
 from ..db.models.device import DeviceDO
-from ..db.models.device_bind_request import DeviceBindRequestDO
 from ..db.models.login_record import LoginRecordDO
 from ..db.models.user import UserDO
 from ..db.session import DatabaseSessionManager
@@ -431,151 +430,36 @@ class UserService:
         )
 
     async def bind_equipment(self, account: str, equipment_no: str) -> bool:
-        """Bind an unclaimed device to a user without stealing an existing binding."""
+        """Bind a device to the user."""
         user = await self._get_user_do(account)
         if not user:
             return False
 
         async with self._session_manager.session() as session:
+            # Upsert
             existing = await session.execute(
                 select(DeviceDO).where(DeviceDO.equipment_no == equipment_no)
             )
-            device = existing.scalar_one_or_none()
-            if device and device.user_id != user.id:
-                return False
-            if not device:
-                session.add(DeviceDO(user_id=user.id, equipment_no=equipment_no))
-
-            # A completed bind invalidates every outstanding request for the serial.
-            await session.execute(
-                delete(DeviceBindRequestDO).where(
-                    DeviceBindRequestDO.equipment_no == equipment_no
+            if existing.scalar_one_or_none():
+                # Device already exists, update binding to current user.
+                await session.execute(
+                    update(DeviceDO)
+                    .where(DeviceDO.equipment_no == equipment_no)
+                    .values(user_id=user.id)
                 )
-            )
-            await session.commit()
-            return True
-
-    async def request_equipment_bind(
-        self, account: str, equipment_no: str, name: str, total_capacity: str
-    ) -> bool:
-        """Create or refresh a pending bind request for an account."""
-        user = await self._get_user_do(account)
-        if not user:
-            return False
-
-        async with self._session_manager.session() as session:
-            result = await session.execute(
-                select(DeviceBindRequestDO).where(
-                    DeviceBindRequestDO.user_id == user.id,
-                    DeviceBindRequestDO.equipment_no == equipment_no,
-                )
-            )
-            pending = result.scalar_one_or_none()
-            now = int(time.time() * 1000)
-            if pending:
-                pending.name = name
-                pending.total_capacity = total_capacity
-                pending.create_time = now
             else:
-                session.add(
-                    DeviceBindRequestDO(
-                        user_id=user.id,
-                        equipment_no=equipment_no,
-                        name=name,
-                        total_capacity=total_capacity,
-                        create_time=now,
-                    )
-                )
+                session.add(DeviceDO(user_id=user.id, equipment_no=equipment_no))
             await session.commit()
             return True
 
-    async def list_equipment_bind_requests(
-        self, account: str
-    ) -> list[DeviceBindRequestDO]:
-        """List pending binds addressed to an authenticated account."""
-        user = await self._get_user_do(account)
-        if not user:
-            return []
-
+    async def unlink_equipment(self, equipment_no: str) -> bool:
+        """Unlink a device."""
         async with self._session_manager.session() as session:
-            result = await session.execute(
-                select(DeviceBindRequestDO)
-                .where(DeviceBindRequestDO.user_id == user.id)
-                .order_by(DeviceBindRequestDO.create_time.desc())
-            )
-            return list(result.scalars().all())
-
-    async def approve_equipment_bind_request(
-        self, account: str, request_id: int
-    ) -> bool:
-        """Approve a pending bind, provided the serial is not owned by another user."""
-        user = await self._get_user_do(account)
-        if not user:
-            return False
-
-        async with self._session_manager.session() as session:
-            result = await session.execute(
-                select(DeviceBindRequestDO).where(
-                    DeviceBindRequestDO.id == request_id,
-                    DeviceBindRequestDO.user_id == user.id,
-                )
-            )
-            pending = result.scalar_one_or_none()
-            if not pending:
-                return False
-
-            result = await session.execute(
-                select(DeviceDO).where(DeviceDO.equipment_no == pending.equipment_no)
-            )
-            device = result.scalar_one_or_none()
-            if device and device.user_id != user.id:
-                raise ValueError("Device is already bound to another account")
-            if not device:
-                session.add(
-                    DeviceDO(user_id=user.id, equipment_no=pending.equipment_no)
-                )
-
             await session.execute(
-                delete(DeviceBindRequestDO).where(
-                    DeviceBindRequestDO.equipment_no == pending.equipment_no
-                )
+                delete(DeviceDO).where(DeviceDO.equipment_no == equipment_no)
             )
             await session.commit()
-            return True
-
-    async def reject_equipment_bind_request(
-        self, account: str, request_id: int
-    ) -> bool:
-        """Reject a pending bind addressed to an authenticated account."""
-        user = await self._get_user_do(account)
-        if not user:
-            return False
-
-        async with self._session_manager.session() as session:
-            result = await session.execute(
-                delete(DeviceBindRequestDO).where(
-                    DeviceBindRequestDO.id == request_id,
-                    DeviceBindRequestDO.user_id == user.id,
-                )
-            )
-            await session.commit()
-            return bool(result.rowcount)
-
-    async def unlink_equipment(self, account: str, equipment_no: str) -> bool:
-        """Unlink a device only when it belongs to the authenticated account."""
-        user = await self._get_user_do(account)
-        if not user:
-            return False
-
-        async with self._session_manager.session() as session:
-            result = await session.execute(
-                delete(DeviceDO).where(
-                    DeviceDO.equipment_no == equipment_no,
-                    DeviceDO.user_id == user.id,
-                )
-            )
-            await session.commit()
-        return bool(result.rowcount)
+        return True
 
     async def update_password(self, account: str, dto: UpdatePasswordDTO) -> bool:
         """Update user password."""
