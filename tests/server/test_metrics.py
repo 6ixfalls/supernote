@@ -93,7 +93,7 @@ async def test_db_session_metrics(client: TestClient) -> None:
 
 async def test_gemini_service_metrics() -> None:
     """Verify that GeminiService tracks api call counts and durations."""
-    gemini = GeminiService(api_key="mock-api-key")
+    gemini = GeminiService(ServerConfig(gemini_api_key="mock-api-key"))
 
     # Mock model API client
     mock_response = AsyncMock()

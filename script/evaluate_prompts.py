@@ -5,7 +5,6 @@ import argparse
 import asyncio
 import io
 import json
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -280,14 +279,24 @@ async def main_async() -> None:
     config = ServerConfig.load()
 
     # Determine api key
-    api_key = (
-        args.api_key or os.getenv("SUPERNOTE_GEMINI_API_KEY") or config.gemini_api_key
-    )
-    if not api_key:
-        print(
-            "Error: Gemini API Key is required. Please set SUPERNOTE_GEMINI_API_KEY, use --api-key, or configure gemini_api_key in config/config.yaml.",
-            file=sys.stderr,
-        )
+    if args.api_key:
+        config.gemini_api_key = args.api_key
+
+    # Initialize Gemini service
+    gemini_service = GeminiService(config)
+    if not gemini_service.is_configured:
+        if config.gemini_provider == "vertex":
+            print(
+                "Error: Vertex AI provider requires gemini_project. Please set "
+                "SUPERNOTE_GEMINI_PROJECT or configure gemini_project in "
+                "config/config.yaml.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Error: Gemini API Key is required. Please set SUPERNOTE_GEMINI_API_KEY, use --api-key, or configure gemini_api_key in config/config.yaml.",
+                file=sys.stderr,
+            )
         sys.exit(1)
 
     ocr_model = args.ocr_model or config.gemini_ocr_model
@@ -295,9 +304,6 @@ async def main_async() -> None:
 
     print(f"OCR Model: {ocr_model}")
     print(f"Summary Model: {summary_model}")
-
-    # Initialize Gemini service
-    gemini_service = GeminiService(api_key=api_key)
 
     # Set up prompt loader
     if args.prompt_dir:

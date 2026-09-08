@@ -48,3 +48,23 @@ auth:
   # When disabled, the public password reset endpoint returns 403.
   enable_remote_password_reset: false
 
+# Optional AI features served by Google Gemini models.
+# - provider "google" (default) uses the Gemini API with an API key
+#   (SUPERNOTE_GEMINI_API_KEY).
+# - provider "vertex" uses Google Cloud Vertex AI, authenticating with
+#   Application Default Credentials (e.g. `gcloud auth application-default
+#   login` or a service account) and requires gemini_project.
+gemini_api_key: null # "your-gemini-api-key"
+# gemini_provider: vertex
+# gemini_project: "your-gcp-project-id"
+# gemini_location: "us-central1" # Optional; region for Vertex AI
+gemini_ocr_model: gemini-3.6-flash
+gemini_embedding_model: gemini-embedding-001
+gemini_max_concurrency: 5
+
+# Use the Flex service tier for lower-cost, batch-tolerant processing.
+gemini_flex: false
+
+# Directory containing custom AI prompts.
+# prompts_dir: "path/to/your/prompts"
+

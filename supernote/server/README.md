@@ -31,6 +31,31 @@ To enable AI features, set the Gemini API key:
 export SUPERNOTE_GEMINI_API_KEY="your-api-key"
 ```
 
+Alternatively, serve the Gemini models through Google Cloud Vertex AI. This
+authenticates with [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials)
+(e.g. `gcloud auth application-default login` or a service account) instead of
+an API key:
+```bash
+export SUPERNOTE_GEMINI_PROVIDER="vertex"
+export SUPERNOTE_GEMINI_PROJECT="your-gcp-project-id"
+# Optional: override the region (defaults to the client library default)
+export SUPERNOTE_GEMINI_LOCATION="us-central1"
+```
+
+Additional options (both providers):
+
+```bash
+# Use the Flex service tier for lower-cost, batch-tolerant processing
+export SUPERNOTE_GEMINI_FLEX="true"
+
+# Override models
+export SUPERNOTE_GEMINI_OCR_MODEL="gemini-3.6-flash"
+export SUPERNOTE_GEMINI_EMBEDDING_MODEL="gemini-embedding-001"
+```
+
+The equivalent `config.yaml` keys are `gemini_provider`, `gemini_project`,
+`gemini_location`, and `gemini_flex`.
+
 ### Running the Server
 
 Start the server using the unified `supernote` CLI:

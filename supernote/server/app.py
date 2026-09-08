@@ -464,9 +464,7 @@ def create_app(config: ServerConfig) -> web.Application:
     app["file_service"] = file_service
     app["url_signer"] = UrlSigner(config.auth.secret_key, coordination_service)
     app["schedule_service"] = ScheduleService(session_manager)
-    gemini_service = GeminiService(
-        config.gemini_api_key, max_concurrency=config.gemini_max_concurrency
-    )
+    gemini_service = GeminiService(config)
     app["gemini_service"] = gemini_service
 
     if config.prompts_dir:

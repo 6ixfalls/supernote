@@ -116,7 +116,36 @@ class ServerConfig(DataClassYAMLMixin):
     gemini_api_key: str | None = None
     """Google Gemini API Key for OCR and Embeddings.
 
+    Only used when `gemini_provider` is `google`; Vertex AI authenticates
+    with Application Default Credentials instead.
+
     Env Var: `SUPERNOTE_GEMINI_API_KEY`
+    """
+
+    gemini_provider: str = "google"
+    """Backend serving the Gemini models: `google` (Gemini API) or `vertex` (Vertex AI).
+
+    Env Var: `SUPERNOTE_GEMINI_PROVIDER`
+    """
+
+    gemini_project: str | None = None
+    """Google Cloud project ID used when `gemini_provider` is `vertex`.
+
+    Env Var: `SUPERNOTE_GEMINI_PROJECT`
+    """
+
+    gemini_location: str | None = None
+    """Google Cloud region used when `gemini_provider` is `vertex`.
+
+    Defaults to the client library default when unset.
+
+    Env Var: `SUPERNOTE_GEMINI_LOCATION`
+    """
+
+    gemini_flex: bool = False
+    """Use the Flex service tier for lower-cost batch-tolerant processing.
+
+    Env Var: `SUPERNOTE_GEMINI_FLEX`
     """
 
     gemini_ocr_model: str = "gemini-3.6-flash"
@@ -318,6 +347,24 @@ BaseConfig
             logger.info(
                 f"Using SUPERNOTE_GEMINI_API_KEY: xxx...{config.gemini_api_key[-3:]}"
             )
+
+        if gemini_provider := os.getenv("SUPERNOTE_GEMINI_PROVIDER"):
+            config.gemini_provider = gemini_provider
+            logger.info(f"Using SUPERNOTE_GEMINI_PROVIDER: {config.gemini_provider}")
+
+        if gemini_project := os.getenv("SUPERNOTE_GEMINI_PROJECT"):
+            config.gemini_project = gemini_project
+            logger.info(f"Using SUPERNOTE_GEMINI_PROJECT: {config.gemini_project}")
+
+        if gemini_location := os.getenv("SUPERNOTE_GEMINI_LOCATION"):
+            config.gemini_location = gemini_location
+            logger.info(f"Using SUPERNOTE_GEMINI_LOCATION: {config.gemini_location}")
+
+        if "SUPERNOTE_GEMINI_FLEX" in os.environ:
+            config.gemini_flex = _get_bool_env(
+                "SUPERNOTE_GEMINI_FLEX", config.gemini_flex
+            )
+            logger.info(f"Using Gemini Flex service tier: {config.gemini_flex}")
 
         if gemini_ocr_model := os.getenv("SUPERNOTE_GEMINI_OCR_MODEL"):
             config.gemini_ocr_model = gemini_ocr_model

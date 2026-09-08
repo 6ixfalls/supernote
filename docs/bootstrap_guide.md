@@ -71,7 +71,11 @@ supernote admin user add member@example.com --name "New Member"
 For production, it is recommended to set secrets via environment:
 - `SUPERNOTE_JWT_SECRET`: The secret key for signing tokens.
 - `SUPERNOTE_ENABLE_REGISTRATION`: "true" or "false".
-- `SUPERNOTE_GEMINI_API_KEY`: API key for AI processing features.
+- `SUPERNOTE_GEMINI_API_KEY`: API key for AI processing features (Gemini API provider).
+- `SUPERNOTE_GEMINI_PROVIDER`: `google` (default, Gemini API) or `vertex` (Vertex AI).
+- `SUPERNOTE_GEMINI_PROJECT`: Google Cloud project ID (required for `vertex`).
+- `SUPERNOTE_GEMINI_LOCATION`: Google Cloud region (optional, for `vertex`).
+- `SUPERNOTE_GEMINI_FLEX`: `true` to use the Flex service tier.
 
 You can control registration behavior in your `config.yaml`:
 

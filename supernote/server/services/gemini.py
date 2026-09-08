@@ -1,8 +1,9 @@
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
+from supernote.server.config import ServerConfig
 from supernote.server.metrics import GEMINI_API_CALLS_TOTAL, GEMINI_API_DURATION_SECONDS
 
 if TYPE_CHECKING:
@@ -11,16 +12,45 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+SUPPORTED_PROVIDERS = frozenset({"google", "vertex"})
+
 
 class GeminiService:
-    """Shared service for interacting with Google Gemini API."""
+    """Shared service for interacting with Google Gemini models.
 
-    def __init__(self, api_key: str | None, max_concurrency: int = 5) -> None:
-        self.api_key = api_key
-        self.max_concurrency = max_concurrency
+    Routes requests to either the Gemini Developer API (`google`) using an
+    API key, or to Vertex AI (`vertex`) using Application Default
+    Credentials with an explicit project and optional location.
+    """
+
+    def __init__(self, config: ServerConfig) -> None:
+        self.provider = config.gemini_provider
+        if self.provider not in SUPPORTED_PROVIDERS:
+            raise ValueError(
+                f"Unsupported Gemini provider {self.provider!r}; expected one of "
+                f"{sorted(SUPPORTED_PROVIDERS)}"
+            )
+        self.flex = config.gemini_flex
+        self.max_concurrency = config.gemini_max_concurrency
+        self.api_key = config.gemini_api_key
+        self.project = config.gemini_project
+        self.location = config.gemini_location
         self._client: "genai.Client | None" = None
         self._semaphore: asyncio.Semaphore | None = None
-        if self.api_key:
+        if self.provider == "vertex":
+            if self.project:
+                # Deferred: google-genai is a heavy import (pulls in ~300
+                # transitive modules), so only pay for it when configured.
+                from google import genai  # noqa: PLC0415
+
+                kwargs: dict[str, Any] = {
+                    "vertexai": True,
+                    "project": self.project,
+                }
+                if self.location:
+                    kwargs["location"] = self.location
+                self._client = genai.Client(**kwargs)
+        elif self.api_key:
             # Deferred: google-genai is a heavy import (pulls in ~300
             # transitive modules), so only pay for it when an API key is
             # actually configured.
@@ -34,11 +64,42 @@ class GeminiService:
     def is_configured(self) -> bool:
         return self._client is not None
 
+    def _require_client(self) -> "genai.Client":
+        """Return the configured client, raising when the service is off."""
+        if self._client is None:
+            if self.provider == "vertex":
+                raise ValueError(
+                    "Vertex AI provider requires gemini_project to be configured"
+                )
+            raise ValueError("Gemini API key not configured")
+        return self._client
+
     def _get_semaphore(self) -> asyncio.Semaphore:
         """Lazy initialization of semaphore to ensure it's in the correct event loop."""
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self.max_concurrency)
         return self._semaphore
+
+    def _apply_config_defaults(
+        self, config: "types.GenerateContentConfigOrDict | None"
+    ) -> "types.GenerateContentConfigOrDict | None":
+        """Merge the configured Flex service tier into a request config."""
+        if not self.flex:
+            return config
+        # google-genai is only needed once a client is configured, which is
+        # guaranteed by the time a request is built.
+        from google.genai import types as genai_types  # noqa: PLC0415
+
+        service_tier = genai_types.ServiceTier.FLEX
+        if config is None:
+            return {"service_tier": service_tier}
+        if isinstance(config, genai_types.GenerateContentConfig):
+            if config.service_tier is None:
+                return config.model_copy(update={"service_tier": service_tier})
+            return config
+        merged: dict[str, Any] = dict(config)
+        merged.setdefault("service_tier", service_tier)
+        return cast("types.GenerateContentConfigDict", merged)
 
     async def generate_content(
         self,
@@ -47,17 +108,16 @@ class GeminiService:
         config: "types.GenerateContentConfigOrDict | None" = None,
     ) -> "types.GenerateContentResponse":
         """Asynchronously generate content using the Gemini API."""
-        if self._client is None:
-            raise ValueError("Gemini API key not configured")
+        client = self._require_client()
 
         start_time = time.perf_counter()
         status = "success"
         try:
             async with self._get_semaphore():
-                return await self._client.aio.models.generate_content(
+                return await client.aio.models.generate_content(
                     model=model,
                     contents=contents,
-                    config=config,
+                    config=self._apply_config_defaults(config),
                 )
         except Exception:
             status = "failure"
@@ -78,14 +138,13 @@ class GeminiService:
         config: "types.EmbedContentConfigOrDict | None" = None,
     ) -> "types.EmbedContentResponse":
         """Asynchronously generate embeddings using the Gemini API."""
-        if self._client is None:
-            raise ValueError("Gemini API key not configured")
+        client = self._require_client()
 
         start_time = time.perf_counter()
         status = "success"
         try:
             async with self._get_semaphore():
-                return await self._client.aio.models.embed_content(
+                return await client.aio.models.embed_content(
                     model=model,
                     contents=contents,
                     config=config,

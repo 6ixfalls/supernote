@@ -75,7 +75,7 @@ No API keys or external services required. Runs locally with SQLite.
     ```
 
 #### Option B: AI & Knowledge Hub (With Gemini)
-Enables handwriting transcription, summarization, and semantic search. Requires a Google Gemini API Key.
+Enables handwriting transcription, summarization, and semantic search. Requires a Google Gemini API Key, or a Google Cloud project when using Vertex AI (see below).
 
 *   **Using Python**:
     ```bash
@@ -96,6 +96,23 @@ Enables handwriting transcription, summarization, and semantic search. Requires 
       --name supernote-server \
       supernote
     ```
+
+<details>
+<summary>Using Google Cloud Vertex AI instead of the Gemini API</summary>
+
+Serve the Gemini models through Vertex AI with Application Default Credentials
+(no API key needed):
+
+```bash
+export SUPERNOTE_GEMINI_PROVIDER="vertex"
+export SUPERNOTE_GEMINI_PROJECT="your-gcp-project-id"
+export SUPERNOTE_GEMINI_LOCATION="us-central1" # optional
+```
+
+Optional: enable the lower-cost Flex service tier for batch-tolerant
+processing with `SUPERNOTE_GEMINI_FLEX="true"`.
+
+</details>
 
 ### 2. Bootstrap Your User
 

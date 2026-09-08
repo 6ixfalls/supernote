@@ -88,6 +88,26 @@ def test_trace_log_file_env_enables_and_disables_logging(tmp_path: Path) -> None
         assert config.trace_log_file is None
 
 
+def test_gemini_provider_env_overrides(tmp_path: Path) -> None:
+    """Vertex AI settings and flex are configurable via environment."""
+    config_dir = tmp_path / "config"
+    with patch.dict(
+        os.environ,
+        {
+            "SUPERNOTE_GEMINI_PROVIDER": "vertex",
+            "SUPERNOTE_GEMINI_PROJECT": "env-project",
+            "SUPERNOTE_GEMINI_LOCATION": "us-east4",
+            "SUPERNOTE_GEMINI_FLEX": "true",
+        },
+    ):
+        config = ServerConfig.load(config_dir)
+
+    assert config.gemini_provider == "vertex"
+    assert config.gemini_project == "env-project"
+    assert config.gemini_location == "us-east4"
+    assert config.gemini_flex is True
+
+
 def test_example_config_is_valid() -> None:
     """Ensure config-example.yaml can be loaded by ServerConfig."""
     base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))

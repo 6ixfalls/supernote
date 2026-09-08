@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from sqlalchemy import select
 
+from supernote.server.config import ServerConfig
 from supernote.server.constants import CACHE_BUCKET
 from supernote.server.db.models.file import UserFileDO
 from supernote.server.db.models.note_processing import NotePageContentDO, SystemTaskDO
@@ -430,7 +431,11 @@ async def test_gemini_concurrency_limit() -> None:
 
     # Use patch to avoid actually calling the API
     with patch("google.genai.Client") as mock_client_cls:
-        service = GeminiService(api_key="fake-key", max_concurrency=max_concurrency)
+        service = GeminiService(
+            ServerConfig(
+                gemini_api_key="fake-key", gemini_max_concurrency=max_concurrency
+            )
+        )
         mock_client = mock_client_cls.return_value
         service._client = mock_client
 
