@@ -121,6 +121,16 @@ class LoginVO(BaseResponse):
     )
     """User nickname."""
 
+    avatars_url: str | None = field(
+        metadata=field_options(alias="avatarsUrl"), default=None
+    )
+    """Avatar URL."""
+
+    last_update_time: str | None = field(
+        metadata=field_options(alias="lastUpdateTime"), default=None
+    )
+    """Last update time."""
+
     is_bind: str = field(metadata=field_options(alias="isBind"), default="N")
     """Is account bound."""
 

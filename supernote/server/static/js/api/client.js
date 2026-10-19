@@ -13,21 +13,21 @@ export function getToken() {
     return authToken;
 }
 
-export function logout() {
+export async function logout() {
     const token = authToken;
-    if (token) {
-        // Keep the OpenAPI-compatible device endpoint as the single logout
-        // contract. `keepalive` lets revocation finish after the page reloads.
-        void fetch('/api/user/logout', {
-            method: 'POST',
-            headers: { 'x-access-token': token },
-            keepalive: true
-        }).catch(() => {
-            // Local logout must still complete if the server is unavailable.
-        });
-    }
     authToken = null;
     localStorage.removeItem('supernote_token');
+    if (token) {
+        try {
+            await fetch('/api/user/logout', {
+                method: 'POST',
+                headers: { 'x-access-token': token },
+                keepalive: true,
+            });
+        } catch (e) {
+            // Ignore network errors during logout
+        }
+    }
     window.location.reload();
 }
 
@@ -84,12 +84,18 @@ export async function login(email, password) {
     return loginData;
 }
 
-// Helper: SHA-256 using Web Crypto API
+// Helper: SHA-256 using Web Crypto API with fallback for non-secure contexts (e.g. plain HTTP on LAN IP)
 async function sha256(message) {
-    const msgBuffer = new TextEncoder().encode(message);
-    const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    if (window.crypto && window.crypto.subtle) {
+        const msgBuffer = new TextEncoder().encode(message);
+        const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+    if (typeof window.sha256 === 'function') {
+        return window.sha256(message);
+    }
+    throw new Error("SHA-256 is not available. Please access via HTTPS/localhost or ensure js-sha256 is loaded.");
 }
 
 /**
@@ -587,4 +593,52 @@ export async function fetchProcessingStatus(fileIds) {
         success: true,
         statusMap: data.statusMap
     };
+}
+
+/**
+ * Get a signed download URL for a stored file.
+ */
+export async function fetchDownloadUrl(fileId) {
+    const currentToken = getToken();
+    if (!currentToken) throw new Error("Unauthorized");
+
+    const response = await fetch('/api/file/download/url', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'x-access-token': currentToken
+        },
+        body: JSON.stringify({ id: fileId })
+    });
+
+    if (!response.ok) {
+        if (response.status === 401) {
+            logout();
+            throw new Error("Unauthorized");
+        }
+        throw new Error(`Download failed: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    if (!data.url) throw new Error("No download URL returned");
+    return data.url;
+}
+
+/**
+ * Trigger a browser download of a stored file.
+ *
+ * Navigates to the signed URL rather than fetching the bytes into a Blob the
+ * way the .ics export does: a notebook can be hundreds of megabytes, and this
+ * way the browser streams it to disk with a progress bar and the server never
+ * holds it in memory. The signature carries the identity, so no header is
+ * needed on the request that actually moves the file.
+ */
+export async function downloadFile(fileId) {
+    const url = await fetchDownloadUrl(fileId);
+    const link = document.createElement('a');
+    link.href = url;
+    link.rel = 'noopener';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
 }

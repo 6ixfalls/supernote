@@ -1,20 +1,17 @@
 import hashlib
 
-import jwt
 import pytest
 from aiohttp.test_utils import TestClient
 
 from supernote.client import Client
 from supernote.client.auth import ConstantAuth
 from supernote.client.device import DeviceClient
-from supernote.server.config import ServerConfig
 from supernote.server.services.blob import BlobStorage
-from supernote.server.services.coordination import CoordinationService
-from supernote.server.services.user import JWT_ALGORITHM
+from supernote.server.services.user import UserService
 
 USER_A = "user_a@example.com"
 USER_B = "user_b@example.com"
-DEFAULT_FOLDERS = ["Export", "Inbox", "Screenshot", "NOTE", "DOCUMENT"]
+DEFAULT_FOLDERS = ["EXPORT", "INBOX", "SCREENSHOT", "NOTE", "DOCUMENT"]
 
 
 @pytest.fixture
@@ -22,34 +19,16 @@ def test_users() -> list[str]:
     return [USER_A, USER_B]
 
 
-async def register_session(
-    coordination_service: CoordinationService, user: str, secret: str
-) -> dict[str, str]:
-    """Register a session for a user."""
-    token = jwt.encode({"sub": user}, secret, algorithm=JWT_ALGORITHM)
-    session_val = f"{user}|"
-    await coordination_service.set_value(f"session:{token}", session_val, ttl=3600)
-    return {"x-access-token": token}
-
-
 async def test_multi_user_content_with_same_hash_isolation(
     client: TestClient,
-    coordination_service: CoordinationService,
-    server_config: ServerConfig,
+    user_service: UserService,
     blob_storage: BlobStorage,
     create_test_user: None,
 ) -> None:
     """Test that users uploading same content have INDEPENDENT blobs (KV separation)."""
     # Setup Users
-    headers_a = await register_session(
-        coordination_service, USER_A, server_config.auth.secret_key
-    )
-    token_a = headers_a["x-access-token"]
-
-    headers_b = await register_session(
-        coordination_service, USER_B, server_config.auth.secret_key
-    )
-    token_b = headers_b["x-access-token"]
+    token_a = await user_service.create_session(USER_A)
+    token_b = await user_service.create_session(USER_B)
 
     base_url = str(client.make_url(""))
 
@@ -95,20 +74,12 @@ async def test_multi_user_content_with_same_hash_isolation(
 async def test_multi_user_content_with_same_paths(
     client: TestClient,
     create_test_user: None,
-    coordination_service: CoordinationService,
-    server_config: ServerConfig,
+    user_service: UserService,
 ) -> None:
     """Test that users can upload distrinct content with the same path."""
     # Setup Users
-    headers_a = await register_session(
-        coordination_service, USER_A, server_config.auth.secret_key
-    )
-    token_a = headers_a["x-access-token"]
-
-    headers_b = await register_session(
-        coordination_service, USER_B, server_config.auth.secret_key
-    )
-    token_b = headers_b["x-access-token"]
+    token_a = await user_service.create_session(USER_A)
+    token_b = await user_service.create_session(USER_B)
 
     base_url = str(client.make_url(""))
 

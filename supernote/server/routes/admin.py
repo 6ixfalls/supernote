@@ -4,7 +4,6 @@ from aiohttp import web
 from mashumaro.exceptions import MissingField
 from sqlalchemy import delete, select
 
-from supernote.models.auth import UserVO
 from supernote.models.base import BaseResponse, TaskType, create_error_response
 from supernote.models.system import QueueStatusVO
 from supernote.models.user import UserRegisterDTO
@@ -31,7 +30,7 @@ def require_admin(
                 create_error_response("Unauthorized").to_dict(), status=401
             )
 
-        user = await user_service._get_user_do(str(username))
+        user = await user_service.get_user_by_email(str(username))
         if not user or not user.is_admin:
             return web.json_response(
                 create_error_response("Forbidden: Admin access required").to_dict(),
@@ -94,25 +93,7 @@ async def handle_admin_update_password(request: web.Request) -> web.Response:
 async def handle_list_users(request: web.Request) -> web.Response:
     """List all users (Admin only)."""
     user_service: UserService = request.app["user_service"]
-    users = await user_service.list_users()
-
-    user_vos = [
-        UserVO(
-            user_id=u.id,
-            user_name=u.display_name or u.email,
-            email=u.email,
-            phone=u.phone or "",
-            country_code="1",
-            total_capacity=u.total_capacity,
-            file_server="",
-            avatars_url=u.avatar or "",
-            birthday="",
-            sex="",
-        )
-        for u in users
-    ]
-
-    # Simple list response for now
+    user_vos = await user_service.list_user_profiles()
     return web.json_response([vo.to_dict() for vo in user_vos])
 
 
@@ -181,7 +162,8 @@ async def handle_reprocess(request: web.Request) -> web.Response:
             stmt = stmt.where(SystemTaskDO.file_id == file_id)
         else:
             file_stmt = select(UserFileDO.id, UserFileDO.user_id).where(
-                UserFileDO.file_name.like("%.note")
+                UserFileDO.file_name.like("%.note"),
+                UserFileDO.is_active == "Y",
             )
             file_result = await session.execute(file_stmt)
             targets = list(file_result.all())

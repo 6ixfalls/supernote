@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -18,7 +19,6 @@ from supernote.notebook import (
 from supernote.server.constants import (
     CACHE_BUCKET,
     CATEGORY_CONTAINERS,
-    IMMUTABLE_SYSTEM_DIRECTORIES,
     USER_DATA_BUCKET,
 )
 from supernote.server.exceptions import (
@@ -44,6 +44,8 @@ from .user import UserService
 from .vfs import VirtualFileSystem
 
 logger = logging.getLogger(__name__)
+
+RECYCLE_RETENTION_MS = 30 * 24 * 3600 * 1000  # 30 days
 
 
 __all__ = [
@@ -508,7 +510,7 @@ class FileService:
             if not node:
                 # Preferring this instead of idempotency for now
                 raise FileNotFound(f"Node {id} not found for user {email}")
-            if node.file_name in IMMUTABLE_SYSTEM_DIRECTORIES:
+            if await vfs.is_system_directory(user_id, node):
                 raise AccessDenied(f"Cannot delete system directory: {node.file_name}")
 
             path_display = await vfs.get_full_path(user_id, node.id)
@@ -517,7 +519,8 @@ class FileService:
             success = await vfs.delete_node(user_id, id)
             if not success:
                 raise FileNotFound(f"Node {id} not found for user {email}")
-            return entity
+        await self._prune_expired_recycle(user_id)
+        return entity
 
     async def delete_items(self, user: str, id_list: list[int], parent_id: int) -> None:
         """Delete files or directories for a specific user using VFS (Web API)."""
@@ -548,12 +551,13 @@ class FileService:
                         )
 
                 # Immutability check
-                if node.file_name in IMMUTABLE_SYSTEM_DIRECTORIES:
+                if await vfs.is_system_directory(user_id, node):
                     raise AccessDenied(
                         f"Cannot delete system directory: {node.file_name}"
                     )
 
                 await vfs.delete_node(user_id, file_id)
+        await self._prune_expired_recycle(user_id)
 
     async def get_storage_usage(self, user: str) -> int:
         """Get total storage usage for a specific user using VFS."""
@@ -586,7 +590,7 @@ class FileService:
                     raise FileNotFound(f"Source item {item_id} not found")
 
                 # Immutability check
-                if node.file_name in IMMUTABLE_SYSTEM_DIRECTORIES:
+                if await vfs.is_system_directory(user_id, node):
                     raise AccessDenied(
                         f"Cannot move system directory: {node.file_name}"
                     )
@@ -612,7 +616,7 @@ class FileService:
                 raise FileNotFound(f"Source item {item_id} not found")
 
             # Immutability check
-            if node.file_name in IMMUTABLE_SYSTEM_DIRECTORIES:
+            if await vfs.is_system_directory(user_id, node):
                 raise AccessDenied(f"Cannot move system directory: {node.file_name}")
 
             # Resolve destination parent
@@ -666,7 +670,7 @@ class FileService:
 
                 # Check immutability? Usually copy is allowed, but let's be safe.
                 # Actually device API copy_item blocks it too.
-                if node.file_name in IMMUTABLE_SYSTEM_DIRECTORIES:
+                if await vfs.is_system_directory(user_id, node):
                     raise AccessDenied(
                         f"Cannot copy system directory: {node.file_name}"
                     )
@@ -693,7 +697,7 @@ class FileService:
                 raise FileNotFound(f"Source {id} not found")
 
             # Immutability check
-            if node.file_name in IMMUTABLE_SYSTEM_DIRECTORIES:
+            if await vfs.is_system_directory(user_id, node):
                 raise AccessDenied(f"Cannot copy system directory: {node.file_name}")
 
             # Resolve destination parent
@@ -741,7 +745,7 @@ class FileService:
                 raise FileNotFound("Source not found")
 
             # Immutability check
-            if node.file_name in IMMUTABLE_SYSTEM_DIRECTORIES:
+            if await vfs.is_system_directory(user_id, node):
                 raise AccessDenied(f"Cannot rename system directory: {node.file_name}")
 
             # Check if name already exists in same directory
@@ -815,6 +819,7 @@ class FileService:
     async def list_recycle(self, user: str) -> list[RecycleEntity]:
         """List files in recycle bin for a specific user using VFS."""
         user_id = await self.user_service.get_user_id(user)
+        await self._prune_expired_recycle(user_id)
 
         recycle_files: list[RecycleEntity] = []
 
@@ -827,31 +832,66 @@ class FileService:
 
         return recycle_files
 
+    async def _prune_expired_recycle(self, user_id: int) -> None:
+        """Opportunistically purge recycle bin entries older than the retention window."""
+        cutoff_ms = int(time.time() * 1000) - RECYCLE_RETENTION_MS
+        await self.purge_recycle(user_id=user_id, older_than_ms=cutoff_ms)
+
+    async def purge_recycle(
+        self,
+        user_id: int,
+        recycle_ids: list[int] | None = None,
+        older_than_ms: int | None = None,
+    ) -> None:
+        """Permanently purge items from recycle bin with reference-counted blob cleanup and event publishing."""
+        async with self.session_manager.session() as session:
+            vfs = VirtualFileSystem(session)
+            purged_nodes = await vfs.purge_recycle(
+                user_id=user_id,
+                recycle_ids=recycle_ids,
+                older_than_ms=older_than_ms,
+            )
+            if not purged_nodes:
+                return
+
+            # Physical storage blobs in the user data bucket must only be deleted
+            # when no surviving file records reference the storage key.
+            candidate_keys = {
+                n.storage_key
+                for n in purged_nodes
+                if n.is_folder == "N" and n.storage_key
+            }
+            blobs_to_delete: set[str] = set()
+            if candidate_keys:
+                stmt = (
+                    select(UserFileDO.storage_key)
+                    .where(UserFileDO.storage_key.in_(candidate_keys))
+                    .group_by(UserFileDO.storage_key)
+                )
+                surviving_keys = {
+                    k
+                    for k in (await session.execute(stmt)).scalars().all()
+                    if k is not None
+                }
+                blobs_to_delete = candidate_keys - surviving_keys
+
+        for blob_key in blobs_to_delete:
+            try:
+                await self.blob_storage.delete(USER_DATA_BUCKET, blob_key)
+            except (FileNotFoundError, OSError) as e:
+                logger.warning(f"Failed to delete blob {blob_key}: {e}")
+
+        if self.event_bus:
+            for node in purged_nodes:
+                if node.is_folder == "N" and node.file_name.endswith(".note"):
+                    await self.event_bus.publish(
+                        NoteDeletedEvent(file_id=node.id, user_id=node.user_id)
+                    )
+
     async def delete_from_recycle(self, user: str, id_list: list[int]) -> None:
         """Permanently delete items from recycle bin for a specific user using VFS."""
         user_id = await self.user_service.get_user_id(user)
-        async with self.session_manager.session() as session:
-            vfs = VirtualFileSystem(session)
-            # Fetch recycle nodes before deletion to get their names/types for event emission
-            # We must query RecycleFileDO because id_list are recycle_bin_ids
-            stmt = select(RecycleFileDO).where(
-                RecycleFileDO.user_id == user_id, RecycleFileDO.id.in_(id_list)
-            )
-            result = await session.execute(stmt)
-            nodes_to_delete = result.scalars().all()
-
-            await vfs.purge_recycle(user_id, id_list)
-
-            if self.event_bus:
-                for node in nodes_to_delete:
-                    # Only emit for actual files, not folders, or if it was a note
-                    if node.is_folder == BooleanEnum.NO and node.file_name.endswith(
-                        ".note"
-                    ):
-                        # node.file_id is the original File ID
-                        await self.event_bus.publish(
-                            NoteDeletedEvent(file_id=node.file_id, user_id=user_id)
-                        )
+        await self.purge_recycle(user_id=user_id, recycle_ids=id_list)
 
     async def revert_from_recycle(self, user: str, id_list: list[int]) -> None:
         """Restore items from recycle bin for a specific user using VFS."""
@@ -864,9 +904,7 @@ class FileService:
     async def clear_recycle(self, user: str) -> None:
         """Empty the recycle bin for a specific user using VFS."""
         user_id = await self.user_service.get_user_id(user)
-        async with self.session_manager.session() as session:
-            vfs = VirtualFileSystem(session)
-            await vfs.purge_recycle(user_id)
+        await self.purge_recycle(user_id=user_id)
 
     async def search_files(self, user: str, keyword: str) -> list[FileEntity]:
         """Search for files matching the keyword in user's storage.

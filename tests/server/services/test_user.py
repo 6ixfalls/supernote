@@ -432,7 +432,7 @@ async def test_unregister_revokes_renamed_sessions_before_id_reuse(
     replacement = await user_service.register(
         UserRegisterDTO(email="replacement@test.com", password=password_md5)
     )
-    assert replacement.id == deleted_user.id
+    assert replacement.id > deleted_user.id
     assert await user_service.verify_token(legacy_token) is None
 
 
@@ -517,7 +517,7 @@ async def test_unregister_revokes_v3_session_with_alias_owned_by_another_user(
     replacement = await user_service.register(
         UserRegisterDTO(email="replacement@test.com", password=password_md5)
     )
-    assert replacement.id == second_owner.id
+    assert replacement.id > second_owner.id
     assert await user_service.verify_token(login.token) is None
 
 
@@ -637,3 +637,193 @@ async def test_register_valid_email(user_service: UserService) -> None:
         except ValueError as e:
             pytest.fail(f"Valid email '{email}' failed validation: {e}")
         # We don't bother cleanup since we're using unique email addresses
+
+
+async def test_create_session_and_verify_token(user_service: UserService) -> None:
+    """Verify create_session mints and persists a verifiable session token."""
+    email = "session_test@example.com"
+    pw_md5 = hashlib.md5(b"password123").hexdigest()
+    await user_service.register(UserRegisterDTO(email=email, password=pw_md5))
+
+    token = await user_service.create_session(email, equipment_no="SN123")
+    state = await user_service.verify_token(token)
+    assert state is not None
+    assert state.email == email
+    assert state.equipment_no == "SN123"
+    assert state.token == token
+
+
+async def test_challenge_single_use_and_concurrent(user_service: UserService) -> None:
+    """Verify challenges are single-use (replay fails) and concurrent challenges do not overwrite each other."""
+    email = "challenge_test@example.com"
+    pw_md5 = hashlib.md5(b"password123").hexdigest()
+    await user_service.register(UserRegisterDTO(email=email, password=pw_md5))
+
+    # Generate two concurrent challenges for the same account
+    code1, ts1 = await user_service.generate_random_code(email)
+    code2, ts2 = await user_service.generate_random_code(email)
+    assert ts1 != ts2
+
+    hash1 = hash_with_salt(pw_md5, code1)
+    hash2 = hash_with_salt(pw_md5, code2)
+
+    # First challenge still works even though second challenge was issued
+    vo1 = await user_service.login(email, hash1, ts1, equipment_no="dev1")
+    assert vo1 is not None
+
+    # Replaying first challenge fails
+    replay = await user_service.login(email, hash1, ts1, equipment_no="dev1")
+    assert replay is None
+
+    # Second challenge still works once
+    vo2 = await user_service.login(email, hash2, ts2, equipment_no="dev2")
+    assert vo2 is not None
+
+
+async def test_update_email_validation_and_duplicate(user_service: UserService) -> None:
+    """Verify update_email validates format and rejects duplicate emails."""
+    pw_md5 = hashlib.md5(b"password123").hexdigest()
+    await user_service.register(
+        UserRegisterDTO(email="u1@example.com", password=pw_md5)
+    )
+    await user_service.register(
+        UserRegisterDTO(email="u2@example.com", password=pw_md5)
+    )
+
+    with pytest.raises(ValueError, match="Invalid email address format"):
+        await user_service.update_email(
+            "u1@example.com", UpdateEmailDTO(email="not-an-email")
+        )
+
+    with pytest.raises(ValueError, match="Email already registered"):
+        await user_service.update_email(
+            "u1@example.com", UpdateEmailDTO(email="u2@example.com")
+        )
+
+
+async def test_equipment_session_revocation(user_service: UserService) -> None:
+    """Verify unlinking equipment or re-logging in on same equipment revokes only that equipment's session."""
+    email = "equip_sess@example.com"
+    pw_md5 = hashlib.md5(b"password123").hexdigest()
+    await user_service.register(UserRegisterDTO(email=email, password=pw_md5))
+
+    # Login on dev1 and dev2
+    code1, ts1 = await user_service.generate_random_code(email)
+    vo1 = await user_service.login(
+        email, hash_with_salt(pw_md5, code1), ts1, equipment_no="dev1"
+    )
+    assert vo1 is not None
+
+    code2, ts2 = await user_service.generate_random_code(email)
+    vo2 = await user_service.login(
+        email, hash_with_salt(pw_md5, code2), ts2, equipment_no="dev2"
+    )
+    assert vo2 is not None
+
+    assert await user_service.verify_token(vo1.token) is not None
+    assert await user_service.verify_token(vo2.token) is not None
+
+    # Re-login on dev1 revokes vo1.token, leaves vo2.token active
+    code3, ts3 = await user_service.generate_random_code(email)
+    vo3 = await user_service.login(
+        email, hash_with_salt(pw_md5, code3), ts3, equipment_no="dev1"
+    )
+    assert vo3 is not None
+    assert await user_service.verify_token(vo1.token) is None
+    assert await user_service.verify_token(vo3.token) is not None
+    assert await user_service.verify_token(vo2.token) is not None
+
+    # Unlinking dev2 revokes vo2.token
+    await user_service.bind_equipment(email, "dev2")
+    await user_service.unlink_equipment("dev2")
+    assert await user_service.verify_token(vo2.token) is None
+    assert await user_service.verify_token(vo3.token) is not None
+
+
+async def test_session_adversarial_edge_cases(
+    user_service: UserService,
+    coordination_service: CoordinationService,
+    server_config: ServerConfig,
+) -> None:
+    """Verify create_session, verify_token, logout, and equipment key encoding resist adversarial inputs."""
+    with pytest.raises(ValueError, match="Active user missing@example.com not found"):
+        await user_service.create_session("missing@example.com")
+
+    assert await user_service.verify_token("") is None
+
+    email = "adv@example.com"
+    pw_md5 = hashlib.md5(b"password123").hexdigest()
+    user = await user_service.register(UserRegisterDTO(email=email, password=pw_md5))
+
+    # Equipment numbers containing colons must not prefix-collide with shorter equipment numbers
+    tok_short = await user_service.create_session(email, equipment_no="SN1")
+    tok_colon = await user_service.create_session(email, equipment_no="SN1:extra")
+    await user_service.revoke_equipment_sessions(user.id, "")
+    await user_service.revoke_equipment_sessions(user.id, "SN1")
+    assert await user_service.verify_token(tok_short) is None
+    assert await user_service.verify_token(tok_colon) is not None
+
+    # Logout handles empty, invalid, and malformed tokens gracefully and revokes only target token
+    await user_service.logout("")
+    await user_service.logout("not-a-jwt")
+    tok_web = await user_service.create_session(email)
+    await user_service.logout(tok_colon)
+    assert await user_service.verify_token(tok_colon) is None
+    assert await user_service.verify_token(tok_web) is not None
+
+    # Forged JWT with boolean user_id=True (int subclass) or missing user_id must be rejected
+    bool_uid_token = jwt.encode(
+        {"sub": email, "user_id": True, "equipment_no": ""},
+        server_config.auth.secret_key,
+        algorithm="HS256",
+    )
+    await user_service.logout(bool_uid_token)
+    assert await user_service.verify_token(bool_uid_token) is None
+
+    no_uid_token = jwt.encode(
+        {"sub": email, "equipment_no": ""},
+        server_config.auth.secret_key,
+        algorithm="HS256",
+    )
+    assert await user_service.verify_token(no_uid_token) is None
+
+    # Corrupted or mismatched SessionState in CoordinationService is rejected
+    tok_corrupt = await user_service.create_session(email)
+    key_corrupt = user_service._session_key(user.id, None, tok_corrupt)
+    await coordination_service.set_value(key_corrupt, "not-json", ttl=60)
+    assert await user_service.verify_token(tok_corrupt) is None
+
+    tok_mismatch = await user_service.create_session(email)
+    key_mismatch = user_service._session_key(user.id, None, tok_mismatch)
+    await coordination_service.set_value(
+        key_mismatch,
+        '{"token": "other", "email": "other@example.com", "user_id": 999}',
+        ttl=60,
+    )
+    assert await user_service.verify_token(tok_mismatch) is None
+
+    # admin_reset_password revokes active sessions
+    tok_before_admin_reset = await user_service.create_session(email)
+    await user_service.admin_reset_password(
+        email, hashlib.md5(b"newadminpw").hexdigest()
+    )
+    assert await user_service.verify_token(tok_before_admin_reset) is None
+
+
+async def test_user_profiles(user_service: UserService) -> None:
+    """Verify get_user_profile and list_user_profiles map UserDO to UserVO."""
+    pw_md5 = hashlib.md5(b"password123").hexdigest()
+    await user_service.register(
+        UserRegisterDTO(email="profile@example.com", password=pw_md5, user_name="Prof")
+    )
+
+    assert await user_service.get_user_profile("missing@example.com") is None
+    profile = await user_service.get_user_profile("profile@example.com")
+    assert profile is not None
+    assert profile.email == "profile@example.com"
+    assert profile.user_name == "Prof"
+
+    profiles = await user_service.list_user_profiles()
+    assert any(
+        p.email == "profile@example.com" and p.user_name == "Prof" for p in profiles
+    )

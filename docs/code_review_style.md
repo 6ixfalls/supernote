@@ -10,6 +10,7 @@ This document establishes the project's engineering, architectural, coding, and 
 High-level component interfaces must never expose low-level wire formats, transport tokens, or protocol artifacts to upper layers.
 
 * **Domain-Driven Signatures**: Methods should speak in domain models and standard exception semantics (`None` on success, typed exceptions on failure).
+* **Role Cohesion & Direction of Knowledge**: Interfaces must only express concepts intrinsic to their own domain—never leak a caller's persistence, scheduling, or orchestration mechanics downward into implementations. Prefer exposing declarative properties on implementations so callers can coordinate generically, and fix gaps in base state models rather than working around them in subclasses.
 * **No Wire Token Leaks**: Callers and test suites should never be forced to inspect protocol literals (such as `"Received"`, `"true"`, or raw status strings) to determine success or failure.
 * **Narrow Exception Scoping**: Catch only specific, expected exceptions (e.g. `(json.JSONDecodeError, ValueError, TypeError, KeyError)`). Never use bare `except Exception:` when handling payload parsing or decoding.
 

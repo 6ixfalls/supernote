@@ -246,27 +246,29 @@ async def test_summary_route_error_handling(
     client: TestClient, auth_headers: dict[str, str]
 ) -> None:
     endpoints = [
-        ("/api/file/add/summary/tag", {"name": "tag"}),
-        ("/api/file/update/summary/tag", {"id": 1, "name": "tag"}),
-        ("/api/file/delete/summary/tag", {"id": 1}),
-        ("/api/file/query/summary/tag", {}),
-        ("/api/file/add/summary", {"content": "c"}),
-        ("/api/file/update/summary", {"id": 1, "content": "c"}),
-        ("/api/file/delete/summary", {"id": 1}),
-        ("/api/file/query/summary", {}),
+        ("post", "/api/file/add/summary/tag", {"name": "tag"}),
+        ("put", "/api/file/update/summary/tag", {"id": 1, "name": "tag"}),
+        ("delete", "/api/file/delete/summary/tag", {"id": 1}),
+        ("get", "/api/file/query/summary/tag", None),
+        ("post", "/api/file/add/summary", {"content": "c"}),
+        ("put", "/api/file/update/summary", {"id": 1, "content": "c"}),
+        ("delete", "/api/file/delete/summary", {"id": 1}),
+        ("post", "/api/file/query/summary", {}),
         (
+            "post",
             "/api/file/add/summary/group",
             {"name": "g", "uniqueIdentifier": "u", "md5Hash": "h"},
         ),
         (
+            "put",
             "/api/file/update/summary/group",
             {"id": 1, "name": "g", "uniqueIdentifier": "u", "md5Hash": "h"},
         ),
-        ("/api/file/delete/summary/group", {"id": 1}),
-        ("/api/file/query/summary/group", {}),
-        ("/api/file/download/summary", {"id": 9999}),
-        ("/api/file/query/summary/hash", {}),
-        ("/api/file/query/summary/id", {}),
+        ("delete", "/api/file/delete/summary/group", {"id": 1}),
+        ("post", "/api/file/query/summary/group", {}),
+        ("post", "/api/file/download/summary", {"id": 9999}),
+        ("post", "/api/file/query/summary/hash", {}),
+        ("post", "/api/file/query/summary/id", {}),
     ]
 
     endpoint_method_map = {
@@ -287,7 +289,7 @@ async def test_summary_route_error_handling(
         "/api/file/query/summary/id": "list_summaries_by_id",
     }
 
-    for ep, payload in endpoints:
+    for http_method, ep, payload in endpoints:
         method_name = endpoint_method_map[ep]
 
         # SupernoteError path -> 400
@@ -296,7 +298,9 @@ async def test_summary_route_error_handling(
             method_name,
             side_effect=SupernoteError("Err", status_code=400),
         ):
-            resp = await client.post(ep, json=payload, headers=auth_headers)
+            resp = await client.request(
+                http_method, ep, json=payload, headers=auth_headers
+            )
             assert resp.status == 400
 
         # Uncaught Exception path -> 500
@@ -305,7 +309,9 @@ async def test_summary_route_error_handling(
             method_name,
             side_effect=Exception("Uncaught"),
         ):
-            resp = await client.post(ep, json=payload, headers=auth_headers)
+            resp = await client.request(
+                http_method, ep, json=payload, headers=auth_headers
+            )
             assert resp.status == 500
 
 

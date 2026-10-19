@@ -111,6 +111,11 @@ export default {
                     {{ error }}
                 </div>
 
+                <div v-else-if="pages.length === 0" class="flex flex-col items-center justify-center py-20 text-center max-w-md mx-auto space-y-2">
+                    <p class="text-sm font-medium text-slate-500 dark:text-slate-400">No page previews available for this notebook.</p>
+                    <p class="text-xs text-slate-400 font-mono">Page previews may be disabled on this server, or the notebook has no pages. Use the tabs on the right to view transcripts and summaries.</p>
+                </div>
+
                 <div v-else class="max-w-4xl mx-auto space-y-6">
                     <div v-for="(page, idx) in pages" :key="page.pageNo"
                         class="bg-white dark:bg-slate-900 rounded-2xl shadow-md border border-slate-200/80 dark:border-slate-800 overflow-hidden">

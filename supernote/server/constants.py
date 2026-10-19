@@ -1,15 +1,21 @@
 """Server constants."""
 
-# System directories that cannot be deleted or renamed
-IMMUTABLE_SYSTEM_DIRECTORIES = {
-    "Export",
-    "Inbox",
-    "Screenshot",
+# Folders a Supernote device expects at fixed locations. Whether a folder is a
+# system folder depends on where it is, see `VirtualFileSystem.is_system_directory`.
+SYSTEM_ROOT_DIRECTORIES = {
+    "EXPORT",
+    "INBOX",
+    "SCREENSHOT",
+    "NOTE",
+    "DOCUMENT",
+}
+
+# All system folder names regardless of location. Not suitable for deciding
+# whether a folder is protected; use `VirtualFileSystem.is_system_directory`.
+IMMUTABLE_SYSTEM_DIRECTORIES = SYSTEM_ROOT_DIRECTORIES | {
     "Note",
     "Document",
     "MyStyle",
-    "NOTE",  # Category container
-    "DOCUMENT",  # Category container
 }
 
 # Category containers (hidden from web API)

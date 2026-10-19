@@ -224,6 +224,8 @@ paths:
     $ref: "./paths/equipment.yaml#/bindEquipment"
   /api/terminal/equipment/unlink:
     $ref: "./paths/equipment.yaml#/unbindEquipment"
+  /api/terminal/send/password/unlock/code:
+    $ref: "./paths/equipment.yaml#/sendPasswordUnlockCode"
   /api/equipment/bind/status:
     $ref: "./paths/equipment.yaml#/bindStatus"
   /api/equipment/query/user/equipment/deleteApi:

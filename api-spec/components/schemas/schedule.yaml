@@ -171,7 +171,6 @@ ClearScheduleTaskGroupDTO:
   type: object
   required:
     - taskListId
-    - lastModified
   properties:
     taskListId:
       type: string

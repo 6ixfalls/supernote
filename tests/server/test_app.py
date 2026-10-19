@@ -4,13 +4,20 @@ These tests verify that the server correctly handles X-Forwarded-* headers
 when deployed behind a reverse proxy, with different proxy modes.
 """
 
+import dataclasses
 import subprocess
 import sys
 
 import pytest
 from aiohttp.test_utils import TestClient
+from pytest_aiohttp import AiohttpClient
 
 from supernote.models.file_device import FileUploadApplyLocalDTO
+from supernote.server.app import create_app
+from supernote.server.config import ServerConfig
+from supernote.server.services.processor_modules.png_conversion import (
+    PngConversionModule,
+)
 
 
 def test_import_does_not_load_google_genai() -> None:
@@ -174,3 +181,62 @@ async def test_upload_url_with_port_in_forwarded_host(
     assert full_upload_url.startswith("http://localhost:9888"), (
         f"Got URL: {full_upload_url}"
     )
+
+
+async def test_static_frontend_sha256_fallback(client: TestClient) -> None:
+    """Verify that index.html and client.js include fallback for SHA-256 in insecure contexts."""
+    resp = await client.get("/")
+    assert resp.status == 200
+    html = await resp.text()
+    assert "js-sha256" in html
+
+    resp = await client.get("/static/js/api/client.js")
+    assert resp.status == 200
+    js = await resp.text()
+    assert "crypto.subtle" in js
+    assert "window.sha256" in js
+
+
+async def test_static_frontend_disabled_when_web_enabled_false(
+    aiohttp_client: AiohttpClient,
+    server_config: ServerConfig,
+) -> None:
+    """Verify that index and static routes are not registered when web_enabled is False."""
+    disabled_config = dataclasses.replace(server_config, web_enabled=False)
+    app = create_app(disabled_config)
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/")
+    assert resp.status == 404
+
+    resp = await client.get("/static/js/api/client.js")
+    assert resp.status == 404
+
+
+@pytest.mark.parametrize(
+    ("web_enabled", "web_notebook_preview", "gemini_api_key", "expected_png"),
+    [
+        (False, False, "fake-key", True),
+        (True, True, None, True),
+        (True, False, None, False),
+        (False, True, None, False),
+    ],
+)
+def test_png_module_registration_matrix(
+    server_config: ServerConfig,
+    web_enabled: bool,
+    web_notebook_preview: bool,
+    gemini_api_key: str | None,
+    expected_png: bool,
+) -> None:
+    """Verify PngConversionModule is only registered when OCR or web notebook preview is active."""
+    cfg = dataclasses.replace(
+        server_config,
+        web_enabled=web_enabled,
+        web_notebook_preview=web_notebook_preview,
+        gemini_api_key=gemini_api_key,
+    )
+    app = create_app(cfg)
+    page_modules = app["processor_service"].page_modules
+    has_png = any(isinstance(m, PngConversionModule) for m in page_modules)
+    assert has_png is expected_png

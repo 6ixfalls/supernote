@@ -61,6 +61,15 @@ FileListQueryVO:
         total:
           type: integer
           format: int64
+        pages:
+          type: integer
+          format: int32
+        pageNum:
+          type: integer
+          format: int32
+        pageSize:
+          type: integer
+          format: int32
         userFileVOList:
           type: array
           items:

@@ -161,6 +161,7 @@ class PageHashingModule(ProcessorModule):
                         row.content_hash = current_hash
                         row.text_content = None  # Clear OCR
                         row.embedding = None  # Clear Embedding
+                        row.embedding_model = None
 
                         # Invalidate downstream tasks
                         # Note: Tasks are keyed by page_index usually?
@@ -191,6 +192,7 @@ class PageHashingModule(ProcessorModule):
                         content_hash=current_hash,
                         text_content=None,
                         embedding=None,
+                        embedding_model=None,
                     )
                     session.add(new_content)
 

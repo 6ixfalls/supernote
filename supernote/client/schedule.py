@@ -55,10 +55,12 @@ class ScheduleClient:
             "/api/file/schedule/group", BaseResponse, json=dto.to_dict()
         )
 
-    async def clear_group(self, group_id: str) -> BaseResponse:
+    async def clear_group(
+        self, group_id: str, last_modified_ms: int | None = None
+    ) -> BaseResponse:
         """Clear all tasks within a schedule group."""
         dto = ClearScheduleTaskGroupDTO(
-            task_list_id=group_id, last_modified=int(time.time() * 1000)
+            task_list_id=group_id, last_modified=last_modified_ms
         )
         return await self._client.post_json(
             "/api/file/schedule/group/clear", BaseResponse, json=dto.to_dict()

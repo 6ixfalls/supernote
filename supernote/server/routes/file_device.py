@@ -41,6 +41,7 @@ from supernote.models.file_device import (
     SynchronousStartLocalDTO,
     SynchronousStartLocalVO,
 )
+from supernote.server.config import ServerConfig
 from supernote.server.exceptions import SupernoteError
 from supernote.server.services.file import (
     FileEntity,
@@ -396,7 +397,9 @@ async def handle_download_apply(request: web.Request) -> web.Response:
         path_to_sign = f"/api/oss/download?path={info.id}"
 
         # helper returns: ...?signature=...
-        signed_path = await url_signer.sign(path_to_sign, user=user_email)
+        signed_path = await url_signer.sign(
+            path_to_sign, user=user_email, single_use=False
+        )
         base_url = get_request_base_url(request)
         download_url = f"{base_url}{signed_path}"
 
@@ -545,6 +548,11 @@ async def handle_note_to_png(request: web.Request) -> web.Response:
     # Response: PngVO
     req_data = PngDTO.from_dict(await request.json())
     user_email = request["user"]
+    config: ServerConfig = request.app["config"]
+
+    if not (config.web_enabled and config.web_notebook_preview):
+        return web.json_response(PngVO(png_page_vo_list=[]).to_dict())
+
     file_service: FileService = request.app["file_service"]
     url_signer: UrlSigner = request.app["url_signer"]
 
@@ -557,7 +565,9 @@ async def handle_note_to_png(request: web.Request) -> web.Response:
             # OSS download URL: /api/oss/download?path={inner_name}
             # Here storage_key is already the full path within bucket
             path_to_sign = f"/api/oss/download?path={res.storage_key}"
-            signed_path = await url_signer.sign(path_to_sign, user=user_email)
+            signed_path = await url_signer.sign(
+                path_to_sign, user=user_email, single_use=False
+            )
             download_url = f"{base_url}{signed_path}"
 
             png_pages.append(PngPageVO(page_no=res.page_no, url=download_url))
@@ -586,7 +596,9 @@ async def handle_note_to_pdf(request: web.Request) -> web.Response:
 
         # Generate signed URL for PDF
         path_to_sign = f"/api/oss/download?path={storage_key}"
-        signed_path = await url_signer.sign(path_to_sign, user=user_email)
+        signed_path = await url_signer.sign(
+            path_to_sign, user=user_email, single_use=False
+        )
         base_url = get_request_base_url(request)
         download_url = f"{base_url}{signed_path}"
 

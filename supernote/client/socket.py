@@ -73,6 +73,26 @@ class SupernoteSocketClient:
                     pass
             await self._status_queue.put(data)
 
+        @self._sio.on(SocketIoEvent.TODO.value)
+        async def on_todo_message(data: str) -> None:
+            logger.debug("Received to-do: %s", data)
+            if isinstance(data, str):
+                try:
+                    msg = SocketMessageData.from_json(data)
+                    await self._message_queue.put(msg)
+                except (json.JSONDecodeError, ValueError, TypeError, KeyError):
+                    logger.warning("Failed to parse to-do message: %s", data)
+
+        @self._sio.on(SocketIoEvent.DIGEST.value)
+        async def on_digest_message(data: str) -> None:
+            logger.debug("Received digest: %s", data)
+            if isinstance(data, str):
+                try:
+                    msg = SocketMessageData.from_json(data)
+                    await self._message_queue.put(msg)
+                except (json.JSONDecodeError, ValueError, TypeError, KeyError):
+                    logger.warning("Failed to parse digest message: %s", data)
+
         @self._sio.on(SocketIoEvent.RATTA_PING.value)
         async def on_ratta_ping(data: Any) -> None:
             logger.debug("Received ratta_ping: %s", data)

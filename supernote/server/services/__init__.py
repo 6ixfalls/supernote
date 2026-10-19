@@ -12,4 +12,5 @@ __all__ = [
     "storage",
     "user",
     "vfs",
+    "webhook",
 ]

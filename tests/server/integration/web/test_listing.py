@@ -97,7 +97,7 @@ async def test_file_list_query_root(
     ] == [
         "Document",
         "Export",
-        "FolderRoot",
+        "Folderroot",
         "Inbox",
         "MyStyle",
         "Note",
@@ -193,11 +193,12 @@ async def test_create_root_directory(
     folder_names = [
         f.file_name for f in res.user_file_vo_list if f.is_folder == BooleanEnum.YES
     ]
-    assert "NewRootFolder" in folder_names
+    # The root listing capitalizes folder names, as the reference server does.
+    assert "Newrootfolder" in folder_names
 
     # Verify the folder has correct properties
     new_folder_in_list = next(
-        f for f in res.user_file_vo_list if f.file_name == "NewRootFolder"
+        f for f in res.user_file_vo_list if f.file_name == "Newrootfolder"
     )
     assert new_folder_in_list.is_folder == BooleanEnum.YES
     assert new_folder_in_list.directory_id == "0"
@@ -261,7 +262,7 @@ async def test_user_file_vo_all_fields_for_folder(
 ) -> None:
     """Verify all UserFileVO fields are populated correctly for a folder."""
     # Create a folder at root
-    folder_name = "ComprehensiveTestFolder"
+    folder_name = "Comprehensivetestfolder"
     created_folder = await web_client.create_folder(parent_id=0, name=folder_name)
 
     # Query root to get the folder in the listing

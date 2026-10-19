@@ -3,7 +3,6 @@
 import shutil
 from pathlib import Path
 
-import jwt
 from aiohttp.test_utils import TestClient, TestServer
 
 from supernote.client.auth import AbstractAuth
@@ -12,7 +11,6 @@ from supernote.client.schedule import ScheduleClient
 from supernote.server.app import create_app
 from supernote.server.config import AuthConfig, ServerConfig
 from supernote.server.db.migrations import run_migrations
-from supernote.server.services.user import JWT_ALGORITHM
 
 FIXTURES_DIR = Path(__file__).parent.parent.parent.parent / "fixtures"
 SCHEDULE_FIXTURE_PATH = FIXTURES_DIR / "db_v1_schedule.sqlite"
@@ -40,12 +38,7 @@ async def test_load_existing_schedule_database_via_api(tmp_path: Path) -> None:
     await server.start_server()
 
     # Generate auth token for the test user
-    test_user = "test@example.com"
-    secret = config.auth.secret_key
-    token = jwt.encode({"sub": test_user}, secret, algorithm=JWT_ALGORITHM)
-    await app["coordination_service"].set_value(
-        f"session:{token}", f"{test_user}|", ttl=3600
-    )
+    token = await app["user_service"].create_session("test@example.com")
 
     class TokenAuth(AbstractAuth):
         async def async_get_access_token(self) -> str:

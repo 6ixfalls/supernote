@@ -68,6 +68,35 @@ async def test_oss_download_range(
     assert part4 == b"0"
 
 
+async def test_oss_download_range_reuses_signed_url(
+    device_client: DeviceClient,
+    client: Client,
+) -> None:
+    """Verify multiple Range requests can reuse a single signed download URL within its TTL."""
+    content = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    upload_result = await device_client.upload_content(
+        path="oss_range_reuse.txt", content=content, equipment_no="TEST"
+    )
+    assert upload_result.id
+
+    download_info = await device_client.download_v3(int(upload_result.id), "TEST")
+    assert download_info
+    parsed = urllib.parse.urlparse(download_info.url)
+    relative_url = f"{parsed.path}?{parsed.query}"
+
+    resp1 = await client.get(relative_url, headers={"Range": "bytes=0-9"})
+    assert resp1.status == 206
+    assert await resp1.read() == b"0123456789"
+
+    resp2 = await client.get(relative_url, headers={"Range": "bytes=10-19"})
+    assert resp2.status == 206
+    assert await resp2.read() == b"ABCDEFGHIJ"
+
+    resp3 = await client.get(relative_url, headers={"Range": "bytes=20-"})
+    assert resp3.status == 206
+    assert await resp3.read() == b"KLMNOPQRSTUVWXYZ"
+
+
 async def test_oss_invalid_signature(
     authenticated_client: Client,
     device_client: DeviceClient,

@@ -56,6 +56,10 @@ class LoginClient:
         )
         return access_token_response.token
 
+    async def logout(self) -> None:
+        """Log out the currently authenticated session."""
+        await self._client.post_json("/api/user/logout", BaseResponse)
+
     async def login_equipment(
         self, email: str, password: str, equipment_no: str
     ) -> LoginVO:

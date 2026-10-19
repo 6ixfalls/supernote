@@ -3,7 +3,7 @@ import logging
 import time
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 
 from supernote.models.base import ProcessingStatus
 from supernote.server.metrics import (
@@ -16,8 +16,15 @@ from supernote.server.metrics import (
 from ..constants import CACHE_BUCKET, DEFAULT_PAGE_CONCURRENCY
 from ..db.models.file import UserFileDO
 from ..db.models.note_processing import NotePageContentDO, SystemTaskDO
+from ..db.models.summary import SummaryDO
 from ..db.session import DatabaseSessionManager
-from ..events import Event, LocalEventBus, NoteDeletedEvent, NoteUpdatedEvent
+from ..events import (
+    Event,
+    LocalEventBus,
+    NoteDeletedEvent,
+    NoteProcessingCompletedEvent,
+    NoteUpdatedEvent,
+)
 from ..services.file import FileService
 from ..services.processor_modules import ProcessorModule
 from ..services.summary import SummaryService
@@ -80,15 +87,15 @@ class ProcessorService:
     def register_modules(
         self,
         hashing: ProcessorModule,
-        png: ProcessorModule,
-        ocr: ProcessorModule,
-        embedding: ProcessorModule,
-        summary: ProcessorModule,
+        png: ProcessorModule | None = None,
+        ocr: ProcessorModule | None = None,
+        embedding: ProcessorModule | None = None,
+        summary: ProcessorModule | None = None,
     ) -> None:
         """Register processing modules in logical order."""
         self.global_pre_modules = [hashing]
-        self.page_modules = [png, ocr, embedding]
-        self.global_post_modules = [summary]
+        self.page_modules = [m for m in (png, ocr, embedding) if m is not None]
+        self.global_post_modules = [m for m in (summary,) if m is not None]
         logger.info("Registered all processor modules.")
 
     async def start(self) -> None:
@@ -208,6 +215,7 @@ class ProcessorService:
             await session.execute(
                 delete(SystemTaskDO).where(SystemTaskDO.file_id == file_id)
             )
+            await session.execute(delete(SummaryDO).where(SummaryDO.file_id == file_id))
             await session.commit()
 
         # Delete Blobs (PNGs)
@@ -217,7 +225,7 @@ class ProcessorService:
             png_path = get_page_png_path(file_id, page_id)
             try:
                 await self.file_service.blob_storage.delete(CACHE_BUCKET, png_path)
-            except Exception as e:
+            except (FileNotFoundError, OSError) as e:
                 logger.warning(
                     f"Failed to delete PNG for {file_id} page {page_id}: {e}"
                 )
@@ -289,17 +297,50 @@ class ProcessorService:
         self._update_queue_metrics()
 
     async def recover_missing_tasks(self) -> None:
-        """Find .note files that have no system tasks and enqueue them."""
+        """Find .note files that have missing or outdated tasks and enqueue them."""
         logger.info("Checking for files with missing tasks...")
-        async with self.session_manager.session() as session:
-            # Subquery to find file_ids that exist in f_system_task
-            task_exists_stmt = select(SystemTaskDO.file_id)
+        conditions = [UserFileDO.id.not_in(select(SystemTaskDO.file_id))]
 
-            # Find all UserFileDO with .note extension that are NOT in f_system_task
+        for module in (*self.global_pre_modules, *self.global_post_modules):
+            if not module.enabled:
+                continue
+            task_stmt = (
+                select(SystemTaskDO.file_id)
+                .where(SystemTaskDO.task_type == module.task_type)
+                .where(SystemTaskDO.key == "global")
+            )
+            if module.version is not None:
+                task_stmt = task_stmt.where(SystemTaskDO.data == module.version)
+            conditions.append(UserFileDO.id.not_in(task_stmt))
+
+        for module in self.page_modules:
+            if not module.enabled:
+                continue
+            page_task_exists = (
+                select(SystemTaskDO.id)
+                .where(SystemTaskDO.file_id == NotePageContentDO.file_id)
+                .where(SystemTaskDO.task_type == module.task_type)
+                .where(SystemTaskDO.key == "page_" + NotePageContentDO.page_id)
+            )
+            if module.version is not None:
+                page_task_exists = page_task_exists.where(
+                    SystemTaskDO.data == module.version
+                )
+            page_missing_stmt = (
+                select(NotePageContentDO.file_id)
+                .where(NotePageContentDO.page_id != "")
+                .where(~page_task_exists.correlate(NotePageContentDO).exists())
+            )
+            conditions.append(UserFileDO.id.in_(page_missing_stmt))
+
+        async with self.session_manager.session() as session:
             stmt = (
                 select(UserFileDO.id, UserFileDO.user_id)
-                .where(UserFileDO.file_name.like("%.note"))
-                .where(UserFileDO.id.not_in(task_exists_stmt))
+                .where(
+                    UserFileDO.file_name.like("%.note"),
+                    UserFileDO.is_active == "Y",
+                )
+                .where(or_(*conditions))
             )
             result = await session.execute(stmt)
             missing = result.all()
@@ -354,7 +395,7 @@ class ProcessorService:
         """Orchestrate the processing pipeline for a single file."""
         logger.info(f"Processing file {file_id}...")
 
-        if not self.global_pre_modules or not self.page_modules:
+        if not self.global_pre_modules:
             logger.error("Modules not fully registered. Skipping processing.")
             return
 
@@ -364,37 +405,61 @@ class ProcessorService:
                 logger.error(f"Pre-module {module.name} failed. Aborting pipeline.")
                 return
 
-        # Identify Pages
-        async with self.session_manager.session() as session:
-            # We want both index and ID. Index is needed for order, ID for tasks/storage.
-            stmt = (
-                select(NotePageContentDO.page_index, NotePageContentDO.page_id)
-                .where(NotePageContentDO.file_id == file_id)
-                .order_by(NotePageContentDO.page_index)
-            )
-            result = await session.execute(stmt)
-            pages = result.all()  # List of (index, id) tuples
+        if self.page_modules:
+            # Identify Pages
+            async with self.session_manager.session() as session:
+                # We want both index and ID. Index is needed for order, ID for tasks/storage.
+                stmt = (
+                    select(NotePageContentDO.page_index, NotePageContentDO.page_id)
+                    .where(NotePageContentDO.file_id == file_id)
+                    .order_by(NotePageContentDO.page_index)
+                )
+                result = await session.execute(stmt)
+                pages = result.all()  # List of (index, id) tuples
 
-        if not pages:
-            logger.info(f"No pages found for file {file_id}. Skipping page tasks.")
-        else:
-            # Pipeline Stage: Per-Page Processing (Parallel across pages with limit)
-            sem = asyncio.Semaphore(self.page_concurrency)
+            if not pages:
+                logger.info(f"No pages found for file {file_id}. Skipping page tasks.")
+            else:
+                # Pipeline Stage: Per-Page Processing (Parallel across pages with limit)
+                sem = asyncio.Semaphore(self.page_concurrency)
 
-            async def throttled_process_page(page_index: int, page_id: str):
-                async with sem:
-                    await self._process_page(file_id, page_index, page_id)
+                async def throttled_process_page(page_index: int, page_id: str):
+                    async with sem:
+                        await self._process_page(file_id, page_index, page_id)
 
-            tasks = [
-                throttled_process_page(page_index, page_id)
-                for page_index, page_id in pages
-                if page_id  # Strict Check: Everything must have a page_id
-            ]
-            await asyncio.gather(*tasks)
+                tasks = [
+                    throttled_process_page(page_index, page_id)
+                    for page_index, page_id in pages
+                    if page_id  # Strict Check: Everything must have a page_id
+                ]
+                await asyncio.gather(*tasks)
 
         # Pipeline Stage: Global Post-processing (Summary)
         for module in self.global_post_modules:
             await module.run(file_id, self.session_manager)
+
+        await self._publish_processing_completed(file_id)
+
+    async def _publish_processing_completed(self, file_id: int) -> None:
+        """Publish NoteProcessingCompletedEvent after pipeline stages complete."""
+        async with self.session_manager.session() as session:
+            result = await session.execute(
+                select(UserFileDO).where(UserFileDO.id == file_id)
+            )
+            user_file = result.scalar_one_or_none()
+            if not isinstance(user_file, UserFileDO):
+                return
+
+        file_path = await self.file_service.get_full_path_by_node(
+            user_file.user_id, file_id
+        )
+        await self.event_bus.publish(
+            NoteProcessingCompletedEvent(
+                file_id=file_id,
+                user_id=user_file.user_id,
+                file_path=file_path,
+            )
+        )
 
     async def _process_page(self, file_id: int, page_index: int, page_id: str) -> None:
         """Process all modules for a single page sequentially."""
@@ -418,13 +483,16 @@ class ProcessorService:
                 exc_info=True,
             )
 
-    async def list_system_tasks(self, limit: int = 100) -> list[SystemTaskDO]:
-        """List recent system tasks."""
+    async def list_system_tasks(
+        self, user_id: int | None = None, limit: int = 100
+    ) -> list[SystemTaskDO]:
+        """List recent system tasks, optionally scoped to a specific user."""
         async with self.session_manager.session() as session:
-            stmt = (
-                select(SystemTaskDO)
-                .order_by(SystemTaskDO.update_time.desc())
-                .limit(limit)
-            )
+            stmt = select(SystemTaskDO)
+            if user_id is not None:
+                stmt = stmt.join(
+                    UserFileDO, SystemTaskDO.file_id == UserFileDO.id
+                ).where(UserFileDO.user_id == user_id)
+            stmt = stmt.order_by(SystemTaskDO.update_time.desc()).limit(limit)
             result = await session.execute(stmt)
             return list(result.scalars().all())

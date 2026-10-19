@@ -11,6 +11,9 @@ from pydantic import AnyHttpUrl
 
 from supernote.models.base import ErrorCode, create_error_response
 from supernote.server.mcp.models import (
+    ListNotebooksRequestDTO,
+    ListNotebooksResponseVO,
+    NotebookVO,
     SearchRequestDTO,
     SearchResponseVO,
     SearchResultVO,
@@ -79,6 +82,49 @@ async def _get_auth_user_id(ctx: Context) -> int | None:
     if not token.user_id:
         return None
     return await user_service.get_user_id(token.user_id)
+
+
+async def list_notebooks(
+    ctx: Context,
+    limit: int = 20,
+    name_filter: str | None = None,
+) -> dict[str, Any]:
+    """
+    List active notebooks ordered by most recently updated.
+
+    Args:
+        limit: Maximum number of notebooks to return (default: 20).
+        name_filter: Optional substring filter for notebook filenames.
+    """
+    search_service: SearchService = _services["search_service"]
+    if not search_service:
+        return create_error_response(
+            "Services not initialized.", ErrorCode.INTERNAL_ERROR
+        ).to_dict()
+
+    user_id = await _get_auth_user_id(ctx)
+    if user_id is None:
+        return create_error_response(
+            "Authentication failed. Please set a valid token in meta.",
+            ErrorCode.UNAUTHORIZED,
+        ).to_dict()
+
+    dto = ListNotebooksRequestDTO(limit=limit, name_filter=name_filter)
+    notebooks = await search_service.list_notebooks(
+        user_id=user_id,
+        name_filter=dto.name_filter,
+        limit=dto.limit,
+    )
+    vo_list = [
+        NotebookVO(
+            file_id=n.file_id,
+            file_name=n.file_name,
+            create_time=n.create_time,
+            update_time=n.update_time,
+        )
+        for n in notebooks
+    ]
+    return ListNotebooksResponseVO(notebooks=vo_list).to_dict()
 
 
 async def search_notebook_chunks(
@@ -204,6 +250,7 @@ def create_mcp_server(issuer_url: str, resource_server_url: str) -> MCPServer:
         ),
         token_verifier=token_verifier,
     )
+    mcp.tool()(list_notebooks)
     mcp.tool()(search_notebook_chunks)
     mcp.tool()(get_notebook_transcript)
     return mcp

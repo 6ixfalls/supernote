@@ -102,6 +102,9 @@ RandomCodeDTO:
       description: User account
     countryCode:
       type: string
+    version:
+      type: string
+      description: "Protocol version (e.g., '202305')"
   required:
     - account
 

@@ -56,6 +56,20 @@ export SUPERNOTE_GEMINI_EMBEDDING_MODEL="gemini-embedding-001"
 The equivalent `config.yaml` keys are `gemini_provider`, `gemini_project`,
 `gemini_location`, and `gemini_flex`.
 
+#### Outbound Webhooks
+To send non-blocking HTTP `POST` notifications on server events (e.g., to Home Assistant, n8n, or Zapier), configure `webhooks` in `config/config.yaml` (or enable via `SUPERNOTE_WEBHOOKS_ENABLED=true`):
+```yaml
+webhooks:
+  enabled: true
+  endpoints:
+    - url: "https://n8n.homelab.local/webhook/supernote"
+      user: "user@example.com"
+      secret: "CHANGE_ME_TO_A_SECURE_RANDOM_STRING"
+      events:
+        - "note.sync_completed"
+```
+Each delivery includes `X-Supernote-Event` and (when `secret` is set) `X-Supernote-Signature: sha256=<hex>` headers with a JSON payload (see [`supernote.models.webhook`](https://allenporter.github.io/supernote/supernote/models/webhook.html) and [`supernote.server.services.webhook`](https://allenporter.github.io/supernote/supernote/server/services/webhook.html)).
+
 ### Running the Server
 
 Start the server using the unified `supernote` CLI:

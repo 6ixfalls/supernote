@@ -68,3 +68,48 @@ gemini_flex: false
 # Directory containing custom AI prompts.
 # prompts_dir: "path/to/your/prompts"
 
+
+# Outbound webhook dispatch (optional).
+# Sends a signed HTTP POST to each endpoint when a subscribed event occurs
+# for the specified user account, e.g. to trigger a Home Assistant, n8n, or
+# Zapier automation on note sync.
+# webhooks:
+#   enabled: true
+#   endpoints:
+#     - url: "https://n8n.homelab.local/webhook/supernote"
+#       # Email address of the user account whose events this endpoint receives.
+#       user: "user@example.com"
+#       # Shared secret used to HMAC-SHA256 sign each payload. Sent to the
+#       # endpoint in the `X-Supernote-Signature: sha256=<hex>` header so it
+#       # can verify the request came from this server and was not altered.
+#       secret: "CHANGE_ME_TO_A_SECURE_RANDOM_STRING"
+#       # Event names this endpoint wants to receive. Omit (or leave empty)
+#       # to receive every event for this user.
+#       events:
+#         - "note.sync_completed"
+#         - "note.processing_completed"
+
+# AI providers and per-capability model configuration (optional)
+# ai:
+#   providers:
+#     gemini:
+#       api_key: "CHANGE_ME_TO_YOUR_GEMINI_API_KEY"
+#     openai:
+#       base_url: "http://localhost:11434/v1"
+#       api_key: "ollama"
+#   ocr:
+#     provider: gemini
+#     model: gemini-3.6-flash
+#     max_concurrency: 5
+#   summary:
+#     provider: gemini
+#     model: gemini-3.6-flash
+#     max_concurrency: 5
+#   embedding:
+#     provider: gemini
+#     model: gemini-embedding-001
+#     max_concurrency: 5
+
+# Web interface settings (optional)
+# web_enabled: true # Set to false to disable web dashboard and static routes (default: true)
+# web_notebook_preview: true # Set to false to disable heavy notebook page rendering for web preview (default: true)

@@ -4,7 +4,6 @@ import hashlib
 import shutil
 from pathlib import Path
 
-import jwt
 from aiohttp.test_utils import TestClient, TestServer
 
 from supernote.client.auth import AbstractAuth
@@ -15,7 +14,7 @@ from supernote.models.user import UserRegisterDTO
 from supernote.server.app import create_app
 from supernote.server.config import AuthConfig, ServerConfig
 from supernote.server.db.migrations import run_migrations
-from supernote.server.services.user import JWT_ALGORITHM, UserService
+from supernote.server.services.user import UserService
 
 
 async def test_unmigrated_summary_api_query(tmp_path: Path) -> None:
@@ -37,12 +36,7 @@ async def test_unmigrated_summary_api_query(tmp_path: Path) -> None:
     )
     app = create_app(config)
 
-    secret = config.auth.secret_key
-    token = jwt.encode({"sub": "api_test@example.com"}, secret, algorithm=JWT_ALGORITHM)
-    coordination_service = app["coordination_service"]
-    await coordination_service.set_value(
-        f"session:{token}", "api_test@example.com|", ttl=3600
-    )
+    token = await app["user_service"].create_session("api_test@example.com")
 
     class TokenAuth(AbstractAuth):
         async def async_get_access_token(self) -> str:
@@ -96,12 +90,7 @@ async def test_migrated_legacy_db_summary_api_query(tmp_path: Path) -> None:
     )
     app = create_app(config)
 
-    secret = config.auth.secret_key
-    token = jwt.encode({"sub": "api_test@example.com"}, secret, algorithm=JWT_ALGORITHM)
-    coordination_service = app["coordination_service"]
-    await coordination_service.set_value(
-        f"session:{token}", "api_test@example.com|", ttl=3600
-    )
+    token = await app["user_service"].create_session("api_test@example.com")
 
     class TokenAuth(AbstractAuth):
         async def async_get_access_token(self) -> str:
@@ -164,14 +153,7 @@ async def test_post_migration_new_summary_creation(tmp_path: Path) -> None:
         UserRegisterDTO(email="new_api_test@example.com", password=pwd_md5)
     )
 
-    secret = config.auth.secret_key
-    token = jwt.encode(
-        {"sub": "new_api_test@example.com"}, secret, algorithm=JWT_ALGORITHM
-    )
-    coordination_service = app["coordination_service"]
-    await coordination_service.set_value(
-        f"session:{token}", "new_api_test@example.com|", ttl=3600
-    )
+    token = await user_service.create_session("new_api_test@example.com")
 
     class TokenAuth(AbstractAuth):
         async def async_get_access_token(self) -> str:

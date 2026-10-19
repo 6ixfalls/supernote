@@ -47,21 +47,21 @@ class SummaryClient:
     async def update_tag(self, tag_id: int, name: str) -> BaseResponse:
         """Update a summary tag."""
         dto = UpdateSummaryTagDTO(id=tag_id, name=name)
-        return await self._client.post_json(
+        return await self._client.put_json(
             "/api/file/update/summary/tag", BaseResponse, json=dto.to_dict()
         )
 
     async def delete_tag(self, tag_id: int) -> BaseResponse:
         """Delete a summary tag."""
         dto = DeleteSummaryTagDTO(id=tag_id)
-        return await self._client.post_json(
+        return await self._client.delete_json(
             "/api/file/delete/summary/tag", BaseResponse, json=dto.to_dict()
         )
 
     async def query_tags(self) -> QuerySummaryTagVO:
         """Query summary tags."""
-        return await self._client.post_json(
-            "/api/file/query/summary/tag", QuerySummaryTagVO, json={}
+        return await self._client.get_json(
+            "/api/file/query/summary/tag", QuerySummaryTagVO
         )
 
     async def add_summary(self, dto: AddSummaryDTO) -> AddSummaryVO:
@@ -72,14 +72,14 @@ class SummaryClient:
 
     async def update_summary(self, dto: UpdateSummaryDTO) -> BaseResponse:
         """Update an existing summary."""
-        return await self._client.post_json(
+        return await self._client.put_json(
             "/api/file/update/summary", BaseResponse, json=dto.to_dict()
         )
 
     async def delete_summary(self, summary_id: int) -> BaseResponse:
         """Delete a summary."""
         dto = DeleteSummaryDTO(id=summary_id)
-        return await self._client.post_json(
+        return await self._client.delete_json(
             "/api/file/delete/summary", BaseResponse, json=dto.to_dict()
         )
 
@@ -109,14 +109,14 @@ class SummaryClient:
 
     async def update_group(self, dto: UpdateSummaryGroupDTO) -> BaseResponse:
         """Update a summary group."""
-        return await self._client.post_json(
+        return await self._client.put_json(
             "/api/file/update/summary/group", BaseResponse, json=dto.to_dict()
         )
 
     async def delete_group(self, group_id: int) -> BaseResponse:
         """Delete a summary group."""
         dto = DeleteSummaryGroupDTO(id=group_id)
-        return await self._client.post_json(
+        return await self._client.delete_json(
             "/api/file/delete/summary/group", BaseResponse, json=dto.to_dict()
         )
 

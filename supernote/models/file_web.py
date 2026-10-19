@@ -582,9 +582,15 @@ class FileLabelSearchDTO(DataClassJSONMixin):
         /api/file/label/list/search (POST)
     """
 
-    keyword: str
+    keyword: str | None = None
     equipment_no: str | None = field(
         metadata=field_options(alias="equipmentNo"), default=None
+    )
+    file_name: str | None = field(
+        metadata=field_options(alias="fileName"), default=None
+    )
+    directory_id: int | None = field(
+        metadata=field_options(alias="directoryId"), default=None
     )
 
     class Config(BaseConfig):
@@ -600,3 +606,6 @@ class FileLabelSearchVO(BaseResponse):
     """
 
     entries: list[EntriesVO] = field(default_factory=list)
+    user_file_search_vo_list: list[UserFileSearchVO] = field(
+        metadata=field_options(alias="userFileSearchVOList"), default_factory=list
+    )

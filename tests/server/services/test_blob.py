@@ -1,10 +1,16 @@
 import hashlib
+import os
+import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
 import pytest
 
-from supernote.server.services.blob import LocalBlobStorage
+from supernote.server.services.blob import (
+    CLEANUP_INTERVAL_SECONDS,
+    TEMP_FILE_TTL_SECONDS,
+    LocalBlobStorage,
+)
 
 
 async def test_put_get_blob(tmp_path: Path) -> None:
@@ -174,3 +180,108 @@ async def test_get_range_large(tmp_path: Path) -> None:
     data = b"".join(chunks)
     assert len(data) == 5
     assert data == b"xxyyy"
+
+
+@pytest.mark.parametrize(
+    ("bucket", "key"),
+    [
+        ("..", "valid-key"),
+        (".", "valid-key"),
+        ("", "valid-key"),
+        ("test-bucket", ".."),
+        ("test-bucket", "."),
+        ("test-bucket", ""),
+        ("test-bucket", "foo/.."),
+    ],
+)
+async def test_invalid_blob_path_rejected(
+    tmp_path: Path, bucket: str, key: str
+) -> None:
+    """Verify invalid bucket or key names that do not resolve within the bucket dir raise ValueError."""
+    storage = LocalBlobStorage(tmp_path)
+
+    with pytest.raises(ValueError, match="Invalid blob path"):
+        storage.get_blob_path(bucket, key)
+
+    with pytest.raises(ValueError, match="Invalid blob path"):
+        await storage.put(bucket, key, b"data")
+
+
+async def test_storage_root_containment(tmp_path: Path) -> None:
+    """Verify resolved blob paths are strictly contained within the storage root."""
+    storage = LocalBlobStorage(tmp_path)
+    bucket = "secure-bucket"
+    key = "normal-key-abc"
+
+    await storage.put(bucket, key, b"safe content")
+    blob_path = storage.get_blob_path(bucket, key)
+
+    assert blob_path.is_file()
+    assert blob_path.is_relative_to(tmp_path.resolve())
+
+
+async def test_cleanup_staging_and_chunks(tmp_path: Path) -> None:
+    """Verify cleanup removes expired staging .tmp files and abandoned .part.N chunks while preserving fresh or normal files."""
+    storage = LocalBlobStorage(tmp_path)
+    temp_dir = tmp_path / "temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    bucket = "user-data"
+
+    now = time.time()
+    expired_mtime = now - TEMP_FILE_TTL_SECONDS - 100
+    fresh_mtime = now - 100
+
+    # 1. Staging files in <root>/temp
+    stale_tmp = temp_dir / "stale.tmp"
+    stale_tmp.write_bytes(b"stale staging data")
+    os.utime(stale_tmp, (expired_mtime, expired_mtime))
+
+    fresh_tmp = temp_dir / "fresh.tmp"
+    fresh_tmp.write_bytes(b"fresh staging data")
+    os.utime(fresh_tmp, (fresh_mtime, fresh_mtime))
+
+    non_tmp = temp_dir / "other.log"
+    non_tmp.write_bytes(b"log data")
+    os.utime(non_tmp, (expired_mtime, expired_mtime))
+
+    # 2. Multipart chunks in bucket
+    await storage.put(bucket, "abandoned.note.part.1", b"chunk a1")
+    await storage.put(bucket, "abandoned.note.part.2", b"chunk a2")
+    path_a1 = storage.get_blob_path(bucket, "abandoned.note.part.1")
+    path_a2 = storage.get_blob_path(bucket, "abandoned.note.part.2")
+    os.utime(path_a1, (expired_mtime, expired_mtime))
+    os.utime(path_a2, (fresh_mtime, fresh_mtime))
+
+    # 3. Normal blob (must never be removed even if old)
+    await storage.put(bucket, "normal.note", b"normal file content")
+    path_normal = storage.get_blob_path(bucket, "normal.note")
+    os.utime(path_normal, (expired_mtime, expired_mtime))
+
+    stats = await storage.cleanup()
+    assert stats.files_removed == 2
+    assert stats.bytes_reclaimed == len(b"stale staging data") + len(b"chunk a1")
+    assert not stale_tmp.exists()
+    assert fresh_tmp.exists()
+    assert non_tmp.exists()
+    assert not path_a1.exists()
+    assert path_a2.exists()
+    assert path_normal.exists()
+
+
+async def test_put_triggers_opportunistic_cleanup(tmp_path: Path) -> None:
+    """Verify put() opportunistically cleans up expired files when CLEANUP_INTERVAL_SECONDS has elapsed."""
+    storage = LocalBlobStorage(tmp_path)
+    temp_dir = tmp_path / "temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    now = time.time()
+    expired_mtime = now - TEMP_FILE_TTL_SECONDS - 100
+    stale_tmp = temp_dir / "abandoned.tmp"
+    stale_tmp.write_bytes(b"orphaned")
+    os.utime(stale_tmp, (expired_mtime, expired_mtime))
+
+    # Simulate CLEANUP_INTERVAL_SECONDS having elapsed since last cleanup
+    storage._last_cleanup = now - CLEANUP_INTERVAL_SECONDS - 1
+
+    await storage.put("user-data", "new.note", b"data")
+    assert not stale_tmp.exists()

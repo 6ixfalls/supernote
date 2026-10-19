@@ -264,7 +264,10 @@ class ClearScheduleTaskGroupDTO(DataClassJSONMixin):
     """
 
     task_list_id: str = field(metadata=field_options(alias="taskListId"))
-    last_modified: int = field(metadata=field_options(alias="lastModified"))
+    last_modified: int | None = field(
+        metadata=field_options(alias="lastModified"), default=None
+    )
+    """Timestamp in milliseconds"""
 
     class Config(BaseConfig):
         serialize_by_alias = True

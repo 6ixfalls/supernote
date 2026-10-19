@@ -15,6 +15,8 @@ from supernote.models.file_web import (
     CapacityVO,
     EntriesVO,
     FileDeleteDTO,
+    FileDownloadDTO,
+    FileDownloadUrlVO,
     FileLabelSearchDTO,
     FileLabelSearchVO,
     FileListQueryDTO,
@@ -35,12 +37,13 @@ from supernote.models.file_web import (
     RecycleFileListDTO,
     RecycleFileListVO,
     RecycleFileVO,
+    UserFileSearchVO,
     UserFileVO,
 )
 from supernote.server.constants import (
     CATEGORY_CONTAINERS,
-    IMMUTABLE_SYSTEM_DIRECTORIES,
     ORDERED_WEB_ROOT,
+    SYSTEM_ROOT_DIRECTORIES,
 )
 from supernote.server.exceptions import SupernoteError
 from supernote.server.services.file import (
@@ -48,7 +51,7 @@ from supernote.server.services.file import (
     FileService,
     FolderDetail,
 )
-from supernote.server.utils.url_signer import get_request_base_url
+from supernote.server.utils.url_signer import UrlSigner, get_request_base_url
 
 logger = logging.getLogger(__name__)
 routes = web.RouteTableDef()
@@ -101,6 +104,9 @@ def _flatten_path(path: str) -> str:
     if len(path_parts) >= 2 and path_parts[0] in CATEGORY_CONTAINERS:
         # Convert NOTE/Note/Sub -> Note/Sub
         return "/".join(path_parts[1:])
+    if path_parts and path_parts[0] in SYSTEM_ROOT_DIRECTORIES:
+        path_parts[0] = path_parts[0].capitalize()
+        return "/".join(path_parts)
     return path
 
 
@@ -246,8 +252,53 @@ async def handle_path_query(request: web.Request) -> web.Response:
             id_parts = id_path.split("/")
             if len(id_parts) >= len(parts):  # Safety check
                 id_path = "/".join(id_parts[1:])
+        elif parts and parts[0] in SYSTEM_ROOT_DIRECTORIES:
+            parts[0] = parts[0].capitalize()
+            path = "/".join(parts)
 
         response = FilePathQueryVO(path=path, id_path=id_path)
+        return web.json_response(response.to_dict())
+    except SupernoteError as err:
+        return err.to_response()
+    except Exception as err:
+        return SupernoteError.uncaught(err).to_response()
+
+
+@routes.post("/api/file/download/url")
+async def handle_download_url(request: web.Request) -> web.Response:
+    # Endpoint: POST /api/file/download/url
+    # Purpose: Get a signed download URL for a stored file (Web).
+    # Response: FileDownloadUrlVO
+
+    req_data = FileDownloadDTO.from_dict(await request.json())
+    user_email = request["user"]
+    file_service: FileService = request.app["file_service"]
+    url_signer: UrlSigner = request.app["url_signer"]
+
+    try:
+        info = await file_service.get_file_info_by_id(user_email, req_data.id)
+        if not info:
+            return web.json_response(
+                BaseResponse(success=False, error_msg="File not found").to_dict(),
+                status=404,
+            )
+        if info.is_folder:
+            return web.json_response(
+                BaseResponse(success=False, error_msg="Not a file").to_dict(),
+                status=400,
+            )
+
+        # The same signed handle the device is given. The bytes are served by
+        # /api/oss/download, which streams and honours Range, so the browser
+        # fetches the file directly instead of this process buffering a
+        # notebook to hand it over.
+        path_to_sign = f"/api/oss/download?path={info.id}"
+        signed_path = await url_signer.sign(
+            path_to_sign, user=user_email, single_use=False
+        )
+        download_url = f"{get_request_base_url(request)}{signed_path}"
+
+        response = FileDownloadUrlVO(url=download_url, md5=info.md5 or "")
         return web.json_response(response.to_dict())
     except SupernoteError as err:
         return err.to_response()
@@ -280,6 +331,8 @@ async def handle_file_list_query(request: web.Request) -> web.Response:
                 if entity.name in CATEGORY_CONTAINERS:
                     category_map[entity.name] = entity
                 else:
+                    if entity.is_folder:
+                        entity.name = entity.name.capitalize()
                     flattened_entities.append(entity)
 
             # Fetch children of category containers and promote to root
@@ -292,11 +345,8 @@ async def handle_file_list_query(request: web.Request) -> web.Response:
 
             file_entities = flattened_entities
 
-        # TODO: This is not currently using the same sorting where there is
-        # a preferred orderign and capitalization for the items in the root folder.
-        # for item in page_items:
-        #     if req_data.directory_id != 0 or item.name not in IMMUTABLE_SYSTEM_DIRECTORIES:
-        #         item.name = item.name.capitalize()
+        # TODO: This is not currently using the same preferred ordering for the
+        # items in the root folder as /api/file/folder/list/query.
         page_items, total = _sort_and_page(
             file_entities,
             req_data.sequence,
@@ -341,16 +391,18 @@ async def handle_file_list_query(request: web.Request) -> web.Response:
 async def handle_file_search(request: web.Request) -> web.Response:
     # Endpoint: POST /api/file/label/list/search
     # Purpose: Search for files by keyword.
-    # Response: FileSearchResponse
+    # Response: FileLabelSearchVO
 
     req_data = FileLabelSearchDTO.from_dict(await request.json())
     user_email = request["user"]
     file_service: FileService = request.app["file_service"]
 
     try:
-        file_entities = await file_service.search_files(user_email, req_data.keyword)
+        search_term = req_data.keyword or req_data.file_name or ""
+        file_entities = await file_service.search_files(user_email, search_term)
 
         entries_vos: list[EntriesVO] = []
+        search_vos: list[UserFileSearchVO] = []
         for entity in file_entities:
             # Web API expects flattened paths for system directories
             path_display = _flatten_path(entity.full_path)
@@ -371,8 +423,23 @@ async def handle_file_search(request: web.Request) -> web.Response:
                     is_downloadable=True,
                 )
             )
+            search_vos.append(
+                UserFileSearchVO(
+                    id=str(entity.id),
+                    directory_id=str(entity.parent_id),
+                    file_name=entity.name,
+                    directory_name=Path(parent_path).name if parent_path else "",
+                    size=entity.size,
+                    md5=entity.md5 or "",
+                    is_folder="Y" if entity.is_folder else "N",
+                    update_time=str(entity.update_time),
+                )
+            )
 
-        response = FileLabelSearchVO(entries=entries_vos)
+        response = FileLabelSearchVO(
+            entries=entries_vos,
+            user_file_search_vo_list=search_vos,
+        )
         return web.json_response(response.to_dict())
     except SupernoteError as err:
         return err.to_response()
@@ -449,8 +516,7 @@ async def handle_folder_list_query(request: web.Request) -> web.Response:
                         child.entity.parent_id = 0  # View adjustment
                         folder_details.append(child)
                 else:
-                    if detail.entity.name not in IMMUTABLE_SYSTEM_DIRECTORIES:
-                        detail.entity.name = detail.entity.name.capitalize()
+                    detail.entity.name = detail.entity.name.capitalize()
                     folder_details.append(detail)
 
         folder_details.sort(key=_root_sort_key)

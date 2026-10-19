@@ -1,5 +1,9 @@
+import asyncio
 import hashlib
+import logging
+import os
 import secrets
+import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
@@ -7,6 +11,13 @@ from pathlib import Path
 
 import aiofiles
 import aiofiles.os
+
+from supernote.server.utils.paths import parse_file_chunk_name
+
+logger = logging.getLogger(__name__)
+
+TEMP_FILE_TTL_SECONDS = 86400.0  # 24 hours
+CLEANUP_INTERVAL_SECONDS = 3600.0  # Run opportunistic cleanup at most once per hour
 
 
 @dataclass
@@ -16,6 +27,14 @@ class BlobMetadata:
     content_type: str | None = None
     content_md5: str | None = None
     size: int = 0
+
+
+@dataclass
+class CleanupStats:
+    """Statistics for storage cleanup operations."""
+
+    files_removed: int = 0
+    bytes_reclaimed: int = 0
 
 
 class BlobStorage(ABC):
@@ -67,6 +86,10 @@ class BlobStorage(ABC):
     def get_blob_path(self, bucket: str, key: str) -> Path:
         """Get physical path to the blob (optional, useful for serving files)."""
 
+    @abstractmethod
+    async def cleanup(self) -> CleanupStats:
+        """Remove expired temporary staging files and abandoned upload chunks."""
+
 
 class LocalBlobStorage(BlobStorage):
     """Local filesystem implementation of Blob Storage.
@@ -76,8 +99,9 @@ class LocalBlobStorage(BlobStorage):
 
     def __init__(self, storage_root: Path) -> None:
         """Create a local blob storage instance."""
-        self.root = storage_root
+        self.root = storage_root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self._last_cleanup = time.time()
 
     def _get_path(self, bucket: str, key: str) -> Path:
         """Get physical path to the blob."""
@@ -85,7 +109,13 @@ class LocalBlobStorage(BlobStorage):
         clean_bucket = Path(bucket).name
         clean_key = Path(key).name
         prefix = clean_key[:2] if len(clean_key) >= 2 else "misc"
-        return self.root / clean_bucket / prefix / clean_key
+        blob_path = (self.root / clean_bucket / prefix / clean_key).resolve()
+        if (
+            not blob_path.is_relative_to(self.root)
+            or len(blob_path.relative_to(self.root).parts) != 3
+        ):
+            raise ValueError(f"Invalid blob path: {bucket}/{key}")
+        return blob_path
 
     async def put(
         self, bucket: str, key: str, stream: AsyncGenerator[bytes] | bytes
@@ -116,6 +146,9 @@ class LocalBlobStorage(BlobStorage):
 
             # Move to final location
             await aiofiles.os.rename(temp_path, blob_path)
+
+            if time.time() - self._last_cleanup >= CLEANUP_INTERVAL_SECONDS:
+                await self.cleanup()
 
             return BlobMetadata(
                 content_md5=md5_hasher.hexdigest(),
@@ -206,3 +239,41 @@ class LocalBlobStorage(BlobStorage):
     def get_blob_path(self, bucket: str, key: str) -> Path:
         """Get physical path to the blob."""
         return self._get_path(bucket, key)
+
+    async def cleanup(self) -> CleanupStats:
+        """Remove expired temporary staging files and abandoned upload chunks."""
+        self._last_cleanup = time.time()
+        return await asyncio.to_thread(self._cleanup_sync)
+
+    def _cleanup_sync(self) -> CleanupStats:
+        stats = CleanupStats()
+        now = time.time()
+        temp_dir = self.root / "temp"
+
+        if temp_dir.is_dir():
+            for file_path in temp_dir.iterdir():
+                if file_path.name.endswith(".tmp") and file_path.is_file():
+                    self._remove_if_expired(file_path, now, stats)
+
+        for root, _, files in os.walk(self.root):
+            root_path = Path(root)
+            if root_path == temp_dir or temp_dir in root_path.parents:
+                continue
+            for filename in files:
+                if parse_file_chunk_name(filename):
+                    self._remove_if_expired(root_path / filename, now, stats)
+
+        return stats
+
+    @staticmethod
+    def _remove_if_expired(file_path: Path, now: float, stats: CleanupStats) -> None:
+        try:
+            stat = file_path.stat()
+            if now - stat.st_mtime >= TEMP_FILE_TTL_SECONDS:
+                file_path.unlink()
+                stats.files_removed += 1
+                stats.bytes_reclaimed += stat.st_size
+        except FileNotFoundError:
+            pass
+        except OSError as err:
+            logger.warning("Failed to remove expired file %s: %s", file_path, err)

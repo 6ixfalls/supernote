@@ -206,7 +206,7 @@ async def handle_oss_download(request: web.Request) -> web.StreamResponse:
     url_signer: UrlSigner = request.app["url_signer"]
     file_service: FileService = request.app["file_service"]
     try:
-        payload = await url_signer.verify(request.path_qs)
+        payload = await url_signer.verify(request.path_qs, consume=False)
     except SupernoteError as err:
         return err.to_response()
 

@@ -11,7 +11,6 @@ from collections.abc import AsyncGenerator, Generator
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-import jwt
 import pytest
 from aiohttp.test_utils import TestClient
 from pytest_aiohttp import AiohttpClient
@@ -25,7 +24,6 @@ from supernote.client.device import DeviceClient
 from supernote.client.login_client import LoginClient
 from supernote.client.summary import SummaryClient
 from supernote.client.web import WebClient
-from supernote.models.auth import Equipment
 from supernote.models.user import UserRegisterDTO
 from supernote.server.app import create_app
 from supernote.server.config import AuthConfig, ServerConfig
@@ -36,7 +34,7 @@ from supernote.server.services.coordination import (
     CoordinationService,
     SqliteCoordinationService,
 )
-from supernote.server.services.user import JWT_ALGORITHM, UserService
+from supernote.server.services.user import UserService
 
 TEST_USERNAME = "test@example.com"
 TEST_PASSWORD = "testpassword"
@@ -190,20 +188,24 @@ async def create_test_user(
         assert result.is_active
 
 
+@pytest.fixture
+async def test_user_id(
+    create_test_user: None,
+    user_service: UserService,
+) -> int:
+    """Return the database ID assigned to the default test user."""
+    return await user_service.get_user_id(TEST_USERNAME)
+
+
 @pytest.fixture(name="auth_headers")
 async def auth_headers_fixture(
-    server_config: ServerConfig,
+    user_service: UserService,
     coordination_service: SqliteCoordinationService,
     create_test_user: None,
 ) -> dict[str, str]:
     """Generate auth headers and persist session in state."""
-    # Create a JWT token (so it works as a session token for login_bridge)
-    secret = server_config.auth.secret_key
-    token = jwt.encode({"sub": TEST_USERNAME}, secret, algorithm=JWT_ALGORITHM)
-
-    # 1. Store as regular Session (for login bridge / user service)
-    session_val = f"{TEST_USERNAME}|v2|{Equipment.WEB.value}|"
-    await coordination_service.set_value(f"session:{token}", session_val, ttl=3600)
+    # 1. Create and persist regular session via UserService
+    token = await user_service.create_session(TEST_USERNAME)
 
     # 2. Store as MCP token (for MCP resource server verification)
     token_data = {
@@ -298,9 +300,14 @@ def user_service(
     server_config: ServerConfig,
     coordination_service: SqliteCoordinationService,
     session_manager: DatabaseSessionManager,
-) -> UserService:
-    """Provides a UserService instance for testing."""
-    return UserService(server_config.auth, coordination_service, session_manager)
+) -> Generator[UserService]:
+    """Provides a shared UserService instance for testing."""
+    service = UserService(server_config.auth, coordination_service, session_manager)
+    with patch(
+        "supernote.server.app.create_user_service",
+        return_value=service,
+    ):
+        yield service
 
 
 @pytest.fixture(name="client")
@@ -309,6 +316,7 @@ async def client_fixture(
     server_config: ServerConfig,
     session_manager: DatabaseSessionManager,
     coordination_service: SqliteCoordinationService,
+    user_service: UserService,
 ) -> TestClient:
     """Create a test client for server tests."""
     app = create_app(server_config)

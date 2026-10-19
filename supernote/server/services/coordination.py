@@ -50,8 +50,14 @@ class CoordinationService(ABC):
         self,
         account: str,
         user_id: int,
+        *,
+        equipment_no: str | None = None,
     ) -> list[str]:
         """Atomically delete sessions and aliases for one stable user identity."""
+
+    @abstractmethod
+    async def delete_by_prefix(self, prefix: str) -> None:
+        """Delete all keys starting with the given prefix."""
 
     @abstractmethod
     async def pop_value(self, key: str) -> str | None:
@@ -67,11 +73,6 @@ class SqliteCoordinationService(CoordinationService):
 
     def __init__(self, session_manager: DatabaseSessionManager) -> None:
         self._session_manager = session_manager
-
-    async def _cleanup(self) -> None:
-        """Cleanup expired keys."""
-        # This could be run periodically or on access.
-        # For simplicity, we trust on-access checks or external cleanup jobs.
 
     async def set_value(self, key: str, value: str, ttl: int | None = None) -> None:
         """Set a key-value pair with optional TTL."""
@@ -170,6 +171,8 @@ class SqliteCoordinationService(CoordinationService):
         self,
         account: str,
         user_id: int,
+        *,
+        equipment_no: str | None = None,
     ) -> list[str]:
         """Atomically delete one user's sessions and historical aliases."""
         alias_prefix = "account-alias:"
@@ -239,6 +242,27 @@ class SqliteCoordinationService(CoordinationService):
                     )
                 )
 
+            if equipment_no is not None:
+                device_suffix = f"|{equipment_no}|{user_id}"
+                device_clauses = [
+                    and_(
+                        first_separator > 0,
+                        func.substr(KeyValueDO.value, first_separator + 1, 3) == "v3|",
+                        func.substr(KeyValueDO.value, -len(device_suffix))
+                        == device_suffix,
+                    )
+                ]
+                for session_account in legacy_accounts:
+                    device_clauses.append(
+                        KeyValueDO.value == f"{session_account}|{equipment_no}"
+                    )
+                    for equipment in (1, 2, 3):
+                        device_clauses.append(
+                            KeyValueDO.value
+                            == f"{session_account}|v2|{equipment}|{equipment_no}"
+                        )
+                value_clauses = [and_(or_(*value_clauses), or_(*device_clauses))]
+
             session_prefix = "session:"
             stmt = (
                 delete(KeyValueDO)
@@ -251,12 +275,23 @@ class SqliteCoordinationService(CoordinationService):
             )
             result = await session.execute(stmt)
             deleted_keys = [str(key) for key in result.scalars().all()]
-            if alias_keys:
+            if alias_keys and equipment_no is None:
                 await session.execute(
                     delete(KeyValueDO).where(KeyValueDO.key.in_(alias_keys))
                 )
             await session.commit()
             return deleted_keys
+
+    async def delete_by_prefix(self, prefix: str) -> None:
+        """Delete all keys starting with the given prefix."""
+        if not prefix:
+            return
+        async with self._session_manager.session() as session:
+            stmt = delete(KeyValueDO).where(
+                KeyValueDO.key.startswith(prefix, autoescape=True)
+            )
+            await session.execute(stmt)
+            await session.commit()
 
     async def pop_value(self, key: str) -> str | None:
         """Get and delete a value atomically."""
@@ -269,14 +304,14 @@ class SqliteCoordinationService(CoordinationService):
                 .returning(KeyValueDO.value, KeyValueDO.expiry)
             )
             result = await session.execute(stmt)
-            row = result.one_or_none()
+            row = result.first()
+            await session.commit()
 
             if not row:
                 return None
 
-            await session.commit()
-
-            if time.time() > row.expiry:
+            value, expiry = row
+            if time.time() > expiry:
                 return None
             return str(row.value)
 

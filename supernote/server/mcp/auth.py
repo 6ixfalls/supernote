@@ -50,32 +50,22 @@ class SupernoteOAuthClientInformationFull(OAuthClientInformationFull):
 
     @override
     def validate_redirect_uri(self, redirect_uri: AnyUrl | None) -> AnyUrl:
-        """Require an exact URI or a same-origin URL-client callback."""
+        """Allows redirect uri prefixes matching the registered origin and path boundary."""
         if redirect_uri is None:
             raise InvalidRedirectUriError("Redirect URI must be specified")
-        redirect_uri_str = str(redirect_uri)
+        redirect_parsed = urlparse(str(redirect_uri))
         for registered_redirect_uri in self.redirect_uris or ():
-            if secrets.compare_digest(
-                redirect_uri_str, str(registered_redirect_uri)
-            ):
-                return redirect_uri
-
-            # URL client identifiers do not have a registration document in this
-            # provider. Permit callback paths on that client's origin without
-            # restoring the unsafe string-prefix matching previously used here.
-            registered = urlparse(str(registered_redirect_uri))
-            requested = urlparse(redirect_uri_str)
-            registered_port = registered.port or (
-                443 if registered.scheme == "https" else 80
-            )
-            requested_port = requested.port or (
-                443 if requested.scheme == "https" else 80
-            )
+            reg_parsed = urlparse(str(registered_redirect_uri))
             if (
-                registered.scheme in ("http", "https")
-                and requested.scheme == registered.scheme
-                and requested.hostname == registered.hostname
-                and requested_port == registered_port
+                redirect_parsed.scheme != reg_parsed.scheme
+                or redirect_parsed.netloc != reg_parsed.netloc
+            ):
+                continue
+            reg_path = reg_parsed.path.rstrip("/")
+            if (
+                not reg_path
+                or redirect_parsed.path == reg_path
+                or redirect_parsed.path.startswith(f"{reg_path}/")
             ):
                 return redirect_uri
         raise InvalidRedirectUriError(
@@ -243,9 +233,7 @@ class SupernoteOAuthProvider(
             await self._coordination.delete_value(
                 f"mcp:access_token:{old_access_token}"
             )
-            await self._coordination.delete_value(
-                f"mcp:token_pair:{old_access_token}"
-            )
+            await self._coordination.delete_value(f"mcp:token_pair:{old_access_token}")
 
         new_access_token = SupernoteAccessToken(
             token=secrets.token_urlsafe(32),
@@ -271,9 +259,7 @@ class SupernoteOAuthProvider(
             new_refresh_token.model_dump_json(),
             ttl=_REFRESH_TOKEN_TTL,
         )
-        await self._store_token_pair(
-            new_access_token.token, new_refresh_token.token
-        )
+        await self._store_token_pair(new_access_token.token, new_refresh_token.token)
         return OAuthToken(
             access_token=new_access_token.token,
             refresh_token=new_refresh_token.token,
@@ -304,19 +290,11 @@ class SupernoteOAuthProvider(
             f"mcp:token_pair:{token.token}"
         )
         if paired_token:
-            await self._coordination.delete_value(
-                f"mcp:access_token:{paired_token}"
-            )
-            await self._coordination.delete_value(
-                f"mcp:refresh_token:{paired_token}"
-            )
-            await self._coordination.delete_value(
-                f"mcp:token_pair:{paired_token}"
-            )
+            await self._coordination.delete_value(f"mcp:access_token:{paired_token}")
+            await self._coordination.delete_value(f"mcp:refresh_token:{paired_token}")
+            await self._coordination.delete_value(f"mcp:token_pair:{paired_token}")
 
-    async def _store_token_pair(
-        self, access_token: str, refresh_token: str
-    ) -> None:
+    async def _store_token_pair(self, access_token: str, refresh_token: str) -> None:
         await self._coordination.set_value(
             f"mcp:token_pair:{access_token}",
             refresh_token,
@@ -376,6 +354,7 @@ def create_auth_app(
         # Extract OAuth params from query
         client_id = request.query_params.get("client_id")
         redirect_uri = request.query_params.get("redirect_uri")
+        code_challenge = request.query_params.get("code_challenge")
         state = request.query_params.get("state")
 
         code_challenge = request.query_params.get("code_challenge")
@@ -409,7 +388,10 @@ def create_auth_app(
             )
         except (InvalidRedirectUriError, ValidationError):
             return JSONResponse(
-                {"error": "invalid_request", "error_description": "Invalid redirect URI"},
+                {
+                    "error": "invalid_redirect_uri",
+                    "error_description": "Invalid redirect URI",
+                },
                 status_code=400,
                 headers={"Cache-Control": "no-store"},
             )

@@ -54,6 +54,11 @@ class BindEquipmentDTO(DataClassJSONMixin):
     total_capacity: str = field(metadata=field_options(alias="totalCapacity"))
     """Total device capacity."""
 
+    country_code: str | None = field(
+        metadata=field_options(alias="countryCode"), default=None
+    )
+    """Country code."""
+
     flag: str | None = None
     """Identifier (Fixed value: 1)."""
 
@@ -274,3 +279,58 @@ class QueryEquipmentVO(DataClassJSONMixin):
 
     class Config(BaseConfig):
         serialize_by_alias = True
+
+
+@dataclass
+class PasswordResetCodeDTO(DataClassJSONMixin):
+    """Request to send device password unlock code.
+
+    Used by:
+        /api/terminal/send/password/unlock/code (POST)
+    """
+
+    equipment_no: str = field(metadata=field_options(alias="equipmentNo"))
+    """Equipment number."""
+
+    code: str
+    """Verification / unlock code."""
+
+    language: str | None = None
+    """Language (1: CN; 2: EN)."""
+
+    type: str | None = None
+    """Verification method type."""
+
+    email: str | None = None
+    """Email address."""
+
+    country_code: str | None = field(
+        metadata=field_options(alias="countryCode"), default=None
+    )
+    """Country code (e.g., +86)."""
+
+    telephone: str | None = None
+    """Telephone number."""
+
+    class Config(BaseConfig):
+        serialize_by_alias = True
+
+
+@dataclass(kw_only=True)
+class PasswordResetCodeVO(BaseResponse):
+    """Response for sending device password unlock code.
+
+    Used by:
+        /api/terminal/send/password/unlock/code (POST)
+    """
+
+    country_code: str | None = field(
+        metadata=field_options(alias="countryCode"), default=None
+    )
+    telephone: str | None = None
+    email: str | None = None
+    equipment_no: str | None = field(
+        metadata=field_options(alias="equipmentNo"), default=None
+    )
+    time: int | None = None
+    send_to: str | None = field(metadata=field_options(alias="sendTo"), default=None)

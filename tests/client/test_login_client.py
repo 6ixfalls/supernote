@@ -39,11 +39,16 @@ async def test_login_client_flow(aiohttp_client: AiohttpClient) -> None:
             {"success": True, "token": "user-access-token-123", "counts": "0"}
         )
 
+    async def handler_logout(request: web.Request) -> web.Response:
+        calls.append("logout")
+        return web.json_response({"success": True})
+
     app = web.Application()
     app.router.add_get("/api/csrf", handler_csrf)
     app.router.add_post("/api/user/query/token", handler_query_token)
     app.router.add_post("/api/official/user/query/random/code", handler_random_code)
     app.router.add_post("/api/official/user/account/login/new", handler_login_new)
+    app.router.add_post("/api/user/logout", handler_logout)
 
     test_client = await aiohttp_client(app)
     base_url = str(test_client.make_url(""))
@@ -57,6 +62,9 @@ async def test_login_client_flow(aiohttp_client: AiohttpClient) -> None:
     assert calls[2][0] == "login_new"
     assert calls[2][1]["account"] == "user@example.com"
     assert calls[2][1]["password"] == hash_password("mypassword", "salt123")
+
+    await login_client.logout()
+    assert calls[3] == "logout"
 
 
 async def test_login_client_equipment_email_and_phone(

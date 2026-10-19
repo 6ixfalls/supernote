@@ -6,11 +6,10 @@ from datetime import datetime
 import numpy as np
 from sqlalchemy import select
 
-from supernote.server.config import ServerConfig
+from supernote.server.ai.models.embedding import EmbeddingModel, EmbeddingTaskType
 from supernote.server.db.models.file import UserFileDO
 from supernote.server.db.models.note_processing import NotePageContentDO
 from supernote.server.db.session import DatabaseSessionManager
-from supernote.server.services.gemini import GeminiService
 from supernote.server.utils.note_content import format_page_metadata, infer_page_date
 
 logger = logging.getLogger(__name__)
@@ -27,18 +26,55 @@ class SearchResult:
     date: str | None = None
 
 
+@dataclass
+class NotebookInfo:
+    file_id: int
+    file_name: str
+    create_time: int
+    update_time: int
+
+
 class SearchService:
     """Service for semantic search across notebook content."""
 
     def __init__(
         self,
         session_manager: DatabaseSessionManager,
-        gemini_service: GeminiService,
-        config: ServerConfig,
+        embedding_model: EmbeddingModel | None,
     ) -> None:
         self.session_manager = session_manager
-        self.gemini_service = gemini_service
-        self.config = config
+        self.embedding_model = embedding_model
+
+    async def list_notebooks(
+        self,
+        user_id: int,
+        name_filter: str | None = None,
+        limit: int = 20,
+    ) -> list[NotebookInfo]:
+        """List active .note notebooks for a user ordered by most recently updated."""
+        async with self.session_manager.session() as session:
+            stmt = (
+                select(UserFileDO)
+                .where(UserFileDO.user_id == user_id)
+                .where(UserFileDO.is_active == "Y")
+                .where(UserFileDO.is_folder == "N")
+                .where(UserFileDO.file_name.ilike("%.note"))
+            )
+            if name_filter:
+                stmt = stmt.where(UserFileDO.file_name.ilike(f"%{name_filter}%"))
+            stmt = stmt.order_by(UserFileDO.update_time.desc()).limit(limit)
+            result = await session.execute(stmt)
+            files = result.scalars().all()
+
+        return [
+            NotebookInfo(
+                file_id=f.id,
+                file_name=f.file_name,
+                create_time=f.create_time,
+                update_time=f.update_time,
+            )
+            for f in files
+        ]
 
     async def search_chunks(
         self,
@@ -60,8 +96,8 @@ class SearchService:
             date_after: Optional ISO date string (YYYY-MM-DD). Filter results created after this date.
             date_before: Optional ISO date string (YYYY-MM-DD). Filter results created before this date.
         """
-        if not self.gemini_service.is_configured:
-            logger.warning("Search requested but Gemini is not configured")
+        if self.embedding_model is None:
+            logger.warning("Search requested but embedding model is not configured")
             return []
 
         # Parse date filters
@@ -76,26 +112,17 @@ class SearchService:
             logger.error(f"Invalid date filter format: {e}")
             return []
 
-        # 1. Embed Query
-        model_id = self.config.gemini_embedding_model
         try:
-            response = await self.gemini_service.embed_content(
-                model=model_id,
-                contents=query,
+            embedding_values = await self.embedding_model.embed(
+                query, task_type=EmbeddingTaskType.RETRIEVAL_QUERY
             )
-            if not response.embeddings:
-                logger.error("No embeddings returned for query")
-                return []
-
-            # Process the embedding values
-            query_embedding = np.array(response.embeddings[0].values)
+            query_embedding = np.array(embedding_values)
         except (ValueError, RuntimeError, TypeError) as e:
             logger.error(f"Failed to fetch or process query embedding: {e}")
             return []
 
         query_norm = np.linalg.norm(query_embedding)
 
-        # 2. Fetch Candidates
         async with self.session_manager.session() as session:
             # Metadata-based page filtering (Phase 2)
             # We use notebook metadata (PAGEID) to infer page dates and filter them.
@@ -104,7 +131,11 @@ class SearchService:
                 select(NotePageContentDO, UserFileDO.file_name)
                 .join(UserFileDO, UserFileDO.id == NotePageContentDO.file_id)
                 .where(UserFileDO.user_id == user_id)
+                .where(UserFileDO.is_active == "Y")
                 .where(NotePageContentDO.embedding.isnot(None))
+                .where(
+                    NotePageContentDO.embedding_model == self.embedding_model.model_id
+                )
             )
 
             if name_filter:
@@ -116,7 +147,6 @@ class SearchService:
         if not candidates:
             return []
 
-        # 3. Calculate Similarity
         results = []
         for content_do, file_name in candidates:
             if not content_do.embedding:

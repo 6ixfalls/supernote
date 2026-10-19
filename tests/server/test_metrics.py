@@ -5,9 +5,9 @@ import pytest
 from aiohttp.test_utils import TestClient
 from prometheus_client import REGISTRY
 
+from supernote.server.ai.models.gemini.backend import GeminiBackend
 from supernote.server.app import create_app
 from supernote.server.config import ServerConfig
-from supernote.server.services.gemini import GeminiService
 
 
 async def test_metrics_endpoint(client: TestClient) -> None:
@@ -92,8 +92,8 @@ async def test_db_session_metrics(client: TestClient) -> None:
 
 
 async def test_gemini_service_metrics() -> None:
-    """Verify that GeminiService tracks api call counts and durations."""
-    gemini = GeminiService(ServerConfig(gemini_api_key="mock-api-key"))
+    """Verify that GeminiBackend tracks api call counts and durations."""
+    gemini = GeminiBackend(api_key="mock-api-key")
 
     # Mock model API client
     mock_response = AsyncMock()

@@ -1,0 +1,18 @@
+---
+trigger: always_on
+description: Universal software design heuristics for abstraction boundaries, role cohesion, and interface design.
+---
+
+# Software Design Heuristics
+
+Before adding a method, parameter, or dependency to an interface or base class, apply these checks:
+
+1. **Preserve Role Cohesion (No Downward Leakage of Caller Concerns)**:
+   - Ask: *"Is this part of this abstraction's intrinsic responsibility, or is it a caller's storage, scheduling, or transport concern?"*
+   - An implementation should not need to import or understand its caller's persistence schema, query builder, or orchestration mechanics.
+
+2. **Expose Intrinsic Facts, Not Caller Mechanisms**:
+   - When a driver or caller needs to coordinate across implementations, prefer exposing simple, declarative properties on the interface (identity, capabilities, version, status) so the caller can run its own logic generically—rather than adding procedural hooks that force each implementation to build pieces of the caller's work.
+
+3. **Fix Root Model Gaps Rather Than Working Around Them in Subclasses**:
+   - If the existing base abstraction or state model cannot express a new requirement, pause and ask what single concept is missing from the core model. Extend the base invariant once rather than writing bespoke overrides in every implementation.

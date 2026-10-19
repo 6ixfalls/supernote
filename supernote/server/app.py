@@ -21,7 +21,10 @@ from supernote.server.mcp.auth import create_auth_app
 from supernote.server.mcp.server import create_mcp_server, run_server, set_services
 from supernote.server.utils.auth_utils import get_token_from_request
 
-from .config import ServerConfig
+from .ai.models.embedding import create_embedding_model
+from .ai.models.ocr import create_ocr_model
+from .ai.models.summary import create_summary_model
+from .config import AuthConfig, ServerConfig
 from .constants import MAX_UPLOAD_SIZE
 from .db.models.user import UserDO
 from .db.session import DatabaseSessionManager
@@ -40,12 +43,11 @@ from .routes import (
 )
 from .routes.decorators import public_route
 from .services.blob import LocalBlobStorage
-from .services.coordination import SqliteCoordinationService
+from .services.coordination import CoordinationService, SqliteCoordinationService
 from .services.file import FileService
-from .services.gemini import GeminiService
 from .services.processor import ProcessorService
-from .services.processor_modules.gemini_embedding import GeminiEmbeddingModule
-from .services.processor_modules.gemini_ocr import GeminiOcrModule
+from .services.processor_modules.embedding import EmbeddingModule
+from .services.processor_modules.ocr import OcrModule
 from .services.processor_modules.page_hashing import PageHashingModule
 from .services.processor_modules.png_conversion import PngConversionModule
 from .services.processor_modules.summary import SummaryModule
@@ -53,6 +55,7 @@ from .services.schedule import ScheduleService
 from .services.search import SearchService
 from .services.summary import SummaryService
 from .services.user import UserService
+from .services.webhook import WebhookService
 from .socket import setup_socketio
 from .utils.hashing import get_md5_hash
 from .utils.prompt_loader import PROMPT_LOADER
@@ -436,6 +439,14 @@ def create_coordination_service(
     return SqliteCoordinationService(session_manager)
 
 
+def create_user_service(
+    auth_config: AuthConfig,
+    coordination_service: CoordinationService,
+    session_manager: DatabaseSessionManager,
+) -> UserService:
+    return UserService(auth_config, coordination_service, session_manager)
+
+
 def create_app(config: ServerConfig) -> web.Application:
     app = web.Application(client_max_size=MAX_UPLOAD_SIZE)
     app["config"] = config
@@ -452,7 +463,9 @@ def create_app(config: ServerConfig) -> web.Application:
     event_bus = LocalEventBus()
     app["event_bus"] = event_bus
 
-    user_service = UserService(config.auth, coordination_service, session_manager)
+    user_service = create_user_service(
+        config.auth, coordination_service, session_manager
+    )
     file_service = FileService(
         config.storage_root,
         blob_storage,
@@ -464,8 +477,12 @@ def create_app(config: ServerConfig) -> web.Application:
     app["file_service"] = file_service
     app["url_signer"] = UrlSigner(config.auth.secret_key, coordination_service)
     app["schedule_service"] = ScheduleService(session_manager)
-    gemini_service = GeminiService(config)
-    app["gemini_service"] = gemini_service
+    ocr_model = create_ocr_model(config)
+    summary_model = create_summary_model(config)
+    embedding_model = create_embedding_model(config)
+    app["ocr_model"] = ocr_model
+    app["summary_model"] = summary_model
+    app["embedding_model"] = embedding_model
 
     if config.prompts_dir:
         PROMPT_LOADER.configure(Path(config.prompts_dir))
@@ -473,7 +490,7 @@ def create_app(config: ServerConfig) -> web.Application:
     summary_service = SummaryService(user_service, session_manager)
     app["summary_service"] = summary_service
 
-    search_service = SearchService(session_manager, gemini_service, config)
+    search_service = SearchService(session_manager, embedding_model)
     app["search_service"] = search_service
 
     app["sync_locks"] = {}  # user -> (equipment_no, expiry_time)
@@ -484,21 +501,24 @@ def create_app(config: ServerConfig) -> web.Application:
     )
     app["processor_service"] = processor_service
 
+    webhook_service = WebhookService(config.webhooks, event_bus, user_service)
+    app["webhook_service"] = webhook_service
+
     # Register modules
+    png_enabled = (ocr_model is not None) or (
+        config.web_enabled and config.web_notebook_preview
+    )
     processor_service.register_modules(
         hashing=PageHashingModule(file_service=file_service),
-        png=PngConversionModule(file_service=file_service),
-        ocr=GeminiOcrModule(
-            file_service=file_service, config=config, gemini_service=gemini_service
-        ),
-        embedding=GeminiEmbeddingModule(
-            file_service=file_service, config=config, gemini_service=gemini_service
+        png=PngConversionModule(file_service=file_service) if png_enabled else None,
+        ocr=OcrModule(file_service=file_service, ocr_model=ocr_model),
+        embedding=EmbeddingModule(
+            file_service=file_service, embedding_model=embedding_model
         ),
         summary=SummaryModule(
             file_service=file_service,
-            config=config,
-            gemini_service=gemini_service,
             summary_service=summary_service,
+            summary_model=summary_model,
         ),
     )
 
@@ -517,14 +537,17 @@ def create_app(config: ServerConfig) -> web.Application:
     setup_socketio(app, config, user_service)
 
     # Serve static frontend files
-    static_path = Path(str(importlib.resources.files("supernote.server") / "static"))
+    if config.web_enabled:
+        static_path = Path(
+            str(importlib.resources.files("supernote.server") / "static")
+        )
 
-    @public_route
-    async def handle_index(request: web.Request) -> web.FileResponse:
-        return web.FileResponse(static_path / "index.html")
+        @public_route
+        async def handle_index(request: web.Request) -> web.FileResponse:
+            return web.FileResponse(static_path / "index.html")
 
-    app.router.add_get("/", handle_index)
-    app.router.add_static("/static/", path=static_path, name="static")
+        app.router.add_get("/", handle_index)
+        app.router.add_static("/static/", path=static_path, name="static")
 
     if config.metrics_enabled:
 
@@ -588,6 +611,7 @@ def create_app(config: ServerConfig) -> web.Application:
 
         logger.info("Starting background services...")
         await processor_service.start()
+        await webhook_service.start()
         logger.info("Startup sequence complete.")
 
         app["mcp_task"] = mcp_task
@@ -602,6 +626,7 @@ def create_app(config: ServerConfig) -> web.Application:
             except asyncio.CancelledError:
                 pass
 
+        await webhook_service.stop()
         await processor_service.stop()
         await session_manager.close()
 

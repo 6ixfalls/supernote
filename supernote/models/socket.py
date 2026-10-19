@@ -110,7 +110,7 @@ class SocketIoClientMessage(str, BaseEnum):
 class SocketIoCode(IntEnum):
     """Response status code constants for SocketMessageData envelopes."""
 
-    SUCCESS = 0
+    SUCCESS = 200
     """Success status code for Socket.IO envelopes."""
 
     FORBIDDEN = 403
@@ -206,7 +206,7 @@ class SocketMessageData(DataClassJSONMixin):
     """Top-level envelope for Socket.IO messages exchanged between server and clients."""
 
     code: str | int | None = None
-    """Response status code indicator (e.g., '0' / 0 for success, '403' / 403 for auth error)."""
+    """Response status code indicator (e.g., '200' / 200 for success, '403' / 403 for auth error)."""
 
     msg: str | None = None
     """Human-readable status or error description message."""

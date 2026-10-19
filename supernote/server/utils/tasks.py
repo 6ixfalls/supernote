@@ -46,6 +46,7 @@ async def update_task_status(
     key: str,
     status: ProcessingStatus,
     error: str | None = None,
+    data: str | None = None,
 ) -> None:
     """Create or update a SystemTaskDO status atomically with retries for lock conflicts."""
     max_retries = DB_WRITE_MAX_RETRIES
@@ -60,10 +61,11 @@ async def update_task_status(
                 # We must provide 'id' and 'retry_count' manually for the INSERT part.
                 sql = text(
                     """
-                    INSERT INTO f_system_task (id, file_id, task_type, key, status, last_error, retry_count, create_time, update_time)
-                    VALUES (:id, :file_id, :task_type, :key, :status, :error, 0, :now, :now)
+                    INSERT INTO f_system_task (id, file_id, task_type, key, status, data, last_error, retry_count, create_time, update_time)
+                    VALUES (:id, :file_id, :task_type, :key, :status, :data, :error, 0, :now, :now)
                     ON CONFLICT(file_id, task_type, key) DO UPDATE SET
                         status = excluded.status,
+                        data = excluded.data,
                         last_error = excluded.last_error,
                         update_time = excluded.update_time
                 """
@@ -77,6 +79,7 @@ async def update_task_status(
                         "task_type": task_type,
                         "key": key,
                         "status": status,
+                        "data": data,
                         "error": error,
                         "now": now,
                     },

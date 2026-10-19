@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import jwt
 from mashumaro.mixins.json import DataClassJSONMixin
 from sqlalchemy import delete, func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from supernote.models.auth import Equipment, LoginVO, UserVO
@@ -69,16 +70,51 @@ class UserService:
         self._coordination_service = coordination_service
         self._session_manager = session_manager
 
+    @staticmethod
+    def _session_key(user_id: int, equipment_no: str | None, token: str) -> str:
+        """Preserve the fork's session keys so existing device tokens stay valid."""
+        return f"session:{token}"
+
+    async def revoke_equipment_sessions(self, user_id: int, equipment_no: str) -> None:
+        """Revoke only sessions for the specified device and stable user identity."""
+        if not equipment_no:
+            return
+        user = await self._get_user_do_by_id(user_id)
+        if user:
+            await self._coordination_service.delete_user_sessions(
+                user.email, user_id, equipment_no=equipment_no
+            )
+
+    async def logout(self, token: str) -> None:
+        """Revoke one persisted session."""
+        await self.revoke_session(token)
+
+    @staticmethod
+    def _to_user_vo(user: UserDO) -> UserVO:
+        """Convert a UserDO database record to a UserVO API model."""
+        return UserVO(
+            user_id=user.id,
+            user_name=user.display_name or user.email,
+            email=user.email,
+            phone=user.phone or "",
+            total_capacity=user.total_capacity,
+            file_server="",
+            avatars_url=user.avatar or "",
+            birthday="",
+            sex="",
+        )
+
     async def list_users(self) -> list[UserDO]:
         async with self._session_manager.session() as session:
             result = await session.execute(select(UserDO))
             return list(result.scalars().all())
 
+    async def list_user_profiles(self) -> list[UserVO]:
+        """List all users as UserVO profile models."""
+        return [self._to_user_vo(u) for u in await self.list_users()]
+
     async def check_user_exists(self, account: str) -> bool:
-        async with self._session_manager.session() as session:
-            stmt = select(UserDO).where(UserDO.email == account)
-            result = await session.execute(stmt)
-            return result.scalar_one_or_none() is not None
+        return (await self.get_user_by_email(account)) is not None
 
     async def _create_user_entry(
         self, session: AsyncSession, dto: UserRegisterDTO, is_admin: bool = False
@@ -109,7 +145,7 @@ class UserService:
         """Create the standard Supernote directory structure for a new user.
 
         Creates the real two-level structure used by device firmware:
-        - System folders at root (Export, Inbox, Screenshot)
+        - System folders at root (EXPORT, INBOX, SCREENSHOT), named as the firmware names them
         - Category containers (NOTE, DOCUMENT) with children
 
         This structure is stored as-is in the database. The web API will
@@ -119,9 +155,9 @@ class UserService:
             vfs = VirtualFileSystem(session)
 
             # System folders at root (directoryId=0) - always visible
-            await vfs.create_directory(user_id, 0, "Export")
-            await vfs.create_directory(user_id, 0, "Inbox")
-            await vfs.create_directory(user_id, 0, "Screenshot")
+            await vfs.create_directory(user_id, 0, "EXPORT")
+            await vfs.create_directory(user_id, 0, "INBOX")
+            await vfs.create_directory(user_id, 0, "SCREENSHOT")
 
             # Category containers with children (for device firmware compatibility)
             note_parent = await vfs.create_directory(user_id, 0, "NOTE")
@@ -175,6 +211,7 @@ class UserService:
             user = result.scalar_one_or_none()
             if not user:
                 return
+            user_id = user.id
 
             # Remove every credential that can resolve to this numeric ID before
             # deleting the row. SQLite can reuse deleted integer primary keys, so
@@ -186,9 +223,9 @@ class UserService:
 
             await session.execute(delete(DeviceDO).where(DeviceDO.user_id == user.id))
             await session.execute(
-                delete(LoginRecordDO).where(LoginRecordDO.user_id == user.id)
+                delete(LoginRecordDO).where(LoginRecordDO.user_id == user_id)
             )
-            await session.execute(delete(UserDO).where(UserDO.id == user.id))
+            await session.execute(delete(UserDO).where(UserDO.id == user_id))
             await session.commit()
 
     async def generate_random_code(self, account: str) -> tuple[str, str]:
@@ -206,12 +243,6 @@ class UserService:
 
         return random_code, str(timestamp_ms)
 
-    async def _get_user_do(self, account: str) -> UserDO | None:
-        async with self._session_manager.session() as session:
-            stmt = select(UserDO).where(UserDO.email == account)
-            result = await session.execute(stmt)
-            return result.scalar_one_or_none()
-
     async def _get_user_do_by_id(self, user_id: int) -> UserDO | None:
         async with self._session_manager.session() as session:
             stmt = select(UserDO).where(UserDO.id == user_id)
@@ -220,19 +251,25 @@ class UserService:
 
     async def get_user_by_email(self, account: str) -> UserDO | None:
         """Get a user by their email address."""
-        return await self._get_user_do(account)
+        async with self._session_manager.session() as session:
+            stmt = select(UserDO).where(UserDO.email == account)
+            result = await session.execute(stmt)
+            return result.scalar_one_or_none()
 
     async def get_user_id(self, account: str) -> int:
-        user = await self._get_user_do(account)
+        user = await self.get_user_by_email(account)
         if user:
             return user.id
         raise ValueError(f"User {account} not found")
 
-    async def verify_login_hash(
-        self, account: str, client_hash: str, timestamp: str
+    async def _verify_login_hash(
+        self,
+        account: str,
+        password_md5: str,
+        client_hash: str,
+        timestamp: str,
     ) -> bool:
-        user = await self._get_user_do(account)
-        if not user or not user.is_active:
+        if not timestamp:
             return False
 
         # Consume before validating the proof. A challenge is one-time even
@@ -244,9 +281,20 @@ class UserService:
         if not random_code:
             return False
 
-        expected_hash = hash_with_salt(user.password_md5, random_code)
+        expected_hash = hash_with_salt(password_md5, random_code)
         return hmac.compare_digest(
             expected_hash.encode("ascii"), str(client_hash).encode("utf-8")
+        )
+
+    async def verify_login_hash(
+        self, account: str, client_hash: str, timestamp: str
+    ) -> bool:
+        """Verify a challenge for an active account."""
+        user = await self.get_user_by_email(account)
+        if not user or not user.is_active:
+            return False
+        return await self._verify_login_hash(
+            account, user.password_md5, client_hash, timestamp
         )
 
     async def login(
@@ -259,12 +307,14 @@ class UserService:
         ip: str | None = None,
         login_method: str | None = None,
     ) -> LoginVO | None:
-        user = await self._get_user_do(account)
+        user = await self.get_user_by_email(account)
         if not user or not user.is_active:
             logger.debug("User %s not found or not active", account)
             return None
 
-        if not await self.verify_login_hash(account, password_hash, timestamp):
+        if not await self._verify_login_hash(
+            account, user.password_md5, password_hash, timestamp
+        ):
             logger.debug("Invalid login hash for user %s", account)
             return None
 
@@ -294,26 +344,10 @@ class UserService:
             session.add(record)
             await session.commit()
 
-        if equipment in (Equipment.TERMINAL, Equipment.APP):
-            ttl = self._config.device_expiration_hours * 3600
-        else:
-            ttl = self._config.expiration_hours * 3600
-
-        payload = {
-            "sub": account,
-            "equipment_no": equipment_no or "",
-            "iat": int(time.time()),
-            "exp": int(time.time()) + ttl,
-        }
-        token = jwt.encode(payload, self._config.secret_key, algorithm=JWT_ALGORITHM)
-
-        # Persist session in CoordinationService
-        # Keep enough client metadata to revoke browser sessions without
-        # invalidating credentials held by unmanaged apps and devices. The
-        # leading account preserves compatibility with bulk account deletion.
-        session_val = f"{account}|v3|{equipment.value}|{equipment_no or ''}|{user.id}"
-        await self._coordination_service.set_value(
-            f"session:{token}", session_val, ttl=ttl
+        token = await self._create_session_for_user(
+            user=user,
+            equipment_no=equipment_no,
+            equipment=equipment,
         )
 
         return LoginVO(
@@ -321,11 +355,58 @@ class UserService:
             counts="0",
             is_bind=is_bind,
             is_bind_equipment=is_bind_equipment,
-            user_name=account,
+            user_name=user.email,
         )
 
+    async def create_session(
+        self,
+        account: str,
+        equipment_no: str | None = None,
+        equipment: Equipment = Equipment.WEB,
+    ) -> str:
+        """Create and persist a new authenticated session token for an active account."""
+        user = await self.get_user_by_email(account)
+        if not user or not user.is_active:
+            raise ValueError(f"Active user {account} not found")
+        return await self._create_session_for_user(user, equipment_no, equipment)
+
+    async def _create_session_for_user(
+        self,
+        user: UserDO,
+        equipment_no: str | None = None,
+        equipment: Equipment = Equipment.WEB,
+    ) -> str:
+        if equipment in (Equipment.TERMINAL, Equipment.APP):
+            ttl = self._config.device_expiration_hours * 3600
+        else:
+            ttl = self._config.expiration_hours * 3600
+
+        if equipment_no:
+            await self.revoke_equipment_sessions(user.id, equipment_no)
+
+        now = int(time.time())
+        payload = {
+            "sub": user.email,
+            "user_id": user.id,
+            "equipment_no": equipment_no or "",
+            "iat": now,
+            "exp": now + ttl,
+            "jti": secrets.token_hex(8),
+        }
+        token = jwt.encode(payload, self._config.secret_key, algorithm=JWT_ALGORITHM)
+
+        session_val = (
+            f"{user.email}|v3|{equipment.value}|{equipment_no or ''}|{user.id}"
+        )
+        await self._coordination_service.set_value(
+            f"session:{token}", session_val, ttl=ttl
+        )
+        return token
+
     async def verify_token(self, token: str) -> SessionState | None:
-        """Verify token against persisted sessions and JWT signature."""
+        """Verify token against JWT signature, persisted session state, and active user record."""
+        if not token:
+            return None
         try:
             # 1. Check if session exists in CoordinationService
             session_val = await self._coordination_service.get_value(f"session:{token}")
@@ -360,6 +441,12 @@ class UserService:
             )
             if payload.get("sub") != username:
                 return None
+            if "user_id" in payload and (
+                type(payload["user_id"]) is not int
+                or payload["user_id"] != session_user_id
+                or payload.get("equipment_no") != (equipment_no or "")
+            ):
+                return None
 
             if session_user_id is None:
                 # Email addresses were the only identity stored in sessions
@@ -377,7 +464,7 @@ class UserService:
             if session_user_id is not None:
                 user = await self._get_user_do_by_id(session_user_id)
             else:
-                user = await self._get_user_do(username)
+                user = await self.get_user_by_email(username)
             if not user or not user.is_active:
                 logger.warning(
                     "Session belongs to a missing or inactive user: %s", username
@@ -413,27 +500,16 @@ class UserService:
             )
 
     async def get_user_profile(self, account: str) -> UserVO | None:
-        user = await self._get_user_do(account)
+        user = await self.get_user_by_email(account)
         if not user:
             return None
+        return self._to_user_vo(user)
 
-        return UserVO(
-            user_id=user.id,
-            user_name=user.display_name or account,
-            email=user.email or account,
-            phone=user.phone or "",
-            total_capacity=user.total_capacity,
-            file_server="",
-            avatars_url=user.avatar or "",
-            birthday="",
-            sex="",
-        )
-
-    async def bind_equipment(self, account: str, equipment_no: str) -> bool:
+    async def bind_equipment(self, account: str, equipment_no: str) -> None:
         """Bind a device to the user."""
-        user = await self._get_user_do(account)
+        user = await self.get_user_by_email(account)
         if not user:
-            return False
+            return
 
         async with self._session_manager.session() as session:
             # Upsert
@@ -450,16 +526,21 @@ class UserService:
             else:
                 session.add(DeviceDO(user_id=user.id, equipment_no=equipment_no))
             await session.commit()
-            return True
 
-    async def unlink_equipment(self, equipment_no: str) -> bool:
-        """Unlink a device."""
+    async def unlink_equipment(self, equipment_no: str) -> None:
+        """Unlink a device and revoke its sessions."""
         async with self._session_manager.session() as session:
+            existing = await session.execute(
+                select(DeviceDO).where(DeviceDO.equipment_no == equipment_no)
+            )
+            user_ids = {d.user_id for d in existing.scalars().all()}
             await session.execute(
                 delete(DeviceDO).where(DeviceDO.equipment_no == equipment_no)
             )
             await session.commit()
-        return True
+
+        for uid in user_ids:
+            await self.revoke_equipment_sessions(uid, equipment_no)
 
     async def update_password(self, account: str, dto: UpdatePasswordDTO) -> bool:
         """Update user password."""
@@ -478,6 +559,8 @@ class UserService:
 
     async def update_email(self, account: str, dto: UpdateEmailDTO) -> bool:
         """Update user email."""
+        if not re.match(EMAIL_REGEX, dto.email):
+            raise ValueError("Invalid email address format")
         async with self._session_manager.session() as session:
             result = await session.execute(
                 select(UserDO.id).where(UserDO.email == account)
@@ -485,6 +568,9 @@ class UserService:
             user_id = result.scalar_one_or_none()
             if user_id is None:
                 return False
+
+        if dto.email != account and await self.check_user_exists(dto.email):
+            raise ValueError("Email already registered")
 
         # Publish the stable identity mapping before changing the email so
         # legacy device sessions remain valid throughout the transition.
@@ -503,10 +589,16 @@ class UserService:
                 )
 
         async with self._session_manager.session() as session:
-            await session.execute(
-                update(UserDO).where(UserDO.email == account).values(email=dto.email)
-            )
-            await session.commit()
+            try:
+                await session.execute(
+                    update(UserDO)
+                    .where(UserDO.email == account)
+                    .values(email=dto.email)
+                )
+                await session.commit()
+            except IntegrityError as err:
+                await session.rollback()
+                raise ValueError("Email already registered") from err
         await self.revoke_web_sessions(account)
         return True
 
@@ -554,7 +646,7 @@ class UserService:
         self, account: str, page: int, size: int
     ) -> tuple[list[LoginRecordVO], int]:
         """Query login records."""
-        user = await self._get_user_do(account)
+        user = await self.get_user_by_email(account)
         if not user:
             return [], 0
 

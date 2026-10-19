@@ -1,7 +1,6 @@
 import hashlib
 from unittest.mock import patch
 
-import jwt
 import pytest
 from aiohttp.test_utils import TestClient
 
@@ -15,6 +14,7 @@ from supernote.server.config import ServerConfig
 from supernote.server.db.session import DatabaseSessionManager
 from supernote.server.exceptions import SupernoteError
 from supernote.server.services.coordination import CoordinationService
+from supernote.server.services.user import UserService
 from supernote.server.utils.rate_limit import (
     LIMIT_CHALLENGE_ACCOUNT_MAX,
     LIMIT_CHALLENGE_IP_MAX,
@@ -116,30 +116,16 @@ async def test_user_query(
     with pytest.raises(ApiException):
         await unauth_web.query_user()
 
-    secret = client.app["config"].auth.secret_key
-    bad_token = jwt.encode(
-        {"sub": "nonexistent@example.com"}, secret, algorithm="HS256"
-    )
-    await client.app["coordination_service"].set_value(
-        f"session:{bad_token}", "nonexistent@example.com|", ttl=3600
-    )
-
-    class BadAuth(AbstractAuth):
-        async def async_get_access_token(self) -> str:
-            return bad_token
-
-    bad_client = Client(client.session, auth=BadAuth(), host=base_url)
-    bad_web = WebClient(bad_client)
-    with pytest.raises(ApiException):
-        await bad_web.query_user()
-
     res = await web_client.query_user()
     assert res.success is True
     assert res.user_name == "Test User"
 
 
 async def test_user_register_errors_and_success(
-    client: TestClient, admin_client: AdminClient, create_test_user: None
+    client: TestClient,
+    admin_client: AdminClient,
+    user_service: UserService,
+    create_test_user: None,
 ) -> None:
     resp = await client.post("/api/user/register", json={})
     assert resp.status == 400
@@ -155,7 +141,7 @@ async def test_user_register_errors_and_success(
     # SupernoteError in register
     with (
         patch.object(
-            client.app["user_service"],
+            user_service,
             "register",
             side_effect=SupernoteError("Reg error", status_code=400),
         ),
@@ -167,9 +153,7 @@ async def test_user_register_errors_and_success(
 
     # Uncaught Exception
     with (
-        patch.object(
-            client.app["user_service"], "register", side_effect=Exception("Crash")
-        ),
+        patch.object(user_service, "register", side_effect=Exception("Crash")),
         pytest.raises(ApiException),
     ):
         await admin_client.register(
@@ -182,15 +166,71 @@ async def test_user_register_errors_and_success(
     )
 
 
+class SimpleTokenAuth(AbstractAuth):
+    def __init__(self, token: str):
+        self.token = token
+
+    async def async_get_access_token(self) -> str:
+        return self.token
+
+
 async def test_user_unregister(
+    client: TestClient,
+    web_client: WebClient,
     admin_client: AdminClient,
+    login_client: LoginClient,
+    user_service: UserService,
 ) -> None:
+    """Test user unregister lifecycle and verify user ID / file isolation."""
+    user1_id = await user_service.get_user_id("test@example.com")
+
+    # User 1 creates a folder and uploads a file
+    folder = await web_client.create_folder(parent_id=0, name="User1PrivateFolder")
+    folder_id = int(folder.id)
+    await web_client.upload_file(
+        parent_id=folder_id, name="secret.txt", content=b"user1 secret"
+    )
+
+    res1 = await web_client.list_query(directory_id=folder_id)
+    assert len(res1.user_file_vo_list) == 1
+    assert res1.user_file_vo_list[0].file_name == "secret.txt"
+
+    # User 1 deletes their account
     await admin_client.unregister()
+
+    # User 2 registers
+    base_url = str(client.make_url(""))
+    unauth_client = Client(client.session, host=base_url)
+    unauth_admin = AdminClient(unauth_client)
+
+    pwd = "password123"
+    pwd_md5 = hashlib.md5(pwd.encode("utf-8")).hexdigest()
+    await unauth_admin.register("user2@example.com", pwd_md5, "User 2")
+
+    user2_id = await user_service.get_user_id("user2@example.com")
+
+    # User 2 logs in
+    user2_token = await login_client.login("user2@example.com", pwd)
+    user2_authed_client = Client(
+        client.session, auth=SimpleTokenAuth(user2_token), host=base_url
+    )
+    user2_web = WebClient(user2_authed_client)
+
+    root_listing = await user2_web.list_query(directory_id=0)
+    folder_names = [f.file_name for f in root_listing.user_file_vo_list]
+
+    res2 = await user2_web.list_query(directory_id=folder_id)
+    user2_files = [f.file_name for f in res2.user_file_vo_list]
+
+    assert user1_id != user2_id
+    assert "User1PrivateFolder" not in folder_names
+    assert len(user2_files) == 0
 
 
 async def test_update_password_authorization(
     client: TestClient,
     admin_client: AdminClient,
+    login_client: LoginClient,
 ) -> None:
     base_url = str(client.make_url(""))
     unauth_client = Client(client.session, host=base_url)
@@ -422,3 +462,63 @@ async def test_user_query_routes_and_equipment_no(
     assert data["success"] is True
     assert data["equipmentNo"] == "EQUIP_999"
     assert data["user"]["email"] == "test@example.com"
+
+
+async def test_logout_and_account_clear(
+    client: TestClient,
+    login_client: LoginClient,
+    create_test_user: None,
+) -> None:
+    """Test POST /api/user/logout single-session revocation and POST /api/user/account/clear."""
+    # Unauthenticated logout returns 401
+    unauth_resp = await client.post("/api/user/logout", json={})
+    assert unauth_resp.status == 401
+
+    base_url = str(client.make_url(""))
+    token_a = await login_client.login("test@example.com", "testpassword")
+    token_b = await login_client.login("test@example.com", "testpassword")
+
+    client_a = Client(client.session, auth=SimpleTokenAuth(token_a), host=base_url)
+    login_a = LoginClient(client_a)
+    web_a = WebClient(client_a)
+
+    client_b = Client(client.session, auth=SimpleTokenAuth(token_b), host=base_url)
+    web_b = WebClient(client_b)
+
+    # Log out session A via LoginClient.logout()
+    await login_a.logout()
+
+    # Session A is revoked, Session B remains active
+    with pytest.raises(ApiException):
+        await web_a.query_user()
+
+    res_b = await web_b.query_user()
+    assert res_b.success is True
+
+    # POST /api/user/account/clear deletes account and revokes remaining sessions
+    clear_resp = await client.post(
+        "/api/user/account/clear",
+        headers={"x-access-token": token_b},
+        json={},
+    )
+    assert clear_resp.status == 200
+    assert (await clear_resp.json())["success"] is True
+
+    with pytest.raises(ApiException):
+        await web_b.query_user()
+
+
+async def test_auth_input_validation(
+    client: TestClient, admin_client: AdminClient
+) -> None:
+    """Keep upstream's malformed input coverage alongside fork session behavior."""
+    with pytest.raises(ApiException):
+        await admin_client.update_password("not-an-md5-hash")
+    with pytest.raises(ApiException):
+        await admin_client.update_email("not-an-email")
+    for path in (
+        "/api/official/user/query/random/code",
+        "/api/official/user/account/login/new",
+    ):
+        response = await client.post(path, json={})
+        assert response.status == 400

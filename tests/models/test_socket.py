@@ -5,10 +5,16 @@ import json
 from supernote.models.socket import (
     SocketHandshakeParams,
     SocketIoAction,
+    SocketIoCode,
     SocketIoMessageTemplate,
     SocketIoMessageType,
     SocketMessageData,
 )
+
+
+def test_socket_io_code_constants() -> None:
+    assert SocketIoCode.SUCCESS == 200
+    assert SocketIoCode.FORBIDDEN == 403
 
 
 def test_socket_handshake_params_serialization() -> None:
@@ -84,7 +90,7 @@ def test_socket_message_data_envelope_serialization() -> None:
     )
 
     envelope = SocketMessageData(
-        code="0",
+        code="200",
         msg="success",
         timestamp=1700000005000,
         msg_type=SocketIoMessageType.FILE_SYN,
@@ -92,7 +98,7 @@ def test_socket_message_data_envelope_serialization() -> None:
     )
 
     d = envelope.to_dict()
-    assert d["code"] == "0"
+    assert d["code"] == "200"
     assert d["msg"] == "success"
     assert d["msgType"] == "FILE-SYN"
     assert len(d["data"]) == 1
@@ -100,7 +106,7 @@ def test_socket_message_data_envelope_serialization() -> None:
     assert d["data"][0]["originalPath"] == "/Documents/Note.note"
 
     restored = SocketMessageData.from_dict(d)
-    assert restored.code == "0"
+    assert restored.code == "200"
     assert restored.msg_type == SocketIoMessageType.FILE_SYN
     assert len(restored.data) == 1
     assert restored.data[0].original_path == "/Documents/Note.note"

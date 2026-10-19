@@ -3,11 +3,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from supernote.server.ai.models.fake.embedding import FakeEmbeddingModel
+from supernote.server.ai.models.fake.ocr import FakeOcrModel
+from supernote.server.ai.models.fake.summary import FakeSummaryModel
 from supernote.server.config import AuthConfig, ServerConfig
 from supernote.server.db.session import DatabaseSessionManager
 from supernote.server.services.blob import BlobStorage
 from supernote.server.services.file import FileService
-from supernote.server.services.gemini import GeminiService
 from supernote.server.services.user import UserService
 
 
@@ -32,7 +34,6 @@ def server_config_gemini(tmp_path: Path) -> ServerConfig:
     conf = ServerConfig(
         auth=AuthConfig(secret_key="secret"),
         storage_dir=str(tmp_path),
-        # db_url is a property, not an init arg. We mock session_manager anyway.
     )
     conf.gemini_api_key = "fake-key"
     conf.gemini_ocr_model = "gemini-2.0-flash-exp"
@@ -41,12 +42,15 @@ def server_config_gemini(tmp_path: Path) -> ServerConfig:
 
 
 @pytest.fixture
-def gemini_service(server_config_gemini: ServerConfig) -> GeminiService:
-    return GeminiService(server_config_gemini)
+def fake_ocr_model() -> FakeOcrModel:
+    return FakeOcrModel()
 
 
 @pytest.fixture
-def mock_gemini_service() -> MagicMock:
-    service = MagicMock(spec=GeminiService)
-    service.is_configured = True
-    return service
+def fake_embedding_model() -> FakeEmbeddingModel:
+    return FakeEmbeddingModel()
+
+
+@pytest.fixture
+def fake_summary_model() -> FakeSummaryModel:
+    return FakeSummaryModel()

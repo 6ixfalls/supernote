@@ -1,22 +1,23 @@
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 from sqlalchemy import select
 
 from supernote.client.client import Client
 from supernote.client.summary import SummaryClient
+from supernote.server.ai.models.fake.embedding import FakeEmbeddingModel
+from supernote.server.ai.models.fake.ocr import FakeOcrModel
+from supernote.server.ai.models.fake.summary import FakeSummaryModel
 from supernote.server.constants import CACHE_BUCKET, USER_DATA_BUCKET
 from supernote.server.db.models.file import UserFileDO
 from supernote.server.db.models.note_processing import NotePageContentDO, SystemTaskDO
 from supernote.server.db.session import DatabaseSessionManager
+from supernote.server.events import LocalEventBus, NoteProcessingCompletedEvent
 from supernote.server.services.blob import BlobStorage
 from supernote.server.services.file import FileService
 from supernote.server.services.processor import ProcessorService
-from supernote.server.services.processor_modules.gemini_embedding import (
-    GeminiEmbeddingModule,
-)
-from supernote.server.services.processor_modules.gemini_ocr import GeminiOcrModule
+from supernote.server.services.processor_modules.embedding import EmbeddingModule
+from supernote.server.services.processor_modules.ocr import OcrModule
 from supernote.server.services.processor_modules.page_hashing import PageHashingModule
 from supernote.server.services.processor_modules.png_conversion import (
     PngConversionModule,
@@ -47,7 +48,7 @@ def processor_service(
     summary_service: SummaryService,
 ) -> ProcessorService:
     return ProcessorService(
-        event_bus=MagicMock(),
+        event_bus=LocalEventBus(),
         session_manager=session_manager,
         file_service=file_service,
         summary_service=summary_service,
@@ -59,8 +60,9 @@ async def test_full_processing_pipeline_with_real_file(
     session_manager: DatabaseSessionManager,
     blob_storage: BlobStorage,
     test_note_path: Path,
-    server_config_gemini: MagicMock,
-    mock_gemini_service: MagicMock,
+    fake_ocr_model: FakeOcrModel,
+    fake_embedding_model: FakeEmbeddingModel,
+    fake_summary_model: FakeSummaryModel,
     authenticated_client: Client,
     user_service: UserService,
 ) -> None:
@@ -89,21 +91,15 @@ async def test_full_processing_pipeline_with_real_file(
         session.add(user_file)
         await session.commit()
 
-    # Register real modules (mostly)
+    # Register modules with fake task models
     hashing = PageHashingModule(processor_service.file_service)
     png = PngConversionModule(processor_service.file_service)
-    # Mock Gemini modules because they need API keys
-    ocr = GeminiOcrModule(
-        processor_service.file_service, server_config_gemini, mock_gemini_service
-    )
-    embedding = GeminiEmbeddingModule(
-        processor_service.file_service, server_config_gemini, mock_gemini_service
-    )
+    ocr = OcrModule(processor_service.file_service, fake_ocr_model)
+    embedding = EmbeddingModule(processor_service.file_service, fake_embedding_model)
     summary = SummaryModule(
         file_service=processor_service.file_service,
-        config=server_config_gemini,
-        gemini_service=mock_gemini_service,
         summary_service=processor_service.summary_service,
+        summary_model=fake_summary_model,
     )
 
     processor_service.register_modules(
@@ -114,21 +110,19 @@ async def test_full_processing_pipeline_with_real_file(
         summary=summary,
     )
 
-    # Mock Gemini responses
-    mock_response = MagicMock()
-    mock_response.text = "Handwritten text content"
-    mock_gemini_service.generate_content.return_value = mock_response
+    completed_events: list[NoteProcessingCompletedEvent] = []
 
-    mock_embed = MagicMock()
-    mock_embed.values = [0.1, 0.2, 0.3]
-    mock_gemini_service.embed_content.return_value = MagicMock(embeddings=[mock_embed])
+    async def on_completed(event: object) -> None:
+        if isinstance(event, NoteProcessingCompletedEvent):
+            completed_events.append(event)
+
+    processor_service.event_bus.subscribe(NoteProcessingCompletedEvent, on_completed)
 
     # Execute Pipeline
     await processor_service.process_file(file_id)
 
     # Verifications
     async with session_manager.session() as session:
-        # 1. Verify Pages were created
         pages = (
             (
                 await session.execute(
@@ -143,13 +137,12 @@ async def test_full_processing_pipeline_with_real_file(
         assert len(pages) > 0
         total_pages = len(pages)
 
-        # 2. Verify OCR and Embedding content was saved
         for page in pages:
             assert page.content_hash is not None
-            assert page.text_content == "Handwritten text content"
+            assert page.text_content is not None
+            assert page.text_content.startswith("Transcribed (")
             assert page.embedding is not None
 
-        # 3. Verify System Tasks are all COMPLETED
         tasks = (
             (
                 await session.execute(
@@ -167,12 +160,10 @@ async def test_full_processing_pipeline_with_real_file(
         completed_tasks = [t for t in tasks if t.status == "COMPLETED"]
         assert len(completed_tasks) == expected_task_count
 
-        # 4. Verify PNGs exist in cache
         for page in pages:
             png_path = get_page_png_path(file_id, page.page_id)
             assert await blob_storage.exists(CACHE_BUCKET, png_path)
 
-        # 5. Verify Summary and SummaryGroup existence via API
         summary_client = SummaryClient(authenticated_client)
 
         group_uuid = get_summary_group_id(storage_key)
@@ -222,11 +213,21 @@ async def test_full_processing_pipeline_with_real_file(
 
         # Check transcript content
         assert transcript.content is not None
-        assert "Handwritten text content" in transcript.content
+        assert "Transcribed (" in transcript.content
         assert transcript.data_source == "OCR"
 
         # Check AI summary content
-        assert ai_summary.content == "Handwritten text content"  # Mocked response
-        assert ai_summary.data_source == "GEMINI"
+        assert ai_summary.content is not None
+        assert "Summary of (" in ai_summary.content
+        assert ai_summary.data_source == "fake-summary-v1"
+
+        # 6. Verify NoteProcessingCompletedEvent was published
+        assert completed_events == [
+            NoteProcessingCompletedEvent(
+                file_id=file_id,
+                user_id=user_id,
+                file_path="real.note",
+            )
+        ]
 
     print(f"Integration test passed with {total_pages} pages processed.")

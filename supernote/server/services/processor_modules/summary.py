@@ -1,11 +1,8 @@
 import hashlib
 import json
 import logging
-from dataclasses import dataclass, field
 from pathlib import Path
 
-from mashumaro.jsonschema import build_json_schema
-from mashumaro.mixins.json import DataClassJSONMixin
 from sqlalchemy import select
 
 from supernote.models.summary import (
@@ -15,13 +12,13 @@ from supernote.models.summary import (
     UpdateSummaryDTO,
     UpdateSummaryGroupDTO,
 )
-from supernote.server.config import ServerConfig
+from supernote.server.ai.models.summary import SummaryModel
+from supernote.server.ai.prompts import format_summary_prompt
 from supernote.server.db.models.file import UserFileDO
 from supernote.server.db.models.note_processing import NotePageContentDO
 from supernote.server.db.models.user import UserDO
 from supernote.server.db.session import DatabaseSessionManager
 from supernote.server.services.file import FileService
-from supernote.server.services.gemini import GeminiService
 from supernote.server.services.processor_modules import ProcessorModule
 from supernote.server.services.summary import SummaryService
 from supernote.server.utils.note_content import format_page_metadata
@@ -30,43 +27,12 @@ from supernote.server.utils.paths import (
     get_summary_id,
     get_transcript_id,
 )
-from supernote.server.utils.prompt_loader import PROMPT_LOADER, PromptId
+
+__all__ = [
+    "SummaryModule",
+]
 
 logger = logging.getLogger(__name__)
-
-
-# Define structured output schema
-@dataclass
-class SummarySegment(DataClassJSONMixin):
-    date_range: str = field(
-        metadata={
-            "description": "The date range covered by this segment (e.g., '2023-10-27', 'Week of Oct 27')."
-        }
-    )
-    summary: str = field(
-        metadata={
-            "description": "A concise summary of the events, tasks, and notes for this period."
-        }
-    )
-    extracted_dates: list[str] = field(
-        metadata={
-            "description": "List of specific dates derived from the content in ISO 8601 format (YYYY-MM-DD)."
-        }
-    )
-    page_refs: list[int] = field(
-        metadata={
-            "description": "List of 1-indexed page numbers typically found in the text as '--- Page X ---'."
-        }
-    )
-
-
-@dataclass
-class SummaryResponse(DataClassJSONMixin):
-    segments: list[SummarySegment] = field(
-        metadata={
-            "description": "List of summary segments extracted from the transcript."
-        }
-    )
 
 
 class SummaryModule(ProcessorModule):
@@ -75,14 +41,12 @@ class SummaryModule(ProcessorModule):
     def __init__(
         self,
         file_service: FileService,
-        config: ServerConfig,
-        gemini_service: GeminiService,
         summary_service: SummaryService,
+        summary_model: SummaryModel | None,
     ) -> None:
         self.file_service = file_service
-        self.config = config
-        self.gemini_service = gemini_service
         self.summary_service = summary_service
+        self.summary_model = summary_model
 
     @property
     def name(self) -> str:
@@ -91,6 +55,10 @@ class SummaryModule(ProcessorModule):
     @property
     def task_type(self) -> str:
         return "SUMMARY_GENERATION"
+
+    @property
+    def enabled(self) -> bool:
+        return self.summary_model is not None
 
     async def run_if_needed(
         self,
@@ -104,13 +72,7 @@ class SummaryModule(ProcessorModule):
         if page_index is not None:
             return False
 
-        if not self.gemini_service.is_configured:
-            return False
-
-        if not await super().run_if_needed(file_id, session_manager, page_index):
-            return False
-
-        return True
+        return await super().run_if_needed(file_id, session_manager, page_index)
 
     async def process(
         self,
@@ -120,17 +82,13 @@ class SummaryModule(ProcessorModule):
         page_id: str | None = None,
         **kwargs: object,
     ) -> None:
-        """
-        Generates an AI summary for the given file.
+        """Aggregate OCR text for the file and store transcript and AI summary records."""
+        if self.summary_model is None:
+            raise ValueError("Summary model not configured")
 
-        1. Aggregates all OCR text for the file.
-        2. Sends to Gemini for summarization and date extraction.
-        3. Stores the result as a new Summary.
-        """
         logger.info(f"Starting summary generation for file_id={file_id}")
 
         async with session_manager.session() as session:
-            # 1. Fetch File Info
             file_do = await session.get(UserFileDO, file_id)
             if not file_do:
                 logger.error(f"File {file_id} not found.")
@@ -142,7 +100,6 @@ class SummaryModule(ProcessorModule):
                 return
             user_email = user.email
 
-            # 2. Key Generation
             file_basis = file_do.storage_key or str(file_do.id)
             group_uuid = get_summary_group_id(file_basis)
             group_name = Path(file_do.file_name).name
@@ -150,8 +107,6 @@ class SummaryModule(ProcessorModule):
             summary_uuid = get_summary_id(file_basis)
             transcript_uuid = get_transcript_id(file_basis)
 
-            # 3. Aggregate OCR Text
-            # We want to format the text with page markers so the model can cite them.
             stmt = (
                 select(NotePageContentDO)
                 .where(NotePageContentDO.file_id == file_id)
@@ -179,7 +134,6 @@ class SummaryModule(ProcessorModule):
 
         full_text = "\n\n".join(text_parts)
 
-        # 4. Upsert Summary Group for the notebook
         await self._upsert_group(
             user_email,
             AddSummaryGroupDTO(
@@ -189,9 +143,6 @@ class SummaryModule(ProcessorModule):
             ),
         )
 
-        # 5. Generate Transcript Summary (Preserve existing functionality)
-        # Store the raw aggregated text as a 'transcript' summary type first
-        # This is a good baseline to have.
         await self._upsert_summary(
             user_email,
             AddSummaryDTO(
@@ -204,87 +155,52 @@ class SummaryModule(ProcessorModule):
             ),
         )
 
-        # 6. Generate AI Summary using Gemini
-        # Determine prompt based on filename/type
         custom_type = Path(file_do.file_name).stem.lower()
+        prompt = format_summary_prompt(full_text, custom_type=custom_type)
+        summary_response = await self.summary_model.summarize(prompt)
 
-        # Load Prompt using specialized logic: Common + (Custom OR Default)
-        prompt_template = PROMPT_LOADER.get_prompt(
-            PromptId.SUMMARY_GENERATION, custom_type=custom_type
-        )
-        prompt = f"{prompt_template}\n\nTRANSCRIPT:\n{full_text}"
-
-        try:
-            response = await self.gemini_service.generate_content(
-                model=self.config.gemini_ocr_model,
-                contents=prompt,
-                config={
-                    "response_mime_type": "application/json",
-                    "response_json_schema": build_json_schema(
-                        SummaryResponse
-                    ).to_dict(),
-                },
-            )
-        except Exception as e:
-            logger.error(f"Failed to generate AI summary for file {file_id}: {e}")
-            return
-
-        # Parse JSON response
+        # Format segments into Markdown and collect metadata
         ai_summary = "No summary generated."
         metadata_str = None
 
-        if response.text:
-            try:
-                data = json.loads(response.text)
-                segments_data = data.get("segments", [])
+        summary_parts = []
+        clean_segments = []
 
-                # Format segments into Markdown and collect metadata
-                summary_parts = []
-                all_extracted_dates = []
+        for seg in summary_response.segments:
+            date_range = seg.date_range or "Unknown Date"
+            text = (seg.summary or "").replace("\\n", "\n")
+            dates = seg.extracted_dates or []
+            page_refs = seg.page_refs or []
 
-                # Check for page citations and build clean segment list for metadata
-                clean_segments = []
+            # Markdown Formatting
+            header = f"## {date_range}"
+            # Add page citations to markdown too for readability
+            if page_refs:
+                # e.g. (Pages 45, 46)
+                pages_str = ", ".join(str(p) for p in page_refs)
+                header += f" (Pages {pages_str})"
 
-                for seg in segments_data:
-                    date_range = seg.get("date_range", "Unknown Date")
-                    text = seg.get("summary", "").replace("\\n", "\n")
-                    dates = seg.get("extracted_dates", [])
-                    page_refs = seg.get("page_refs", [])
+            summary_parts.append(f"{header}\n{text}")
 
-                    # Markdown Formatting
-                    header = f"## {date_range}"
-                    # Add page citations to markdown too for readability
-                    if page_refs:
-                        # e.g. (Pages 45, 46)
-                        pages_str = ", ".join(str(p) for p in page_refs)
-                        header += f" (Pages {pages_str})"
+            clean_segments.append(
+                {
+                    "date_range": date_range,
+                    "summary": text,
+                    "extracted_dates": dates,
+                    "page_refs": page_refs,
+                }
+            )
 
-                    summary_parts.append(f"{header}\n{text}")
-                    all_extracted_dates.extend(dates)
+        if summary_parts:
+            ai_summary = "\n\n".join(summary_parts)
 
-                    clean_segments.append(
-                        {
-                            "date_range": date_range,
-                            "summary": text,  # Optional: could truncate or omit to save space
-                            "extracted_dates": dates,
-                            "page_refs": page_refs,
-                        }
-                    )
-
-                if summary_parts:
-                    ai_summary = "\n\n".join(summary_parts)
-
-                # Construct rich metadata for retrieval
-                if clean_segments:
-                    meta_obj = {METADATA_SEGMENTS: clean_segments}
-                    metadata_str = json.dumps(meta_obj)
-                    logger.info(
-                        f"Generated metadata for file {file_id}: segments={len(clean_segments)}"
-                    )
-
-            except json.JSONDecodeError:
-                logger.error(f"Failed to parse JSON response for file {file_id}")
-                ai_summary = response.text
+        # Construct rich metadata for retrieval
+        if clean_segments:
+            meta_obj = {METADATA_SEGMENTS: clean_segments}
+            metadata_str = json.dumps(meta_obj)
+            logger.info(
+                f"Generated metadata for file {file_id}: segments={len(clean_segments)}"
+            )
 
         await self._upsert_summary(
             user_email,
@@ -293,7 +209,7 @@ class SummaryModule(ProcessorModule):
                 unique_identifier=summary_uuid,
                 parent_unique_identifier=group_uuid,
                 content=ai_summary,
-                data_source="GEMINI",
+                data_source=self.summary_model.model_id,
                 source_path=file_do.file_name,
                 metadata=metadata_str,
             ),

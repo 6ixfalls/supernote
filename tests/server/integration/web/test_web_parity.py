@@ -17,7 +17,7 @@ async def test_web_rename(web_client: WebClient) -> None:
     assert [f.file_name for f in list_res.user_file_vo_list] == [
         "Screenshot",
         "Note",
-        "NewName",  # New folder
+        "Newname",  # New folder, capitalized like every root folder
         "MyStyle",
         "Inbox",
         "Export",

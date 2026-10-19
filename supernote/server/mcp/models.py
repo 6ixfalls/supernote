@@ -123,3 +123,51 @@ class TranscriptResponseVO(BaseResponse):
 
     class Config(BaseConfig):
         serialize_by_alias = True
+
+
+@dataclass
+class ListNotebooksRequestDTO(DataClassJSONMixin):
+    """Request DTO for listing notebooks.
+
+    Used by: list_notebooks (MCP)
+    """
+
+    limit: int = 20
+    """Maximum number of notebooks to return (default: 20)."""
+
+    name_filter: str | None = field(
+        metadata=field_options(alias="nameFilter"), default=None
+    )
+    """Optional substring filter for notebook filenames."""
+
+    class Config(BaseConfig):
+        serialize_by_alias = True
+
+
+@dataclass
+class NotebookVO(DataClassJSONMixin):
+    """VO for a single notebook metadata entry.
+
+    Used by: list_notebooks (MCP)
+    """
+
+    file_id: int = field(metadata=field_options(alias="fileId"))
+    file_name: str = field(metadata=field_options(alias="fileName"))
+    create_time: int = field(metadata=field_options(alias="createTime"))
+    update_time: int = field(metadata=field_options(alias="updateTime"))
+
+    class Config(BaseConfig):
+        serialize_by_alias = True
+
+
+@dataclass
+class ListNotebooksResponseVO(BaseResponse):
+    """Response VO for listing notebooks.
+
+    Used by: list_notebooks (MCP)
+    """
+
+    notebooks: list[NotebookVO] = field(default_factory=list)
+
+    class Config(BaseConfig):
+        serialize_by_alias = True

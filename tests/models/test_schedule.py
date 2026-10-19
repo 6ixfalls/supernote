@@ -3,6 +3,7 @@
 from supernote.models.schedule import (
     AddScheduleTaskDTO,
     AddScheduleTaskGroupDTO,
+    ClearScheduleTaskGroupDTO,
     ScheduleRecurTaskItem,
     ScheduleTaskAllVO,
     ScheduleTaskGroupItem,
@@ -45,6 +46,13 @@ def test_schedule_task_info() -> None:
 def test_add_schedule_task_group_dto() -> None:
     dto = AddScheduleTaskGroupDTO(title="New Group")
     assert dto.to_dict()["title"] == "New Group"
+
+
+def test_clear_schedule_task_group_dto() -> None:
+    dto = ClearScheduleTaskGroupDTO.from_dict({"taskListId": "group1"})
+    assert dto.task_list_id == "group1"
+    assert dto.last_modified is None
+    assert dto.to_dict() == {"taskListId": "group1", "lastModified": None}
 
 
 def test_add_schedule_task_dto() -> None:

@@ -22,9 +22,9 @@ async def test_device_vs_web_structure(
     device_res = await device_client.list_folder("/", recursive=False)
     device_folders = {e.name for e in device_res.entries}
 
-    # Device should see: Export, Inbox, Screenshot, NOTE, DOCUMENT
+    # Device should see: EXPORT, INBOX, SCREENSHOT, NOTE, DOCUMENT
     # But NOT Note, Document, MyStyle at root
-    expected_device = {"Export", "Inbox", "Screenshot", "NOTE", "DOCUMENT"}
+    expected_device = {"EXPORT", "INBOX", "SCREENSHOT", "NOTE", "DOCUMENT"}
     assert expected_device.issubset(device_folders)
     assert "Note" not in device_folders
     assert "Document" not in device_folders

@@ -19,6 +19,7 @@ Execute this prescriptive task list when reviewing code changes, auditing PRs, o
 ### Step 2: Audit Abstraction Boundaries (Zero Leaky Abstractions)
 - [ ] Inspect API method signatures: verify high-level methods use domain models and standard exception semantics (`None` on success, typed exceptions on failure).
 - [ ] Confirm no transport tokens, wire literals (e.g. `"Received"`, `"true"`), or status strings leak to upper layers.
+- [ ] Audit role cohesion: verify interfaces do not leak caller concerns (storage, scheduling, query building) downward into implementations, and prefer declarative properties over bespoke per-subclass hooks.
 - [ ] Check exception blocks: ensure broad `except Exception:` is replaced with narrow parse errors (`(json.JSONDecodeError, ValueError, TypeError, KeyError)`).
 
 ### Step 3: Audit Orthogonality & State Isolation

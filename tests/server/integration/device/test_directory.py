@@ -72,11 +72,11 @@ async def test_list_recursive(device_client: DeviceClient) -> None:
     results = sorted((e.name, e.path_display) for e in data.entries)
     assert results == [
         ("DOCUMENT", "DOCUMENT"),
-        ("Export", "Export"),
-        ("Inbox", "Inbox"),
+        ("EXPORT", "EXPORT"),
+        ("INBOX", "INBOX"),
         ("NOTE", "NOTE"),
         ("Parent", "Parent"),
-        ("Screenshot", "Screenshot"),
+        ("SCREENSHOT", "SCREENSHOT"),
     ]
 
     # List recursive from root
@@ -89,13 +89,13 @@ async def test_list_recursive(device_client: DeviceClient) -> None:
         ("Child", "Parent/Child"),
         ("DOCUMENT", "DOCUMENT"),
         ("Document", "DOCUMENT/Document"),
-        ("Export", "Export"),
-        ("Inbox", "Inbox"),
+        ("EXPORT", "EXPORT"),
+        ("INBOX", "INBOX"),
         ("MyStyle", "NOTE/MyStyle"),
         ("NOTE", "NOTE"),
         ("Note", "NOTE/Note"),
         ("Parent", "Parent"),
-        ("Screenshot", "Screenshot"),
+        ("SCREENSHOT", "SCREENSHOT"),
     ]
 
 

@@ -34,6 +34,9 @@ class NotePageContentDO(Base):
     embedding: Mapped[str | None] = mapped_column(Text, nullable=True)
     """JSON string representation of the vector embedding."""
 
+    embedding_model: Mapped[str | None] = mapped_column(String, nullable=True)
+    """Identifier of the model that produced the embedding."""
+
     create_time: Mapped[int] = mapped_column(
         BigInteger, default=lambda: int(time.time() * 1000)
     )

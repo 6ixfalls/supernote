@@ -1,11 +1,7 @@
-import jwt
-
 from supernote.models.socket import SocketHandshakeParams
-from supernote.server.services.user import JWT_ALGORITHM
 from supernote.server.socket_auth import (
     compute_handshake_signature,
     verify_handshake_signature,
-    verify_handshake_token,
 )
 
 
@@ -44,31 +40,3 @@ def test_verify_handshake_signature_missing_sign() -> None:
         sign="",
     )
     assert verify_handshake_signature(params) is False
-
-
-def test_verify_handshake_token_valid() -> None:
-    secret = "test-secret-key-32-characters-long!!"
-    token = jwt.encode({"sub": "user@example.com"}, secret, algorithm=JWT_ALGORITHM)
-
-    user_id = verify_handshake_token(token, secret)
-    assert user_id == "user@example.com"
-
-
-def test_verify_handshake_token_invalid() -> None:
-    secret = "test-secret-key-32-characters-long!!"
-
-    # Empty token string
-    assert verify_handshake_token("", secret) is None
-
-    # Invalid token string
-    assert verify_handshake_token("invalid.jwt.token", secret) is None
-
-    # Wrong secret key
-    token = jwt.encode(
-        {"sub": "user@example.com"}, "wrong-secret", algorithm=JWT_ALGORITHM
-    )
-    assert verify_handshake_token(token, secret) is None
-
-    # Missing 'sub' claim in JWT payload
-    no_sub_token = jwt.encode({"other": "claim"}, secret, algorithm=JWT_ALGORITHM)
-    assert verify_handshake_token(no_sub_token, secret) is None

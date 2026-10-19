@@ -7,6 +7,8 @@ from supernote.models.equipment import (
     EquipmentManualDTO,
     EquipmentManualVO,
     EquipmentVO,
+    PasswordResetCodeDTO,
+    PasswordResetCodeVO,
     QueryEquipmentDTO,
     QueryEquipmentVO,
     UnbindEquipmentDTO,
@@ -31,13 +33,16 @@ def test_bind_equipment_dto() -> None:
         account="user@example.com",
         name="MyDevice",
         total_capacity="32GB",
+        country_code="1",
         label=["tag1", "tag2"],
     )
     assert dto.equipment_no == "SN123"
+    assert dto.country_code == "1"
     assert dto.label == ["tag1", "tag2"]
 
     data = dto.to_dict()
     assert data["equipmentNo"] == "SN123"
+    assert data["countryCode"] == "1"
     assert data["label"] == ["tag1", "tag2"]
 
     dto2 = BindEquipmentDTO.from_dict(data)
@@ -108,3 +113,29 @@ def test_query_equipment_vo() -> None:
     vo = QueryEquipmentVO(equipment_number="SN123", user_id="u1")
     assert vo.equipment_number == "SN123"
     assert vo.to_dict()["userId"] == "u1"
+
+
+def test_password_reset_code_dto_and_vo() -> None:
+    dto = PasswordResetCodeDTO(
+        equipment_no="SN123",
+        code="654321",
+        language="2",
+        email="user@example.com",
+        country_code="+1",
+    )
+    d = dto.to_dict()
+    assert d["equipmentNo"] == "SN123"
+    assert d["code"] == "654321"
+    assert d["countryCode"] == "+1"
+    assert PasswordResetCodeDTO.from_dict(d) == dto
+
+    vo = PasswordResetCodeVO(
+        equipment_no="SN123",
+        email="user@example.com",
+        time=60,
+        send_to="user@example.com",
+    )
+    vd = vo.to_dict()
+    assert vd["equipmentNo"] == "SN123"
+    assert vd["sendTo"] == "user@example.com"
+    assert PasswordResetCodeVO.from_dict(vd).time == 60

@@ -1,6 +1,6 @@
 from collections.abc import Generator
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 from aiohttp.test_utils import TestClient
@@ -11,10 +11,14 @@ from supernote.client.extended import ExtendedClient
 from supernote.client.summary import SummaryClient
 from supernote.models.base import ProcessingStatus
 from supernote.models.summary import AddSummaryDTO
+from supernote.server.ai.models.fake.embedding import FakeEmbeddingModel
+from supernote.server.ai.models.fake.ocr import FakeOcrModel
+from supernote.server.ai.models.fake.summary import FakeSummaryModel
 from supernote.server.db.models.file import UserFileDO
 from supernote.server.db.models.note_processing import NotePageContentDO, SystemTaskDO
 from supernote.server.db.session import DatabaseSessionManager
 from supernote.server.exceptions import SupernoteError
+from supernote.server.services.user import UserService
 
 
 @pytest.fixture
@@ -25,19 +29,19 @@ def extended_client(authenticated_client: Client) -> ExtendedClient:
 
 @pytest.fixture
 def mock_gemini_service() -> Generator[None]:
-    """Fixture to mock Gemini service."""
-    # Mock Gemini Service to avoid network calls
-    mock_embedding_response = AsyncMock()
-    mock_embedding_response.embeddings = [AsyncMock(values=[1.0, 0.0, 0.0])]
-
+    """Fixture to provide fake AI models for extended route tests."""
     with (
         patch(
-            "supernote.server.services.gemini.GeminiService.is_configured",
-            return_value=True,
+            "supernote.server.app.create_ocr_model",
+            return_value=FakeOcrModel(),
         ),
         patch(
-            "supernote.server.services.gemini.GeminiService.embed_content",
-            return_value=mock_embedding_response,
+            "supernote.server.app.create_summary_model",
+            return_value=FakeSummaryModel(),
+        ),
+        patch(
+            "supernote.server.app.create_embedding_model",
+            return_value=FakeEmbeddingModel(),
         ),
     ):
         yield
@@ -45,21 +49,23 @@ def mock_gemini_service() -> Generator[None]:
 
 @pytest.fixture(autouse=True)
 def patch_gemini_service(mock_gemini_service: Generator[None]) -> None:
-    """Patch the Gemini service in the search service."""
-    # This is handled by the mock_gemini_service fixture
+    """Configure fake AI models for the search service."""
 
 
 async def test_extended_search(
     extended_client: ExtendedClient,
     session_manager: DatabaseSessionManager,
+    test_user_id: int,
 ) -> None:
     # 1. Seed some search data
-    user_id = 1
     file_id = 101
     async with session_manager.session() as session:
         session.add(
             UserFileDO(
-                id=file_id, user_id=user_id, file_name="SearchTest.note", directory_id=0
+                id=file_id,
+                user_id=test_user_id,
+                file_name="SearchTest.note",
+                directory_id=0,
             )
         )
         session.add(
@@ -70,6 +76,7 @@ async def test_extended_search(
                 text_content="The quick brown fox jumps over the lazy dog.",
                 # Mock embedding [1, 0, 0] for simplicity in SQL
                 embedding="[1.0, 0.0, 0.0]",
+                embedding_model="fake-embedding-v1",
             )
         )
         await session.commit()
@@ -84,14 +91,17 @@ async def test_extended_search_with_mock(
     extended_client: ExtendedClient,
     session_manager: DatabaseSessionManager,
     client: Any,  # TestClient from aiohttp
+    test_user_id: int,
 ) -> None:
     # 1. Seed data
-    user_id = 1
     file_id = 101
     async with session_manager.session() as session:
         session.add(
             UserFileDO(
-                id=file_id, user_id=user_id, file_name="Fox.note", directory_id=0
+                id=file_id,
+                user_id=test_user_id,
+                file_name="Fox.note",
+                directory_id=0,
             )
         )
         session.add(
@@ -101,6 +111,7 @@ async def test_extended_search_with_mock(
                 page_id="p0",
                 text_content="The quick brown fox.",
                 embedding="[1.0, 0.0, 0.0]",
+                embedding_model="fake-embedding-v1",
             )
         )
         await session.commit()
@@ -189,8 +200,17 @@ async def test_handle_list_system_tasks(
     client: TestClient,
     extended_client: ExtendedClient,
     session_manager: DatabaseSessionManager,
+    test_user_id: int,
 ) -> None:
     async with session_manager.session() as session:
+        session.add(
+            UserFileDO(
+                id=1,
+                user_id=test_user_id,
+                file_name="Note1.note",
+                directory_id=0,
+            )
+        )
         session.add(
             SystemTaskDO(file_id=1, task_type="PNG", key="page_0", status="COMPLETED")
         )
@@ -211,10 +231,55 @@ async def test_handle_list_system_tasks(
         await extended_client.list_system_tasks()
 
 
+async def test_handle_list_system_tasks_excludes_other_users_tasks(
+    extended_client: ExtendedClient,
+    session_manager: DatabaseSessionManager,
+    test_user_id: int,
+) -> None:
+    """Verify GET /api/extended/system/tasks only returns tasks for the authenticated user's files."""
+    other_user_id = test_user_id + 999
+    async with session_manager.session() as session:
+        session.add(
+            UserFileDO(
+                id=1,
+                user_id=test_user_id,
+                file_name="OwnNote.note",
+                directory_id=0,
+            )
+        )
+        session.add(
+            UserFileDO(
+                id=2,
+                user_id=other_user_id,
+                file_name="OtherUserSecret.note",
+                directory_id=0,
+            )
+        )
+        session.add(
+            SystemTaskDO(file_id=1, task_type="PNG", key="page_0", status="COMPLETED")
+        )
+        session.add(
+            SystemTaskDO(
+                file_id=2,
+                task_type="OCR",
+                key="page_0",
+                status="FAILED",
+                last_error="secret error",
+            )
+        )
+        await session.commit()
+
+    res = await extended_client.list_system_tasks()
+    assert res.success
+    returned_file_ids = {t.file_id for t in res.tasks}
+    assert returned_file_ids == {1}
+
+
 async def test_file_processing_status(
     client: TestClient,
     extended_client: ExtendedClient,
     session_manager: DatabaseSessionManager,
+    test_user_id: int,
 ) -> None:
     # Invalid DTO
     with pytest.raises(ApiException):
@@ -224,6 +289,15 @@ async def test_file_processing_status(
         )
 
     async with session_manager.session() as session:
+        for fid in (10, 20, 30, 40):
+            session.add(
+                UserFileDO(
+                    id=fid,
+                    user_id=test_user_id,
+                    file_name=f"Note{fid}.note",
+                    directory_id=0,
+                )
+            )
         # File 10: FAILED task
         session.add(
             SystemTaskDO(file_id=10, task_type="PNG", key="p0", status="FAILED")
@@ -265,8 +339,36 @@ async def test_file_processing_status(
         await extended_client.get_processing_status(file_ids=[10])
 
 
+async def test_file_processing_status_excludes_other_users_files(
+    extended_client: ExtendedClient,
+    session_manager: DatabaseSessionManager,
+    test_user_id: int,
+) -> None:
+    """Verify POST /api/extended/file/processing/status does not leak task status for another user's file."""
+    other_user_id = test_user_id + 999
+    async with session_manager.session() as session:
+        session.add(
+            UserFileDO(
+                id=77,
+                user_id=other_user_id,
+                file_name="OtherUser.note",
+                directory_id=0,
+            )
+        )
+        session.add(
+            SystemTaskDO(file_id=77, task_type="PNG", key="p0", status="FAILED")
+        )
+        await session.commit()
+
+    res = await extended_client.get_processing_status(file_ids=[77])
+    assert res.success
+    assert res.status_map["77"] == ProcessingStatus.NONE
+
+
 async def test_extended_search_invalid_dto_and_errors(
-    client: TestClient, extended_client: ExtendedClient
+    client: TestClient,
+    extended_client: ExtendedClient,
+    user_service: UserService,
 ) -> None:
     # Invalid DTO
     with pytest.raises(ApiException):
@@ -277,7 +379,7 @@ async def test_extended_search_invalid_dto_and_errors(
 
     # User not found
     with (
-        patch.object(client.app["user_service"], "get_user_id", return_value=None),
+        patch.object(user_service, "get_user_id", return_value=None),
         pytest.raises(ApiException),
     ):
         await extended_client.search(query="test")
@@ -295,7 +397,9 @@ async def test_extended_search_invalid_dto_and_errors(
 
 
 async def test_extended_transcript_invalid_dto_and_errors(
-    client: TestClient, extended_client: ExtendedClient
+    client: TestClient,
+    extended_client: ExtendedClient,
+    user_service: UserService,
 ) -> None:
     # Invalid DTO
     with pytest.raises(ApiException):
@@ -306,7 +410,7 @@ async def test_extended_transcript_invalid_dto_and_errors(
 
     # User not found
     with (
-        patch.object(client.app["user_service"], "get_user_id", return_value=None),
+        patch.object(user_service, "get_user_id", return_value=None),
         pytest.raises(ApiException),
     ):
         await extended_client.get_transcript(file_id=101)
@@ -321,3 +425,15 @@ async def test_extended_transcript_invalid_dto_and_errors(
         pytest.raises(ApiException),
     ):
         await extended_client.get_transcript(file_id=101)
+
+
+async def test_extended_ai_status(extended_client: ExtendedClient) -> None:
+    resp = await extended_client._client.get("/api/extended/ai/status")
+    data = await resp.json()
+    assert data == {
+        "success": True,
+        "hasApiKey": True,
+        "ocrEnabled": True,
+        "vectorSearchEnabled": True,
+        "model": "fake-ocr-v1",
+    }

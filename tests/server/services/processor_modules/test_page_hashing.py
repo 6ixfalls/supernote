@@ -118,6 +118,8 @@ async def test_process_with_real_file(
         page.content_hash = "FAKE_HASH"
         # Set some dummy content that should be cleared
         page.text_content = "dummy_ocr"
+        page.embedding = "[0.1, 0.2]"
+        page.embedding_model = "old-model"
 
         # Add a mock downstream task that should be invalidated (deleted)
         ocr_task = SystemTaskDO(
@@ -148,8 +150,10 @@ async def test_process_with_real_file(
         assert page is not None
         # Hash should be back to original (real) hash
         assert page.content_hash == original_hash
-        # Text content should be cleared because we simulated a "change" (Fake -> Real)
+        # Text content, embedding, and embedding_model should be cleared because we simulated a "change" (Fake -> Real)
         assert page.text_content is None
+        assert page.embedding is None
+        assert page.embedding_model is None
 
         # Check that the downstream task was invalidated (deleted)
         invalidated_task = (

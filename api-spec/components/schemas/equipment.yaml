@@ -201,3 +201,50 @@ QueryEquipmentVO:
       description: "Remark or note"
     fileServer:
       type: string
+
+PasswordResetCodeDTO:
+  type: object
+  required:
+    - equipmentNo
+    - code
+  properties:
+    equipmentNo:
+      type: string
+      description: Equipment Number
+    language:
+      type: string
+      description: "Language (1: CN; 2: EN)"
+    code:
+      type: string
+      description: Verification / unlock code
+    type:
+      type: string
+      description: Verification method type
+    email:
+      type: string
+      description: Email address
+    countryCode:
+      type: string
+      description: Country code (e.g., +86)
+    telephone:
+      type: string
+      description: Telephone number
+
+PasswordResetCodeVO:
+  allOf:
+    - $ref: "common.yaml#/BaseVO"
+    - type: object
+      properties:
+        countryCode:
+          type: string
+        telephone:
+          type: string
+        email:
+          type: string
+        equipmentNo:
+          type: string
+        time:
+          type: integer
+          format: int32
+        sendTo:
+          type: string

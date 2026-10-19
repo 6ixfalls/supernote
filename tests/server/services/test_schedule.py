@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from supernote.server.db.session import DatabaseSessionManager
@@ -140,3 +142,29 @@ async def test_delete_group_cascades_contained_tasks(
 
     tasks_after = await schedule_service.list_tasks(user_id)
     assert len(tasks_after) == 0
+
+
+async def test_batch_update_tasks_updates_timestamp_for_since_filter(
+    schedule_service: ScheduleService,
+) -> None:
+    """Test that batch_update_tasks bumps update_time so incremental sync (since) includes updated tasks."""
+    user_id = 555
+    group = await schedule_service.create_group(user_id, "Reorder Group")
+    task1 = await schedule_service.create_task(user_id, group.id, "Task 1", sort=1)
+    task2 = await schedule_service.create_task(user_id, group.id, "Task 2", sort=2)
+
+    sync_token = max(task1.update_time, task2.update_time)
+    assert await schedule_service.list_tasks(user_id, since=sync_token) == []
+
+    await asyncio.sleep(0.005)
+    await schedule_service.batch_update_tasks(
+        user_id,
+        [{"task_id": task1.id, "sort": 2, "sort_time": sync_token + 100}],
+    )
+
+    updated_task1 = await schedule_service.get_task(user_id, task1.id)
+    assert updated_task1 is not None
+    assert updated_task1.sort == 2
+    assert updated_task1.update_time > sync_token
+    delta_tasks = await schedule_service.list_tasks(user_id, since=sync_token)
+    assert [t.task_id for t in delta_tasks] == [task1.task_id]

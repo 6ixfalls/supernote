@@ -318,6 +318,7 @@ class ScheduleService:
         self, user_id: int, updates_list: list[dict[str, Any]]
     ) -> bool:
         """Batch update tasks atomically in a single transaction."""
+        now_ms = int(time.time() * 1000)
         async with self.session_manager.session() as session:
             for item in updates_list:
                 if not (task_id := item.get("task_id")):
@@ -341,6 +342,7 @@ class ScheduleService:
                 }
                 if not updates:
                     continue
+                updates["update_time"] = now_ms
 
                 stmt = (
                     update(ScheduleTaskDO)

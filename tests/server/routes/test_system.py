@@ -4,6 +4,7 @@ import pytest
 
 from supernote.client.client import Client
 from supernote.models.extended import SystemTaskListVO
+from supernote.server.db.models.file import UserFileDO
 from supernote.server.db.models.note_processing import SystemTaskDO
 from supernote.server.db.session import DatabaseSessionManager
 
@@ -17,9 +18,26 @@ async def test_list_system_tasks(
     authenticated_client: Client,
     system_tasks_url: str,
     session_manager: DatabaseSessionManager,
+    test_user_id: int,
 ) -> None:
     # 1. Seed some system tasks
     async with session_manager.session() as session:
+        session.add(
+            UserFileDO(
+                id=101,
+                user_id=test_user_id,
+                file_name="Note101.note",
+                directory_id=0,
+            )
+        )
+        session.add(
+            UserFileDO(
+                id=102,
+                user_id=test_user_id,
+                file_name="Note102.note",
+                directory_id=0,
+            )
+        )
         # Create a pending task
         t1 = SystemTaskDO(
             file_id=101,

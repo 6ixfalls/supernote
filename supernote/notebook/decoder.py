@@ -18,9 +18,10 @@ import base64
 import json
 import zlib
 from dataclasses import dataclass
+from io import BytesIO
 
 import numpy as np
-import png
+from PIL import Image
 
 from . import color, exceptions
 
@@ -78,7 +79,22 @@ class FlateDecoder(BaseDecoder):
         int
             bit per pixel
         """
-        uncompressed = zlib.decompress(data)
+        expected_length = (
+            self.INTERNAL_PAGE_WIDTH
+            * self.INTERNAL_PAGE_HEIGHT
+            * np.dtype(np.uint16).itemsize
+        )
+        decompressor = zlib.decompressobj()
+        try:
+            uncompressed = decompressor.decompress(data, expected_length + 1)
+        except zlib.error as err:
+            raise exceptions.DecoderException(
+                f"failed to decompress bitmap: {err}"
+            ) from err
+        if decompressor.unconsumed_tail or len(uncompressed) != expected_length:
+            raise exceptions.DecoderException(
+                f"uncompressed bitmap length = {len(uncompressed)}, expected = {expected_length}"
+            )
         bitmap = np.frombuffer(uncompressed, dtype=np.uint16)
         bitmap = np.reshape(
             bitmap, (self.INTERNAL_PAGE_WIDTH, self.INTERNAL_PAGE_HEIGHT)
@@ -203,6 +219,11 @@ class RattaRleDecoder(BaseDecoder):
                     else:
                         length += 1
                         uncompressed += color_bytes_list[colorcode] * length
+
+                if len(uncompressed) > expected_length:
+                    raise exceptions.DecoderException(
+                        f"uncompressed bitmap length = {len(uncompressed)}, expected = {expected_length}"
+                    )
         except StopIteration:
             if len(holder) > 0:
                 (colorcode, length) = holder
@@ -338,21 +359,14 @@ class PngDecoder(BaseDecoder):
         int
             bit per pixel
         """
-        r = png.Reader(bytes=data)
-        (width, height, rows, info) = r.asRGBA()
-        if width != page_width or height != page_height:
-            raise exceptions.DecoderException(
-                f"invalid size = ({width}, {height}), expected = ({page_width}, {page_height})"
-            )
-        values = [x for row in rows for x in row]  # flatten rows
-        depth = info["bitdepth"]
-        greyscale = info["greyscale"]
-        alpha = info["alpha"]
-        ch = 1 if greyscale else 3
-        if alpha:
-            ch = ch + 1
-        bit_per_pixel = depth * ch
-        return bytes(values), (page_width, page_height), bit_per_pixel
+        with Image.open(BytesIO(data)) as img:
+            width, height = img.size
+            if width != page_width or height != page_height:
+                raise exceptions.DecoderException(
+                    f"invalid size = ({width}, {height}), expected = ({page_width}, {page_height})"
+                )
+            bitmap = img.convert("RGBA").tobytes()
+        return bitmap, (page_width, page_height), 32
 
 
 @dataclass(frozen=True)

@@ -1,9 +1,14 @@
+import dataclasses
 from pathlib import Path
 
+import pytest
 from aiohttp.test_utils import TestClient
+from pytest_aiohttp import AiohttpClient
 from sqlalchemy import delete
 
 from supernote.client.device import DeviceClient
+from supernote.server.app import create_app
+from supernote.server.config import ServerConfig
 from supernote.server.constants import CACHE_BUCKET, USER_DATA_BUCKET
 from supernote.server.db.models.note_processing import NotePageContentDO
 from supernote.server.db.session import DatabaseSessionManager
@@ -148,3 +153,39 @@ async def test_note_png_caching(
         ):
             chunks.append(chunk)
         assert b"".join(chunks) == b"mock_png_bytes"
+
+
+@pytest.mark.parametrize(
+    ("web_enabled", "web_notebook_preview", "gemini_api_key"),
+    [
+        (True, False, None),
+        (True, False, "fake-gemini-key"),
+        (False, True, None),
+    ],
+)
+async def test_note_to_png_disabled_matrix(
+    aiohttp_client: AiohttpClient,
+    server_config: ServerConfig,
+    auth_headers: dict[str, str],
+    web_enabled: bool,
+    web_notebook_preview: bool,
+    gemini_api_key: str | None,
+) -> None:
+    """Verify /api/file/note/to/png returns empty page list when web or preview is disabled, even if Gemini is configured."""
+    cfg = dataclasses.replace(
+        server_config,
+        web_enabled=web_enabled,
+        web_notebook_preview=web_notebook_preview,
+        gemini_api_key=gemini_api_key,
+    )
+    app = create_app(cfg)
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/api/file/note/to/png",
+        json={"id": 99999},
+        headers=auth_headers,
+    )
+    assert resp.status == 200
+    data = await resp.json()
+    assert data == {"success": True, "pngPageVOList": []}

@@ -29,6 +29,15 @@ class NoteDeletedEvent(Event):
     user_id: int
 
 
+@dataclass
+class NoteProcessingCompletedEvent(Event):
+    """Triggered when the asynchronous processing pipeline for a .note file completes."""
+
+    file_id: int
+    user_id: int
+    file_path: str
+
+
 EventHandler = Callable[[Event], Awaitable[Any]]
 
 

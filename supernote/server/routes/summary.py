@@ -56,9 +56,10 @@ async def handle_add_summary_tag(request: web.Request) -> web.Response:
         return SupernoteError.uncaught(err).to_response()
 
 
+@routes.put("/api/file/update/summary/tag")
 @routes.post("/api/file/update/summary/tag")
 async def handle_update_summary_tag(request: web.Request) -> web.Response:
-    # Endpoint: POST /api/file/update/summary/tag
+    # Endpoint: PUT /api/file/update/summary/tag
     # Purpose: Update an existing summary tag.
     # Response: BaseResponse
     req_data = UpdateSummaryTagDTO.from_dict(await request.json())
@@ -74,9 +75,10 @@ async def handle_update_summary_tag(request: web.Request) -> web.Response:
         return SupernoteError.uncaught(err).to_response()
 
 
+@routes.delete("/api/file/delete/summary/tag")
 @routes.post("/api/file/delete/summary/tag")
 async def handle_delete_summary_tag(request: web.Request) -> web.Response:
-    # Endpoint: POST /api/file/delete/summary/tag
+    # Endpoint: DELETE /api/file/delete/summary/tag
     # Purpose: Delete a summary tag.
     # Response: BaseResponse
     req_data = DeleteSummaryTagDTO.from_dict(await request.json())
@@ -92,9 +94,10 @@ async def handle_delete_summary_tag(request: web.Request) -> web.Response:
         return SupernoteError.uncaught(err).to_response()
 
 
+@routes.get("/api/file/query/summary/tag")
 @routes.post("/api/file/query/summary/tag")
 async def handle_query_summary_tag(request: web.Request) -> web.Response:
-    # Endpoint: POST /api/file/query/summary/tag
+    # Endpoint: GET /api/file/query/summary/tag
     # Purpose: Query summary tags.
     # Response: QuerySummaryTagVO
     user_email = request["user"]
@@ -127,9 +130,10 @@ async def handle_add_summary(request: web.Request) -> web.Response:
         return SupernoteError.uncaught(err).to_response()
 
 
+@routes.put("/api/file/update/summary")
 @routes.post("/api/file/update/summary")
 async def handle_update_summary(request: web.Request) -> web.Response:
-    # Endpoint: POST /api/file/update/summary
+    # Endpoint: PUT /api/file/update/summary
     # Purpose: Update an existing summary.
     # Response: BaseResponse
     req_data = UpdateSummaryDTO.from_dict(await request.json())
@@ -145,9 +149,10 @@ async def handle_update_summary(request: web.Request) -> web.Response:
         return SupernoteError.uncaught(err).to_response()
 
 
+@routes.delete("/api/file/delete/summary")
 @routes.post("/api/file/delete/summary")
 async def handle_delete_summary(request: web.Request) -> web.Response:
-    # Endpoint: POST /api/file/delete/summary
+    # Endpoint: DELETE /api/file/delete/summary
     # Purpose: Delete a summary.
     # Response: BaseResponse
     req_data = DeleteSummaryDTO.from_dict(await request.json())
@@ -213,9 +218,10 @@ async def handle_add_summary_group(request: web.Request) -> web.Response:
         return SupernoteError.uncaught(err).to_response()
 
 
+@routes.put("/api/file/update/summary/group")
 @routes.post("/api/file/update/summary/group")
 async def handle_update_summary_group(request: web.Request) -> web.Response:
-    # Endpoint: POST /api/file/update/summary/group
+    # Endpoint: PUT /api/file/update/summary/group
     # Purpose: Update an existing summary group.
     # Response: BaseResponse
     req_data = UpdateSummaryGroupDTO.from_dict(await request.json())
@@ -231,9 +237,10 @@ async def handle_update_summary_group(request: web.Request) -> web.Response:
         return SupernoteError.uncaught(err).to_response()
 
 
+@routes.delete("/api/file/delete/summary/group")
 @routes.post("/api/file/delete/summary/group")
 async def handle_delete_summary_group(request: web.Request) -> web.Response:
-    # Endpoint: POST /api/file/delete/summary/group
+    # Endpoint: DELETE /api/file/delete/summary/group
     # Purpose: Delete a summary group.
     # Response: BaseResponse
     req_data = DeleteSummaryGroupDTO.from_dict(await request.json())
@@ -335,7 +342,9 @@ async def handle_download_summary(request: web.Request) -> web.Response:
         url_signer: UrlSigner = request.app["url_signer"]
         encoded_name = urllib.parse.quote(summary.handwrite_inner_name)
         download_path = f"/api/oss/download?path={encoded_name}"
-        signed_path = await url_signer.sign(download_path, user=user_email)
+        signed_path = await url_signer.sign(
+            download_path, user=user_email, single_use=False
+        )
         base_url = get_request_base_url(request)
         download_url = f"{base_url}{signed_path}"
 

@@ -669,3 +669,24 @@ async def test_schedule_string_uuid_support(authenticated_client: Client) -> Non
 
     # Delete task
     await schedule.delete_task(string_task_id)
+
+
+async def test_clear_group_without_last_modified(
+    authenticated_client: Client,
+) -> None:
+    """Verify /api/file/schedule/group/clear accepts requests omitting lastModified."""
+    schedule = ScheduleClient(authenticated_client)
+
+    group_vo = await schedule.create_group("Clear Test Group")
+    assert group_vo.task_list_id is not None
+
+    task_vo = await schedule.create_task(group_vo.task_list_id, "Task to Clear")
+    assert task_vo.task_id is not None
+
+    clear_vo = await schedule.clear_group(group_vo.task_list_id)
+    assert clear_vo.success is True
+
+    tasks_vo = await schedule.get_tasks_all(group_id=group_vo.task_list_id)
+    assert tasks_vo.schedule_task == []
+
+    await schedule.delete_group(group_vo.task_list_id)

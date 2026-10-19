@@ -4,7 +4,6 @@ import re
 from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager
 from typing import Any, cast
-from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -13,6 +12,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.types import TextContent
 from sqlalchemy import select
 
+from supernote.server.ai.models.fake.embedding import FakeEmbeddingModel
 from supernote.server.config import ServerConfig
 from supernote.server.db.models.file import UserFileDO
 from supernote.server.db.models.note_processing import NotePageContentDO
@@ -66,6 +66,7 @@ async def notebook_file_id(
             page_id="P001",
             text_content="This is a test note.",
             embedding=json.dumps([0.1] * 768),
+            embedding_model="fake-embedding-v1",
         )
         db.add(content_do)
         await db.commit()
@@ -73,23 +74,15 @@ async def notebook_file_id(
 
 
 @pytest.fixture
-def mock_gemini_service() -> Generator[None]:
-    """Fixture to mock Gemini service."""
-    # 1. Mock Gemini Service to avoid network calls
-    mock_embedding_response = AsyncMock()
-    mock_embedding_response.embeddings = [AsyncMock(values=[0.1] * 768)]
-
-    with (
-        patch(
-            "supernote.server.services.gemini.GeminiService.is_configured",
-            return_value=True,
-        ),
-        patch(
-            "supernote.server.services.gemini.GeminiService.embed_content",
-            return_value=mock_embedding_response,
-        ),
-    ):
+def mock_gemini_service(client: Any) -> Generator[None]:
+    """Fixture to configure a FakeEmbeddingModel on the app's search service."""
+    search_service = client.app["search_service"]
+    original = search_service.embedding_model
+    search_service.embedding_model = FakeEmbeddingModel(dimensions=768)
+    try:
         yield
+    finally:
+        search_service.embedding_model = original
 
 
 @asynccontextmanager
@@ -117,8 +110,32 @@ async def test_mcp_list_tools(
     async with mcp_session(mcp_url, auth_headers) as session:
         result = await session.list_tools()
         tool_names = [t.name for t in result.tools]
+        assert "list_notebooks" in tool_names
         assert "search_notebook_chunks" in tool_names
         assert "get_notebook_transcript" in tool_names
+
+
+async def test_mcp_list_notebooks(
+    mcp_url: str,
+    auth_headers: dict[str, str],
+    notebook_file_id: int,
+) -> None:
+    """Integrated test for listing notebooks via MCP."""
+    token = auth_headers["x-access-token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    async with mcp_session(mcp_url, headers) as session:
+        call_result = await session.call_tool(
+            "list_notebooks",
+            arguments={"name_filter": "test_notes"},
+            meta={"token": token},
+        )
+        assert call_result.content
+        content = call_result.content[0]
+        assert isinstance(content, TextContent)
+        res_data = json.loads(content.text)
+        assert len(res_data["notebooks"]) == 1
+        assert res_data["notebooks"][0]["fileId"] == notebook_file_id
+        assert res_data["notebooks"][0]["fileName"] == "test_notes.note"
 
 
 async def test_mcp_search_notebook_chunks(

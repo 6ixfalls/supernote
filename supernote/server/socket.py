@@ -10,7 +10,9 @@ from aiohttp import web
 from supernote.models.socket import (
     SocketHandshakeParams,
     SocketIoClientMessage,
+    SocketIoCode,
     SocketIoEvent,
+    SocketIoMessageType,
     SocketMessageData,
 )
 from supernote.server.config import ServerConfig
@@ -20,6 +22,12 @@ from supernote.server.socket_auth import (
 )
 
 logger = logging.getLogger(__name__)
+
+_MSG_TYPE_TO_EVENT: dict[str, SocketIoEvent] = {
+    SocketIoMessageType.FILE_SYN.value: SocketIoEvent.SERVER_MESSAGE,
+    SocketIoMessageType.TASK_SYN.value: SocketIoEvent.TODO,
+    SocketIoMessageType.DIGEST_SYN.value: SocketIoEvent.DIGEST,
+}
 
 
 def _extract_handshake_params(environ: dict) -> SocketHandshakeParams:
@@ -101,6 +109,7 @@ class SocketIOServerManager:
         logger.warning(
             "Disconnecting Socket.IO session with revoked authorization: %s", sid
         )
+        await self._send_error(sid, HTTPStatus.FORBIDDEN, "token verification failed")
         await self._sio.disconnect(sid)
         return True
 
@@ -211,13 +220,27 @@ class SocketIOServerManager:
                 to=sid,
             )
 
-    async def send_message(self, user_id: str, message: SocketMessageData) -> None:
+    async def send_message(
+        self,
+        user_id: str,
+        message: SocketMessageData,
+    ) -> None:
         """Send a SocketMessageData event to all connected sessions for a given user.
 
         Args:
             user_id: Target user email or identifier.
             message: SocketMessageData payload to deliver.
         """
+        if message.code is None:
+            message.code = str(SocketIoCode.SUCCESS.value)
+        msg_type = (
+            message.msg_type.value
+            if isinstance(message.msg_type, SocketIoMessageType)
+            else str(message.msg_type or "")
+        )
+        resolved_event = _MSG_TYPE_TO_EVENT.get(
+            msg_type, SocketIoEvent.SERVER_MESSAGE
+        ).value
         payload_str = message.to_json()
         logger.debug("Emitting ServerMessage to user=%s: %s", user_id, payload_str)
         target_user = await self._user_service.get_user_by_email(user_id)
@@ -231,7 +254,7 @@ class SocketIOServerManager:
             if self._sid_to_user_id.get(sid) != stable_user_id:
                 continue
             await self._sio.emit(
-                SocketIoEvent.SERVER_MESSAGE.value,
+                resolved_event,
                 payload_str,
                 to=sid,
             )

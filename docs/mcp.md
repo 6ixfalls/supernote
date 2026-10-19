@@ -61,6 +61,7 @@ params = {
 
 The MCP server exposes specialized "Tools" that LLMs can call to explore your knowledge:
 
+- `list_notebooks`: List active notebooks ordered by most recently updated (supports optional filename substring filtering and limit).
 - `search_notebook_chunks`: Semantic search for content chunks across all notebooks (supports filtering by name and date).
 - `get_notebook_transcript`: Retrieve the full AI-generated transcript or specific page ranges for a notebook.
 

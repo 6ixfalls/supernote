@@ -5,17 +5,29 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from sqlalchemy import select
 
-from supernote.server.config import ServerConfig
+from supernote.server.ai.models.fake.embedding import FakeEmbeddingModel
+from supernote.server.ai.models.fake.ocr import FakeOcrModel
+from supernote.server.ai.models.fake.summary import FakeSummaryModel
+from supernote.server.ai.models.ocr import ConcurrencyLimitedOcrModel
 from supernote.server.constants import CACHE_BUCKET
 from supernote.server.db.models.file import UserFileDO
 from supernote.server.db.models.note_processing import NotePageContentDO, SystemTaskDO
+from supernote.server.db.models.summary import SummaryDO
 from supernote.server.db.session import DatabaseSessionManager
-from supernote.server.events import LocalEventBus, NoteDeletedEvent, NoteUpdatedEvent
+from supernote.server.events import (
+    Event,
+    LocalEventBus,
+    NoteDeletedEvent,
+    NoteProcessingCompletedEvent,
+    NoteUpdatedEvent,
+)
 from supernote.server.services.coordination import SqliteCoordinationService
-from supernote.server.services.gemini import GeminiService
 from supernote.server.services.processor import ProcessorService
 from supernote.server.services.processor_modules import ProcessorModule
+from supernote.server.services.processor_modules.embedding import EmbeddingModule
+from supernote.server.services.processor_modules.ocr import OcrModule
 from supernote.server.services.processor_modules.page_hashing import PageHashingModule
+from supernote.server.services.processor_modules.summary import SummaryModule
 from supernote.server.utils.hashing import get_md5_hash
 from supernote.server.utils.paths import get_page_png_path
 
@@ -160,6 +172,14 @@ async def test_handle_note_deleted_cleanup(
                 file_id=file_id, task_type="OCR", key="page_0", status="COMPLETED"
             )
         )
+        session.add(
+            SummaryDO(
+                user_id=1,
+                file_id=file_id,
+                unique_identifier="summary_delete_test",
+                content="test content",
+            )
+        )
         await session.commit()
 
     # Trigger deletion event
@@ -188,8 +208,18 @@ async def test_handle_note_deleted_cleanup(
             .scalars()
             .all()
         )
+        summaries = (
+            (
+                await session.execute(
+                    select(SummaryDO).where(SummaryDO.file_id == file_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
         assert len(contents) == 0
         assert len(tasks) == 0
+        assert len(summaries) == 0
 
     # Verify Blobs are deleted
     mock_file_service.blob_storage.delete.assert_any_call(
@@ -429,38 +459,28 @@ async def test_page_parallelism(
 async def test_gemini_concurrency_limit() -> None:
     max_concurrency = 2
 
-    # Use patch to avoid actually calling the API
-    with patch("google.genai.Client") as mock_client_cls:
-        service = GeminiService(
-            ServerConfig(
-                gemini_api_key="fake-key", gemini_max_concurrency=max_concurrency
-            )
-        )
-        mock_client = mock_client_cls.return_value
-        service._client = mock_client
+    active_calls = 0
+    max_active_seen = 0
 
-        active_calls = 0
-        max_active_seen = 0
-
-        async def slow_call(*args: object, **kwargs: object) -> MagicMock:
+    class SlowOcrModel(FakeOcrModel):
+        async def extract_text(self, png_data: bytes, prompt: str) -> str:
             nonlocal active_calls, max_active_seen
             active_calls += 1
             max_active_seen = max(max_active_seen, active_calls)
             try:
                 await asyncio.sleep(0.1)
-                return MagicMock()
+                return await super().extract_text(png_data, prompt)
             finally:
                 active_calls -= 1
 
-        mock_client.aio.models.generate_content = AsyncMock(side_effect=slow_call)
+    model = ConcurrencyLimitedOcrModel(SlowOcrModel(), max_concurrency=max_concurrency)
+    tasks = [model.extract_text(b"png", "prompt") for _ in range(4)]
+    await asyncio.gather(*tasks)
 
-        tasks = [service.generate_content("model", "content") for _ in range(4)]
-        await asyncio.gather(*tasks)
-
-        assert max_active_seen == 2, (
-            f"Expected max 2 concurrent calls, saw {max_active_seen}"
-        )
-        assert active_calls == 0
+    assert max_active_seen == 2, (
+        f"Expected max 2 concurrent calls, saw {max_active_seen}"
+    )
+    assert active_calls == 0
 
 
 async def test_processor_pause_resume(
@@ -524,3 +544,228 @@ async def test_processor_pause_resume(
 
         # Cleanup
         await processor_service.stop()
+
+
+async def test_process_file_without_page_modules(
+    processor_service: ProcessorService,
+) -> None:
+    """Verify process_file runs global pre-modules and skips page queries when no page_modules are registered."""
+    hashing = MagicMock(spec=ProcessorModule)
+    hashing.run = AsyncMock(return_value=True)
+
+    processor_service.register_modules(hashing=hashing, png=None)
+    assert processor_service.page_modules == []
+    assert processor_service.global_post_modules == []
+
+    await processor_service.process_file(123)
+    hashing.run.assert_called_once_with(123, processor_service.session_manager)
+
+
+async def test_process_file_publishes_processing_completed_event(
+    processor_service: ProcessorService,
+    session_manager: DatabaseSessionManager,
+    mock_file_service: MagicMock,
+) -> None:
+    """Verify process_file publishes NoteProcessingCompletedEvent when pipeline completes."""
+    file_id = 777
+    async with session_manager.session() as session:
+        session.add(
+            UserFileDO(
+                id=file_id,
+                user_id=7,
+                file_name="Daily.note",
+                storage_key="key",
+                md5="hash",
+            )
+        )
+        await session.commit()
+
+    mock_file_service.get_full_path_by_node = AsyncMock(return_value="Note/Daily.note")
+    hashing = MagicMock(spec=ProcessorModule)
+    hashing.run = AsyncMock(return_value=True)
+    processor_service.register_modules(hashing=hashing, png=None)
+
+    received_events: list[Event] = []
+
+    async def capture_event(event: Event) -> None:
+        received_events.append(event)
+
+    processor_service.event_bus.subscribe(NoteProcessingCompletedEvent, capture_event)
+
+    await processor_service.process_file(file_id)
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert received_events == [
+        NoteProcessingCompletedEvent(
+            file_id=file_id,
+            user_id=7,
+            file_path="Note/Daily.note",
+        )
+    ]
+
+
+async def test_recover_missing_tasks_skips_inactive_files(
+    session_manager: DatabaseSessionManager,
+    processor_service: ProcessorService,
+) -> None:
+    """Verify recover_missing_tasks enqueues active .note files and ignores inactive files."""
+    async with session_manager.session() as session:
+        # Active note with missing tasks
+        session.add(
+            UserFileDO(
+                id=9001,
+                user_id=1,
+                file_name="active.note",
+                storage_key="k1",
+                md5="m1",
+                is_active="Y",
+            )
+        )
+        # Soft-deleted note (in recycle bin)
+        session.add(
+            UserFileDO(
+                id=9002,
+                user_id=1,
+                file_name="deleted.note",
+                storage_key="k2",
+                md5="m2",
+                is_active="N",
+            )
+        )
+        await session.commit()
+
+    await processor_service.recover_missing_tasks()
+
+    assert 9001 in processor_service.processing_files
+    assert 9002 not in processor_service.processing_files
+    assert processor_service.queue.qsize() == 1
+    enqueued = await processor_service.queue.get()
+    assert enqueued == 9001
+
+
+async def test_recover_missing_tasks_backfills_embedding_model_and_ai_modules(
+    session_manager: DatabaseSessionManager,
+    processor_service: ProcessorService,
+    mock_file_service: MagicMock,
+) -> None:
+    """Verify recover_missing_tasks enqueues files needing OCR, embedding, or summary backfill."""
+    processor_service.register_modules(
+        hashing=PageHashingModule(file_service=mock_file_service),
+        png=None,
+        ocr=OcrModule(file_service=mock_file_service, ocr_model=FakeOcrModel()),
+        embedding=EmbeddingModule(
+            file_service=mock_file_service,
+            embedding_model=FakeEmbeddingModel(model_id="new-model"),
+        ),
+        summary=SummaryModule(
+            file_service=mock_file_service,
+            summary_service=MagicMock(),
+            summary_model=FakeSummaryModel(),
+        ),
+    )
+
+    async with session_manager.session() as session:
+        # File 9101: All tasks completed with current model ("new-model") -> should NOT be enqueued
+        # File 9102: Missing OCR_EXTRACTION task -> needs OCR backfill
+        # File 9103: Has EMBEDDING_GENERATION with data="old-model" -> needs embedding backfill
+        # File 9104: Missing SUMMARY_GENERATION task -> needs summary backfill
+        for fid in (9101, 9102, 9103, 9104):
+            session.add(
+                UserFileDO(
+                    id=fid,
+                    user_id=1,
+                    file_name=f"f{fid}.note",
+                    storage_key=f"k{fid}",
+                    md5="m",
+                    is_active="Y",
+                )
+            )
+            session.add(
+                NotePageContentDO(
+                    file_id=fid,
+                    page_index=0,
+                    page_id="p0",
+                    content_hash="h",
+                )
+            )
+            session.add(
+                SystemTaskDO(
+                    file_id=fid,
+                    task_type="HASHING",
+                    key="global",
+                    status="COMPLETED",
+                )
+            )
+
+        session.add_all(
+            [
+                # 9101: Complete for OCR, EMBEDDING ("new-model"), and SUMMARY
+                SystemTaskDO(
+                    file_id=9101,
+                    task_type="OCR_EXTRACTION",
+                    key="page_p0",
+                    status="COMPLETED",
+                ),
+                SystemTaskDO(
+                    file_id=9101,
+                    task_type="EMBEDDING_GENERATION",
+                    key="page_p0",
+                    status="COMPLETED",
+                    data="new-model",
+                ),
+                SystemTaskDO(
+                    file_id=9101,
+                    task_type="SUMMARY_GENERATION",
+                    key="global",
+                    status="COMPLETED",
+                ),
+                # 9102: Missing OCR_EXTRACTION (and EMBEDDING_GENERATION)
+                SystemTaskDO(
+                    file_id=9102,
+                    task_type="SUMMARY_GENERATION",
+                    key="global",
+                    status="COMPLETED",
+                ),
+                # 9103: EMBEDDING_GENERATION completed with old-model
+                SystemTaskDO(
+                    file_id=9103,
+                    task_type="OCR_EXTRACTION",
+                    key="page_p0",
+                    status="COMPLETED",
+                ),
+                SystemTaskDO(
+                    file_id=9103,
+                    task_type="EMBEDDING_GENERATION",
+                    key="page_p0",
+                    status="COMPLETED",
+                    data="old-model",
+                ),
+                SystemTaskDO(
+                    file_id=9103,
+                    task_type="SUMMARY_GENERATION",
+                    key="global",
+                    status="COMPLETED",
+                ),
+                # 9104: Missing SUMMARY_GENERATION
+                SystemTaskDO(
+                    file_id=9104,
+                    task_type="OCR_EXTRACTION",
+                    key="page_p0",
+                    status="COMPLETED",
+                ),
+                SystemTaskDO(
+                    file_id=9104,
+                    task_type="EMBEDDING_GENERATION",
+                    key="page_p0",
+                    status="COMPLETED",
+                    data="new-model",
+                ),
+            ]
+        )
+        await session.commit()
+
+    await processor_service.recover_missing_tasks()
+
+    assert 9101 not in processor_service.processing_files
+    assert {9102, 9103, 9104}.issubset(processor_service.processing_files)

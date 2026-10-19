@@ -60,6 +60,26 @@ unbindEquipment:
             schema:
               $ref: "../components/schemas/common.yaml#/BaseVO"
 
+sendPasswordUnlockCode:
+  post:
+    tags:
+      - Equipment
+    summary: Send Password Unlock Code
+    operationId: sendPasswordUnlockCode
+    security: {}
+    requestBody:
+      content:
+        application/json:
+          schema:
+            $ref: "../components/schemas/equipment.yaml#/PasswordResetCodeDTO"
+    responses:
+      "200":
+        description: Unlock Code Sent
+        content:
+          application/json:
+            schema:
+              $ref: "../components/schemas/equipment.yaml#/PasswordResetCodeVO"
+
 bindStatus:
   post:
     tags:
