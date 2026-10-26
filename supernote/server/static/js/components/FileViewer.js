@@ -1,5 +1,5 @@
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue';
-import { convertNoteToPng, fetchTranscript, fetchSummaries, fetchDownloadUrl, downloadFile } from '../api/client.js';
+import { convertNoteToPng, fetchTranscript, fetchSummaries, fetchDownloadUrl, downloadFile, exportNoteAsPdf } from '../api/client.js';
 import { showToast } from '../composables/useToast.js';
 
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg']);
@@ -18,6 +18,7 @@ export default {
         const isLoading = ref(true);
         const error = ref(null);
         const downloading = ref(false);
+        const exportingPdf = ref(false);
 
         const activeRightTab = ref('transcription'); // 'transcription' | 'insights'
         const isMobileSidePanelOpen = ref(false);
@@ -241,6 +242,18 @@ export default {
             }
         };
 
+        const handleExportPdf = async () => {
+            if (!props.file || fileCategory.value !== 'note' || exportingPdf.value) return;
+            exportingPdf.value = true;
+            try {
+                await exportNoteAsPdf(props.file.id);
+            } catch (e) {
+                showToast("Failed to export PDF: " + e.message);
+            } finally {
+                exportingPdf.value = false;
+            }
+        };
+
         const loadFileContent = async () => {
             if (!props.file) return;
             const seq = ++activeLoadSeq;
@@ -408,6 +421,8 @@ export default {
             error,
             downloading,
             handleDownload,
+            exportingPdf,
+            handleExportPdf,
             formatSize,
             isLoadingTranscript,
             activeRightTab,
@@ -425,7 +440,7 @@ export default {
     template: `
     <div class="bg-slate-100 dark:bg-slate-950 h-[calc(100vh-12rem)] min-h-[540px] rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm flex flex-col overflow-hidden relative transition-colors animate-fade-in">
         <!-- Top Fixed Header -->
-        <div class="flex-none bg-white/90 dark:bg-slate-900/90 backdrop-blur-md p-3.5 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between px-4 sm:px-6 z-20">
+        <div class="flex-none bg-white/90 dark:bg-slate-900/90 backdrop-blur-md p-3.5 border-b border-slate-200 dark:border-slate-800 flex flex-wrap gap-3 items-center justify-between px-4 sm:px-6 z-20">
             <div class="flex items-center space-x-3 min-w-0">
                 <button @click="$emit('close')" class="p-1.5 rounded-lg text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 hover:bg-slate-200/60 dark:hover:bg-slate-800 transition-colors">
                     ← Back
@@ -438,6 +453,11 @@ export default {
                 </div>
             </div>
             <div class="flex items-center gap-2">
+                <button v-if="fileCategory === 'note'" @click="handleExportPdf" :disabled="exportingPdf"
+                    :aria-busy="exportingPdf" title="Export all notebook pages as a PDF"
+                    class="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold transition-colors disabled:opacity-50 disabled:cursor-wait">
+                    <span>{{ exportingPdf ? 'Exporting PDF…' : 'Export PDF' }}</span>
+                </button>
                 <button @click="handleDownload" :disabled="downloading"
                     class="flex items-center gap-1.5 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 rounded-lg text-xs font-semibold transition-colors disabled:opacity-50 disabled:cursor-wait">
                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">

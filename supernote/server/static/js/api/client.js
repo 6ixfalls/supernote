@@ -785,6 +785,39 @@ export async function fetchDownloadUrl(fileId) {
  */
 export async function downloadFile(fileId) {
     const url = await fetchDownloadUrl(fileId);
+    triggerDownload(url);
+}
+
+/** Convert all notebook pages to PDF and download using the signed URL. */
+export async function exportNoteAsPdf(fileId) {
+    const currentToken = getToken();
+    if (!currentToken) throw new Error("Unauthorized");
+
+    const response = await fetch('/api/file/note/to/pdf', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'x-access-token': currentToken
+        },
+        // An empty page list exports the entire notebook, including unpreviewed pages.
+        body: JSON.stringify({ id: fileId, pageNoList: [] })
+    });
+
+    if (!response.ok) {
+        if (response.status === 401) {
+            logout();
+            throw new Error("Unauthorized");
+        }
+        throw new Error(`PDF export failed: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    if (data.success === false) throw new Error(data.errorMsg || "PDF export failed");
+    if (!data.url) throw new Error("No PDF download URL returned");
+    triggerDownload(data.url);
+}
+
+function triggerDownload(url) {
     const link = document.createElement('a');
     link.href = url;
     link.rel = 'noopener';
