@@ -1,3 +1,12 @@
+"""Externalized Markdown prompt loader (`PromptLoader`) and notebook-stem prompt routing.
+
+Loads built-in or user-overridden (`ServerConfig.prompts_dir` / `SUPERNOTE_PROMPTS_DIR`)
+prompts for `ocr` (`PromptId.OCR_TRANSCRIPTION`) and `summary` (`PromptId.SUMMARY_GENERATION`).
+When a notebook is processed, `PromptLoader.get_prompt` combines `common/*.md` with either
+a matching `<notebook_stem>/*.md` directory (e.g. `daily/` for `Daily.note`) or `default/*.md`.
+Used by `supernote.server.ai.prompts`. See `supernote.guides.mcp`.
+"""
+
 import enum
 import importlib.resources
 import logging
@@ -103,6 +112,16 @@ class PromptLoader:
             if file_path.is_file():
                 prompts.append(file_path.read_text(encoding="utf-8").strip())
         return "\n\n".join(prompts)
+
+    def has_custom_prompt(self, prompt_id: PromptId, custom_type: str | None) -> bool:
+        """Return True if a specific custom prompt directory exists for custom_type."""
+        if not custom_type or custom_type in (COMMON, DEFAULT):
+            return False
+        if self._prompts is None:
+            self._load_prompts()
+        assert self._prompts is not None
+        type_map = self._prompts.get(prompt_id, {})
+        return custom_type.lower() in type_map
 
     def get_prompt(self, prompt_id: PromptId, custom_type: str | None = None) -> str:
         """Retrieve a prompt by its ID, optionally overridden by a custom type.

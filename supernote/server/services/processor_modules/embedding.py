@@ -1,3 +1,12 @@
+"""Stage 4 of the `.note` processing pipeline: page vector embedding generation (`TaskType.EMBEDDING_GENERATION`).
+
+`EmbeddingModule` reads the OCR transcript from `NotePageContentDO.text_content`, calls
+`supernote.server.ai.models.embedding.EmbeddingModel.embed` with `EmbeddingTaskType.RETRIEVAL_DOCUMENT`,
+and stores the vector and `model_id` on `NotePageContentDO`. Because `EmbeddingModule.version`
+returns `embedding_model.model_id`, changing `ai.embedding.model` in `ServerConfig`
+automatically triggers background re-embedding of all pages. See `supernote.guides.mcp`.
+"""
+
 import json
 import logging
 
@@ -80,11 +89,18 @@ class EmbeddingModule(ProcessorModule):
         async with session_manager.session() as session:
             content = await get_page_content_by_id(session, file_id, page_id)
 
-            if not content or not content.text_content:
+            if not content or content.is_blank:
+                if content and (
+                    content.embedding is not None or content.embedding_model is not None
+                ):
+                    content.embedding = None
+                    content.embedding_model = None
+                    await session.commit()
                 logger.debug(
                     f"No text content to embed for file {file_id} page {page_id} (idx {page_index})"
                 )
                 return
+            assert content.text_content is not None
             text_content = content.text_content
 
         embedding_values = await self.embedding_model.embed(

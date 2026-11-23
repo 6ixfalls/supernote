@@ -1,9 +1,26 @@
-"""Client for Extended (Web) APIs."""
+"""Self-hosted server intelligence extension client (`ExtendedClient`).
 
+This module provides `supernote.client.extended.ExtendedClient` for querying custom `/api/extended/*`
+endpoints exposed by the self-hosted Supernote server, including hybrid semantic search (`search`),
+OCR page transcripts (`get_transcript`), AI synthesis summaries (`list_summaries`), per-file
+processing status (`get_processing_status`), and global task state (`list_system_tasks`). See
+`supernote.models.extended`, `supernote.client`, and `supernote.guides.note_processing_design`.
+"""
+
+from supernote.models.base import BaseResponse
 from supernote.models.extended import (
+    ApiKeyListResponseVO,
+    CreateApiKeyDTO,
+    CreateApiKeyResponseVO,
     FileProcessingStatusDTO,
     FileProcessingStatusVO,
+    OAuthGrantListResponseVO,
     SystemTaskListVO,
+    WebAiStatusVO,
+    WebNoteCoverRequestDTO,
+    WebNoteCoverVO,
+    WebNoteMetadataRequestDTO,
+    WebNoteMetadataVO,
     WebSearchRequestDTO,
     WebSearchResponseVO,
     WebSummaryListRequestDTO,
@@ -80,4 +97,53 @@ class ExtendedClient:
         """List recent system tasks (Extension)."""
         return await self._client.get_json(
             "/api/extended/system/tasks", SystemTaskListVO
+        )
+
+    async def list_api_keys(self) -> ApiKeyListResponseVO:
+        """List active static Bearer API keys for the current user (Extension)."""
+        return await self._client.get_json("/api/extended/keys", ApiKeyListResponseVO)
+
+    async def create_api_key(
+        self, name: str, expires_in_days: int | None = None
+    ) -> CreateApiKeyResponseVO:
+        """Create a new static Bearer API key (Extension)."""
+        dto = CreateApiKeyDTO(name=name, expires_in_days=expires_in_days)
+        return await self._client.post_json(
+            "/api/extended/keys", CreateApiKeyResponseVO, json=dto.to_dict()
+        )
+
+    async def delete_api_key(self, key_id: str) -> BaseResponse:
+        """Revoke an existing static Bearer API key (Extension)."""
+        return await self._client.delete_json(
+            f"/api/extended/keys/{key_id}", BaseResponse
+        )
+
+    async def list_oauth_grants(self) -> OAuthGrantListResponseVO:
+        """List MCP OAuth clients the current user has authorized (Extension)."""
+        return await self._client.get_json(
+            "/api/extended/oauth/grants", OAuthGrantListResponseVO
+        )
+
+    async def revoke_oauth_grant(self, grant_id: str) -> BaseResponse:
+        """Disconnect an authorized MCP OAuth client (Extension)."""
+        return await self._client.delete_json(
+            f"/api/extended/oauth/grants/{grant_id}", BaseResponse
+        )
+
+    async def get_ai_status(self) -> WebAiStatusVO:
+        """Query server AI processing configuration and status (Extension)."""
+        return await self._client.get_json("/api/extended/ai/status", WebAiStatusVO)
+
+    async def get_note_cover(self, file_id: int) -> WebNoteCoverVO:
+        """Retrieve a single-page cover preview URL for a notebook (Extension)."""
+        dto = WebNoteCoverRequestDTO(file_id=file_id)
+        return await self._client.post_json(
+            "/api/extended/file/note/cover", WebNoteCoverVO, json=dto.to_dict()
+        )
+
+    async def get_note_metadata(self, file_id: int) -> WebNoteMetadataVO:
+        """Retrieve structured notebook and per-page metadata (Extension)."""
+        dto = WebNoteMetadataRequestDTO(file_id=file_id)
+        return await self._client.post_json(
+            "/api/extended/file/note/metadata", WebNoteMetadataVO, json=dto.to_dict()
         )

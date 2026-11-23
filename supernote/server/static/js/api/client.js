@@ -2,10 +2,20 @@
  * API Client for Supernote Backend
  */
 
-let authToken = localStorage.getItem('supernote_token');
+import { getFileExtension, normalizeEpochMs } from '../utils/format.js';
+import { ApiError, apiRequest, getToken, onLogout, setToken } from './http.js';
+
+/** @type {SocketClient | null} */
 let socketInstance = null;
+/** @type {Promise<SocketClient | null> | null} */
+let connectingSocketPromise = null;
+let socketEpoch = 0;
 const SOCKET_IO_KEY = 'K+5xFzxbnB1iSZWqmu3Etw==';
 
+/**
+ * @param {ArrayBuffer} buffer
+ * @returns {string}
+ */
 function arrayBufferToBase64Alnum(buffer) {
     const bytes = new Uint8Array(buffer);
     let binary = '';
@@ -15,762 +25,753 @@ function arrayBufferToBase64Alnum(buffer) {
     return btoa(binary).replace(/[^a-zA-Z0-9]/g, '');
 }
 
+/**
+ * @param {string} token
+ * @param {string} connType
+ * @param {string} randomVal
+ * @returns {Promise<string>}
+ */
 export async function computeSocketSignature(token, connType, randomVal) {
     const raw = `${token}_${connType}_${randomVal}`;
-    if (window.crypto && window.crypto.subtle) {
+    if (window.crypto?.subtle) {
         const enc = new TextEncoder();
         const cryptoKey = await window.crypto.subtle.importKey(
             'raw',
             enc.encode(SOCKET_IO_KEY),
             { name: 'HMAC', hash: 'SHA-256' },
             false,
-            ['sign']
+            ['sign'],
         );
         const sigBuffer = await window.crypto.subtle.sign('HMAC', cryptoKey, enc.encode(raw));
         return arrayBufferToBase64Alnum(sigBuffer);
     }
-    if (window.sha256 && window.sha256.hmac && typeof window.sha256.hmac.arrayBuffer === 'function') {
+    if (typeof window.sha256?.hmac?.arrayBuffer === 'function') {
         const sigBuffer = window.sha256.hmac.arrayBuffer(SOCKET_IO_KEY, raw);
         return arrayBufferToBase64Alnum(sigBuffer);
     }
     throw new Error('HMAC-SHA256 is not available.');
 }
 
+/**
+ * @param {unknown} raw
+ * @returns {Record<string, unknown> | null}
+ */
 function parseSocketPayload(raw) {
     if (!raw) return null;
-    if (typeof raw === 'object') return raw;
+    if (typeof raw === 'object') return /** @type {Record<string, unknown>} */ (raw);
     if (typeof raw === 'string') {
         if (raw === 'true' || raw === 'Received') return null;
         try {
             return JSON.parse(raw);
-        } catch (e) {
+        } catch {
             return null;
         }
     }
     return null;
 }
 
-export async function connectSocket() {
+export function connectSocket() {
     const token = getToken();
-    if (!token || typeof window.io !== 'function') return null;
-    if (socketInstance && socketInstance.connected) return socketInstance;
+    const ioFactory = window.io;
+    if (!token || typeof ioFactory !== 'function') return Promise.resolve(null);
+    if (socketInstance?.connected) return Promise.resolve(socketInstance);
+    if (connectingSocketPromise) return connectingSocketPromise;
+
+    const epoch = ++socketEpoch;
     if (socketInstance) {
         socketInstance.disconnect();
         socketInstance = null;
     }
 
-    try {
-        const connType = 'WEB';
-        const randomVal = String(Date.now());
-        const sign = await computeSocketSignature(token, connType, randomVal);
-        const socket = window.io('/', {
-            path: '/socket.io',
-            query: {
-                token,
-                type: connType,
-                random: randomVal,
-                sign
-            },
-            transports: ['polling', 'websocket']
-        });
-
-        socket.on('ServerMessage', (data) => {
-            const parsed = parseSocketPayload(data);
-            if (!parsed) return;
-            if (String(parsed.code) === '403') {
-                disconnectSocket();
-                return;
+    connectingSocketPromise = (async () => {
+        try {
+            const connType = 'WEB';
+            const randomVal = String(Date.now());
+            const sign = await computeSocketSignature(token, connType, randomVal);
+            if (epoch !== socketEpoch || getToken() !== token) {
+                return null;
             }
-            socket.emit('ClientMessage', 'Received');
-            window.dispatchEvent(new CustomEvent('supernote:file-sync', { detail: parsed }));
-        });
+            const socket = ioFactory('/', {
+                path: '/socket.io',
+                query: {
+                    token,
+                    type: connType,
+                    random: randomVal,
+                    sign,
+                },
+                transports: ['polling', 'websocket'],
+            });
 
-        socket.on('to-do', (data) => {
-            const parsed = parseSocketPayload(data);
-            if (!parsed) return;
-            socket.emit('to-do', 'Received');
-            window.dispatchEvent(new CustomEvent('supernote:task-sync', { detail: parsed }));
-        });
+            socket.on('ServerMessage', (data) => {
+                const parsed = parseSocketPayload(data);
+                if (!parsed) return;
+                if (String(parsed.code) === '403') {
+                    disconnectSocket();
+                    return;
+                }
+                socket.emit('ClientMessage', 'Received');
+                window.dispatchEvent(new CustomEvent('supernote:file-sync', { detail: parsed }));
+            });
 
-        socket.on('digest', (data) => {
-            const parsed = parseSocketPayload(data);
-            if (!parsed) return;
-            socket.emit('digest', 'Received');
-            window.dispatchEvent(new CustomEvent('supernote:digest-sync', { detail: parsed }));
-        });
+            socket.on('to-do', (data) => {
+                const parsed = parseSocketPayload(data);
+                if (!parsed) return;
+                socket.emit('to-do', 'Received');
+                window.dispatchEvent(new CustomEvent('supernote:task-sync', { detail: parsed }));
+            });
 
-        socketInstance = socket;
-        return socket;
-    } catch (e) {
-        console.error('Failed to connect Socket.IO:', e);
-        return null;
-    }
+            socket.on('digest', (data) => {
+                const parsed = parseSocketPayload(data);
+                if (!parsed) return;
+                socket.emit('digest', 'Received');
+                window.dispatchEvent(new CustomEvent('supernote:digest-sync', { detail: parsed }));
+            });
+
+            socketInstance = socket;
+            return socket;
+        } catch (e) {
+            console.error('Failed to connect Socket.IO:', e);
+            return null;
+        } finally {
+            if (epoch === socketEpoch) {
+                connectingSocketPromise = null;
+            }
+        }
+    })();
+
+    return connectingSocketPromise;
 }
 
 export function disconnectSocket() {
+    socketEpoch++;
+    connectingSocketPromise = null;
     if (socketInstance) {
         socketInstance.disconnect();
         socketInstance = null;
     }
 }
 
-export function setToken(token) {
-    authToken = token;
-    localStorage.setItem('supernote_token', token);
-}
+onLogout(disconnectSocket);
 
-export function getToken() {
-    return authToken;
-}
+/**
+ * Secure challenge-response login flow.
+ * @param {string} email
+ * @param {string} password
+ * @returns {Promise<void>}
+ */
+export async function login(email, password) {
+    // Pre-check / wakeup token endpoint (mirrors the CLI client session flow
+    // before starting the challenge-response handshake).
+    await fetch('/api/user/query/token', { method: 'POST', body: '{}' }).catch(() => null);
 
-export async function logout() {
-    const token = authToken;
-    authToken = null;
-    localStorage.removeItem('supernote_token');
-    disconnectSocket();
-    if (token) {
-        try {
-            await fetch('/api/user/logout', {
-                method: 'POST',
-                headers: { 'x-access-token': token },
-                keepalive: true,
-            });
-        } catch (e) {
-            // Ignore network errors during logout
+    // Request login challenge (randomCode + timestamp); surfaces 429 rate-limit errorMsg via ApiError
+    const { randomCode, timestamp } = await apiRequest('/api/official/user/query/random/code', {
+        body: { account: email },
+        requireAuth: false,
+        reloadOnUnauthorized: false,
+        errorPrefix: 'Failed to get login challenge',
+    });
+
+    // Hash password with challenge: SHA256(MD5(password) + randomCode)
+    const md5Password = SparkMD5.hash(password);
+    const sha256Hash = await sha256(md5Password + randomCode);
+
+    // Submit challenge-response credentials
+    let loginData;
+    try {
+        loginData = await apiRequest('/api/official/user/account/login/new', {
+            body: {
+                account: email,
+                password: sha256Hash,
+                timestamp,
+                loginMethod: '2', // Email
+                equipment: 1, // WEB
+            },
+            requireAuth: false,
+            reloadOnUnauthorized: false,
+            errorPrefix: 'Login failed',
+        });
+    } catch (e) {
+        if (e instanceof ApiError && e.status === 401) {
+            throw new Error('Invalid credentials');
         }
+        throw e;
     }
-    window.location.reload();
+
+    if (!loginData?.success || !loginData.token) {
+        throw new Error(loginData?.errorMsg || 'Invalid credentials');
+    }
+    setToken(loginData.token);
 }
 
 /**
- * Secure Login Flow
+ * Submit an OAuth 2.1 consent decision (`approve` or `deny`) to `/login-bridge`
+ * and return the authorized redirect URL.
+ * @param {string} bridgePathWithQuery
+ * @param {'approve' | 'deny'} decision
+ * @returns {Promise<string>}
  */
-export async function login(email, password) {
-    // 1. Wakeup / Get Token (Using query/token endpoint as a pre-check/wakeup)
-    // This step in the CLI client ensures a clean session/CSRF token if needed,
-    // although for the Web API we primarily rely on the random code flow.
-    await fetch('/api/user/query/token', { method: 'POST', body: '{}' });
-
-    // 2. Get Random Code (Challenge)
-    const randomCodeResp = await fetch('/api/official/user/query/random/code', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ account: email })
+export async function submitOAuthBridgeDecision(bridgePathWithQuery, decision) {
+    const data = await apiRequest(bridgePathWithQuery, {
+        body: { decision },
+        headers: { Accept: 'application/json' },
+        reloadOnUnauthorized: false,
+        errorPrefix: 'Authorization failed',
     });
-
-    if (!randomCodeResp.ok) throw new Error("Failed to get login challenge");
-    const { randomCode, timestamp } = await randomCodeResp.json();
-
-    // 3. Hash Password
-    // Schema: SHA256(MD5(password) + randomCode)
-
-    // Step 3a: MD5(password)
-    // Using SparkMD5 global from CDN
-    const md5Password = SparkMD5.hash(password);
-
-    // Step 3b: SHA256(md5Password + randomCode)
-    const contentToHash = md5Password + randomCode;
-    const sha256Hash = await sha256(contentToHash);
-
-    // 4. Authenticate
-    const loginResp = await fetch('/api/official/user/account/login/new', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            account: email,
-            password: sha256Hash,
-            timestamp: timestamp,
-            loginMethod: "2", // Email
-            equipment: 1 // WEB
-        })
-    });
-
-    if (!loginResp.ok) {
-        if (loginResp.status === 401) throw new Error("Invalid credentials");
-        throw new Error("Login failed");
+    if (!data?.redirect_url) {
+        throw new Error('Authorization failed: missing redirect URL');
     }
-
-    const loginData = await loginResp.json();
-    if (!loginData.success) {
-        throw new Error(loginData.errorMsg || "Invalid credentials");
-    }
-    setToken(loginData.token);
-    return loginData;
+    return String(data.redirect_url);
 }
 
-// Helper: SHA-256 using Web Crypto API with fallback for non-secure contexts (e.g. plain HTTP on LAN IP)
+/**
+ * SHA-256 using Web Crypto API with fallback for non-secure contexts (e.g. plain HTTP on LAN IP).
+ * @param {string} message
+ * @returns {Promise<string>}
+ */
 async function sha256(message) {
-    if (window.crypto && window.crypto.subtle) {
+    if (window.crypto?.subtle) {
         const msgBuffer = new TextEncoder().encode(message);
         const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
         const hashArray = Array.from(new Uint8Array(hashBuffer));
-        return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+        return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
     }
     if (typeof window.sha256 === 'function') {
         return window.sha256(message);
     }
-    throw new Error("SHA-256 is not available. Please access via HTTPS/localhost or ensure js-sha256 is loaded.");
+    throw new Error(
+        'SHA-256 is not available. Please access via HTTPS/localhost or ensure js-sha256 is loaded.',
+    );
+}
+
+const DEFAULT_FILE_PAGE_SIZE = 100;
+const MAX_DIRECTORY_PAGES = 100;
+
+/**
+ * @param {Record<string, any>} file
+ * @returns {FileItem}
+ */
+function mapUserFileVO(file) {
+    const isDirectory = file.isFolder === 'Y' || file.isFolder === true || file.isFolder === 1;
+    const ext = isDirectory ? null : getFileExtension(file.fileName) || null;
+    return {
+        id: String(file.id),
+        name: file.fileName,
+        isDirectory,
+        size: file.size,
+        updatedAt: file.updateTime,
+        extension: ext,
+    };
 }
 
 /**
- * Fetch files for a given directory.
+ * @param {string | number} directoryId
+ * @param {number} pageNo
+ * @param {number} pageSize
  */
-export async function fetchFiles(directoryId = "0", pageNo = 1, pageSize = 50) {
-    const headers = {
-        'Content-Type': 'application/json'
-    };
-    if (authToken) {
-        headers['x-access-token'] = authToken;
-    }
-
-    const response = await fetch('/api/file/list/query', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-            directoryId: directoryId, // Pass as string/raw to preserve precision
+function fetchFilesPage(directoryId, pageNo, pageSize) {
+    return apiRequest('/api/file/list/query', {
+        body: {
+            directoryId, // Pass as string/raw to preserve 64-bit VFS ID precision
             pageNo,
             pageSize,
-            order: "filename",
-            sequence: "asc"
-        })
+            order: 'filename',
+            sequence: 'asc',
+        },
+        errorPrefix: 'Failed to fetch files',
     });
+}
 
-    if (!response.ok) {
-        if (response.status === 401) {
-            // If the token is invalid, clear it
-            if (authToken) {
-                logout();
-                throw new Error("Unauthorized");
-            }
-            throw new Error("Unauthorized");
-        }
-        throw new Error(`Failed to fetch files: ${response.statusText}`);
+/**
+ * Fetch all files and folders for a given directory across pages.
+ * @param {string | number} [directoryId='0']
+ * @param {number} [pageSize]
+ * @returns {Promise<FileItem[]>}
+ */
+export async function fetchFiles(directoryId = '0', pageSize = DEFAULT_FILE_PAGE_SIZE) {
+    const firstPage = await fetchFilesPage(directoryId, 1, pageSize);
+    const items = (firstPage.userFileVOList || []).map(mapUserFileVO);
+    const totalPages = Math.min(MAX_DIRECTORY_PAGES, Math.max(1, Number(firstPage.pages) || 1));
+
+    for (let pageNo = 2; pageNo <= totalPages; pageNo++) {
+        const nextPage = await fetchFilesPage(directoryId, pageNo, pageSize);
+        const pageItems = nextPage.userFileVOList || [];
+        if (pageItems.length === 0) break;
+        items.push(...pageItems.map(mapUserFileVO));
     }
 
-    const data = await response.json();
-
-    // Map backend VO to frontend interface
-    return (data.userFileVOList || []).map(file => ({
-        id: file.id,
-        name: file.fileName,
-        isDirectory: file.isFolder === "Y" || file.isFolder === true || file.isFolder === 1,
-        size: file.size,
-        updatedAt: file.updateTime,
-        extension: file.isFolder === "Y" ? null : getExtension(file.fileName)
-    }));
+    return items;
 }
 
 /**
  * Query path and ID path for a file or folder.
- * @param {string|number} nodeId
- * @returns {Promise<{success: boolean, path: string, idPath: string}>}
+ * @param {string | number} nodeId
+ * @returns {Promise<PathInfo>}
  */
 export async function fetchPathInfo(nodeId) {
-    const currentToken = getToken();
-    if (!currentToken) throw new Error("Unauthorized");
-
-    const response = await fetch('/api/file/path/query', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-access-token': currentToken
-        },
-        body: JSON.stringify({ id: String(nodeId) })
+    const data = await apiRequest('/api/file/path/query', {
+        body: { id: String(nodeId) },
+        errorPrefix: 'Path query failed',
     });
-
-    if (!response.ok) {
-        if (response.status === 401) {
-            logout();
-            throw new Error("Unauthorized");
-        }
-        throw new Error(`Path query failed: ${response.statusText}`);
-    }
-
-    return await response.json();
-}
-
-function getExtension(filename) {
-    if (!filename) return null;
-    const parts = filename.split('.');
-    return parts.length > 1 ? parts.pop().toLowerCase() : null;
+    return {
+        path: data?.path || '',
+        idPath: data?.idPath || '',
+    };
 }
 
 /**
- * Convert Note to PNG
+ * Convert Note to PNG pages.
  * @param {string} fileId
- * @returns {Promise<Array<{pageNo: number, url: string}>>}
+ * @returns {Promise<NotePngPage[]>}
  */
 export async function convertNoteToPng(fileId) {
-    // 1. Get Token
-    const currentToken = getToken();
-    if (!currentToken) throw new Error("Unauthorized");
-
-    // 2. Call API
-    const response = await fetch('/api/file/note/to/png', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-access-token': currentToken
-        },
-        body: JSON.stringify({ id: fileId }) // Pass as string to preserve 64-bit precision
+    const data = await apiRequest('/api/file/note/to/png', {
+        body: { id: fileId }, // Pass as string to preserve 64-bit precision
+        errorPrefix: 'Conversion failed',
     });
-
-    if (!response.ok) {
-        if (response.status === 401) {
-            logout();
-            throw new Error("Unauthorized");
-        }
-        throw new Error(`Conversion failed: ${response.statusText}`);
-    }
-
-    const data = await response.json();
     return data.pngPageVOList || [];
 }
 
 /**
+ * Normalize raw transcript page entries into canonical `TranscriptPage` objects.
+ * @param {unknown} rawPages
+ * @returns {TranscriptPage[]}
+ */
+export function normalizeTranscriptPages(rawPages) {
+    if (!Array.isArray(rawPages)) return [];
+    return rawPages.map((p, idx) => ({
+        pageIndex:
+            typeof p.pageIndex === 'number'
+                ? p.pageIndex
+                : typeof p.page_index === 'number'
+                  ? p.page_index
+                  : idx,
+        pageId: String(p.pageId || p.page_id || `page-${idx}`),
+        text: p.text ?? '',
+        date: p.date || null,
+    }));
+}
+
+/**
  * Fetch per-page OCR transcripts for a notebook file.
- * @param {string|number} fileId
- * @returns {Promise<Array<{pageIndex: number, pageId: string, text: string|null, date: string|null}>>}
+ * @param {string | number} fileId
+ * @returns {Promise<TranscriptPage[]>}
  */
 export async function fetchTranscript(fileId) {
-    const currentToken = getToken();
-    if (!currentToken) throw new Error("Unauthorized");
-
-    const response = await fetch('/api/extended/transcript', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-access-token': currentToken
-        },
-        body: JSON.stringify({ fileId: String(fileId) })
+    const data = await apiRequest('/api/extended/transcript', {
+        body: { fileId: String(fileId) },
+        fallbackValue: null,
     });
-
-    if (response.status === 401) {
-        logout();
-        throw new Error("Unauthorized");
-    }
-
-    if (!response.ok) return [];
-    const data = await response.json();
-    return Array.isArray(data.pages) ? data.pages : [];
+    return normalizeTranscriptPages(data?.pages);
 }
 
 /**
- * Fetch summaries for a file
- * @param {string} fileId
- * @returns {Promise<Array<Object>>}
+ * Fetch synthesized non-OCR summaries for a notebook file.
+ * @param {string | number} fileId
+ * @returns {Promise<NoteSummary[]>}
  */
 export async function fetchSummaries(fileId) {
-    const currentToken = getToken();
-    if (!currentToken) throw new Error("Unauthorized");
-
-    const response = await fetch('/api/extended/file/summary/list', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-access-token': currentToken
-        },
-        // Extension endpoint expects { fileId: ... }
-        body: JSON.stringify({ fileId: String(fileId) })
+    const data = await apiRequest('/api/extended/file/summary/list', {
+        // Extended endpoint expects { fileId } rather than official { id }
+        body: { fileId: String(fileId) },
+        errorPrefix: 'Summary fetch failed',
     });
-
-    if (!response.ok) {
-        if (response.status === 401) {
-            logout();
-            throw new Error("Unauthorized");
-        }
-        throw new Error(`Summary fetch failed: ${response.statusText}`);
-    }
-
-    const data = await response.json();
-    return data.summaryDOList || [];
+    /** @type {Array<Record<string, any>>} */
+    const rawList = Array.isArray(data?.summaryDOList) ? data.summaryDOList : [];
+    return rawList
+        .filter(
+            (s) => s.isSummaryGroup !== 'Y' && String(s.dataSource || '').toUpperCase() !== 'OCR',
+        )
+        .map((s, idx) => ({
+            id: String(s.id ?? s.uniqueIdentifier ?? idx),
+            name: s.name || null,
+            content: s.content || '',
+            dataSource: s.dataSource || null,
+        }));
 }
 
 /**
- * Search files by keyword.
+ * Search files and folders by keyword and map `EntriesVO` payloads into `SearchFileMatch` items.
+ * @param {string} keyword
+ * @returns {Promise<SearchFileMatch[]>}
  */
 export async function searchFiles(keyword) {
-    const currentToken = getToken();
-    if (!currentToken) throw new Error("Unauthorized");
-
-    const response = await fetch('/api/file/label/list/search', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-access-token': currentToken
-        },
-        body: JSON.stringify({ keyword })
+    const data = await apiRequest('/api/file/label/list/search', {
+        body: { keyword },
+        fallbackValue: null,
     });
-
-    if (!response.ok) return [];
-    const data = await response.json();
-    return data.entries || [];
+    /** @type {Array<Record<string, any>>} */
+    const entries = Array.isArray(data?.entries) ? data.entries : [];
+    return entries.map((f) => {
+        const fileName = String(f.name || f.fileName || '');
+        const isDirectory = f.tag === 'folder' || Boolean(f.isDirectory);
+        const ext = isDirectory ? null : getFileExtension(fileName) || null;
+        return {
+            id: String(f.id),
+            name: fileName,
+            path: String(f.path_display || f.parent_path || fileName),
+            isDirectory,
+            size: typeof f.size === 'number' ? f.size : 0,
+            updatedAt: f.lastUpdateTime || 0,
+            extension: ext,
+        };
+    });
 }
 
 /**
  * Perform semantic vector search across notebook embeddings.
+ * @param {string} query
+ * @param {number} [topN=5]
+ * @returns {Promise<SemanticSearchMatch[]>}
  */
 export async function searchSemantic(query, topN = 5) {
-    const currentToken = getToken();
-    if (!currentToken) throw new Error("Unauthorized");
-
-    const response = await fetch('/api/extended/search', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-access-token': currentToken
-        },
-        body: JSON.stringify({ query, top_n: topN })
+    const data = await apiRequest('/api/extended/search', {
+        body: { query, topN },
+        fallbackValue: null,
     });
-
-    if (!response.ok) return [];
-    const data = await response.json();
-    return data.results || [];
+    /** @type {Array<Record<string, any>>} */
+    const rawResults = Array.isArray(data?.results) ? data.results : [];
+    return rawResults.map((r, idx) => {
+        const fileId = String(r.fileId ?? r.file_id ?? '');
+        const fileName = String(r.fileName ?? r.file_name ?? `Notebook ${fileId}`);
+        const pageIndex =
+            typeof r.pageIndex === 'number'
+                ? r.pageIndex
+                : typeof r.page_index === 'number'
+                  ? r.page_index
+                  : 0;
+        const extension = getFileExtension(fileName) || 'note';
+        return {
+            key: String(r.pageId ?? r.page_id ?? `${fileId}-${pageIndex}-${idx}`),
+            fileId,
+            fileName,
+            extension,
+            pageIndex,
+            pageNumber: pageIndex + 1,
+            score: typeof r.score === 'number' ? r.score : 0,
+            textPreview: String(r.textPreview ?? r.text_preview ?? ''),
+            date: r.date || null,
+        };
+    });
 }
 
+/** @type {AiStatus} */
+const DEFAULT_AI_STATUS = {
+    hasApiKey: false,
+    ocrEnabled: false,
+    ocrModel: null,
+    summaryEnabled: false,
+    summaryModel: null,
+    vectorSearchEnabled: false,
+    embeddingModel: null,
+    model: null,
+};
+
 /**
- * Fetch AI Processing Status & Gemini API Key health.
+ * Fetch server AI processing configuration status.
+ * @returns {Promise<AiStatus>}
  */
 export async function fetchAiStatus() {
-    const currentToken = getToken();
-    const headers = { 'Content-Type': 'application/json' };
-    if (currentToken) headers['x-access-token'] = currentToken;
-
-    const response = await fetch('/api/extended/ai/status', {
+    const data = await apiRequest('/api/extended/ai/status', {
         method: 'GET',
-        headers
+        requireAuth: false,
+        fallbackValue: null,
     });
-
-    if (!response.ok) {
-        return { hasApiKey: false, ocrEnabled: false, vectorSearchEnabled: false, model: 'N/A' };
-    }
-    return await response.json();
+    if (!data) return { ...DEFAULT_AI_STATUS };
+    return {
+        hasApiKey: Boolean(data.hasApiKey),
+        ocrEnabled: Boolean(data.ocrEnabled),
+        ocrModel: data.ocrModel ?? null,
+        summaryEnabled: Boolean(data.summaryEnabled),
+        summaryModel: data.summaryModel ?? null,
+        vectorSearchEnabled: Boolean(data.vectorSearchEnabled),
+        embeddingModel: data.embeddingModel ?? null,
+        model: data.model ?? null,
+    };
 }
 
 /**
- * Fetch system tasks (Extended API).
- * @returns {Promise<Object>} The system task list response.
+ * Fetch recent background system tasks (Extended API).
+ * @returns {Promise<SystemTaskItem[]>}
  */
 export async function fetchSystemTasks() {
-    const currentToken = getToken();
-    if (!currentToken) throw new Error("Unauthorized");
-
-    const response = await fetch('/api/extended/system/tasks', {
+    const data = await apiRequest('/api/extended/system/tasks', {
         method: 'GET',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-access-token': currentToken
-        }
+        errorPrefix: 'Failed to fetch system tasks',
     });
-
-    if (response.status === 401) {
-        logout();
-        throw new Error("Unauthorized");
-    }
-
-    if (!response.ok) {
-        throw new Error(`Failed to fetch system tasks: ${response.statusText}`);
-    }
-
-    return await response.json();
+    return Array.isArray(data?.tasks) ? data.tasks : [];
 }
 
 /**
  * Fetch storage capacity/quota.
- * @returns {Promise<{usedCapacity: number, totalCapacity: number}>}
+ * @returns {Promise<CapacityInfo>}
  */
-export async function fetchCapacity() {
-    const currentToken = getToken();
-    if (!currentToken) throw new Error("Unauthorized");
-
-    const response = await fetch('/api/file/capacity/query', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-access-token': currentToken
-        },
-        body: JSON.stringify({})
+export function fetchCapacity() {
+    return apiRequest('/api/file/capacity/query', {
+        body: {},
+        errorPrefix: 'Failed to fetch capacity',
     });
-
-    if (response.status === 401) {
-        logout();
-        throw new Error("Unauthorized");
-    }
-
-    if (!response.ok) {
-        throw new Error(`Failed to fetch capacity: ${response.statusText}`);
-    }
-
-    return await response.json();
 }
 
 /**
  * Create a new folder.
+ * @param {string | number} directoryId
+ * @param {string} folderName
+ * @returns {Promise<void>}
  */
 export async function createFolder(directoryId, folderName) {
-    const currentToken = getToken();
-    if (!currentToken) throw new Error("Unauthorized");
-
-    const response = await fetch('/api/file/folder/add', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-access-token': currentToken
-        },
-        body: JSON.stringify({
-            directoryId: directoryId,
-            fileName: folderName
-        })
+    await apiRequest('/api/file/folder/add', {
+        body: { directoryId, fileName: folderName },
+        errorPrefix: 'Failed to create folder',
     });
-
-    if (!response.ok) {
-        throw new Error(`Failed to create folder: ${response.statusText}`);
-    }
-
-    return await response.json();
 }
 
 /**
  * Delete items (files or folders).
+ * @param {string | number} directoryId
+ * @param {Array<string | number>} idList
+ * @returns {Promise<void>}
  */
 export async function deleteItems(directoryId, idList) {
-    const currentToken = getToken();
-    if (!currentToken) throw new Error("Unauthorized");
-
-    const response = await fetch('/api/file/delete', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-access-token': currentToken
-        },
-        body: JSON.stringify({
-            directoryId: directoryId,
-            idList: idList
-        })
+    await apiRequest('/api/file/delete', {
+        body: { directoryId, idList },
+        errorPrefix: 'Failed to delete items',
     });
+}
 
-    if (!response.ok) {
-        throw new Error(`Failed to delete items: ${response.statusText}`);
+/**
+ * @param {Record<string, any>} item
+ * @returns {RecycleItem}
+ */
+function mapRecycleFileVO(item) {
+    const isDirectory = item.isFolder === 'Y' || item.isFolder === true || item.isFolder === 1;
+    const name = String(item.fileName || '');
+    const ext = isDirectory ? null : getFileExtension(name) || null;
+    return {
+        id: String(item.fileId),
+        name,
+        isDirectory,
+        size: Number(item.size) || 0,
+        deletedAt: normalizeEpochMs(item.updateTime),
+        extension: ext,
+    };
+}
+
+/**
+ * @param {number} pageNo
+ * @param {number} pageSize
+ */
+function fetchRecycleBinPage(pageNo, pageSize) {
+    return apiRequest('/api/file/recycle/list/query', {
+        body: {
+            order: 'time',
+            sequence: 'desc',
+            pageNo,
+            pageSize,
+        },
+        errorPrefix: 'Failed to fetch recycle bin',
+    });
+}
+
+/**
+ * Fetch all soft-deleted items in the Recycle Bin across pages.
+ * @param {number} [pageSize]
+ * @returns {Promise<RecycleItem[]>}
+ */
+export async function fetchRecycleBin(pageSize = DEFAULT_FILE_PAGE_SIZE) {
+    const firstPage = await fetchRecycleBinPage(1, pageSize);
+    const items = (firstPage.recycleFileVOList || []).map(mapRecycleFileVO);
+    const total = Number(firstPage.total) || items.length;
+    const totalPages = Math.min(MAX_DIRECTORY_PAGES, Math.max(1, Math.ceil(total / pageSize)));
+
+    for (let pageNo = 2; pageNo <= totalPages; pageNo++) {
+        const nextPage = await fetchRecycleBinPage(pageNo, pageSize);
+        const pageItems = nextPage.recycleFileVOList || [];
+        if (pageItems.length === 0) break;
+        items.push(...pageItems.map(mapRecycleFileVO));
     }
 
-    return await response.json();
+    return items;
+}
+
+/**
+ * Restore soft-deleted items from the Recycle Bin.
+ * @param {Array<string | number>} idList
+ * @returns {Promise<void>}
+ */
+export async function revertRecycleItems(idList) {
+    await apiRequest('/api/file/recycle/revert', {
+        body: { idList: idList.map(String) },
+        errorPrefix: 'Failed to restore items',
+    });
+}
+
+/**
+ * Permanently delete specific items from the Recycle Bin.
+ * @param {Array<string | number>} idList
+ * @returns {Promise<void>}
+ */
+export async function deleteRecycleItems(idList) {
+    await apiRequest('/api/file/recycle/delete', {
+        body: { idList: idList.map(String) },
+        errorPrefix: 'Failed to permanently delete items',
+    });
+}
+
+/**
+ * Permanently empty all items in the Recycle Bin.
+ * @returns {Promise<void>}
+ */
+export async function clearRecycleBin() {
+    await apiRequest('/api/file/recycle/clear', {
+        body: {},
+        errorPrefix: 'Failed to empty recycle bin',
+    });
 }
 
 /**
  * Move items to a new directory.
+ * @param {Array<string | number>} idList
+ * @param {string | number} targetDirectoryId
+ * @returns {Promise<void>}
  */
 export async function moveItems(idList, targetDirectoryId) {
-    const currentToken = getToken();
-    if (!currentToken) throw new Error("Unauthorized");
-
-    const response = await fetch('/api/file/move', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-access-token': currentToken
+    await apiRequest('/api/file/move', {
+        body: {
+            idList,
+            directoryId: '0', // Not strictly required for move, included for official DTO compliance
+            goDirectoryId: targetDirectoryId,
         },
-        body: JSON.stringify({
-            idList: idList,
-            directoryId: "0", // Not strictly required for move but good for DTO compliance if needed
-            goDirectoryId: targetDirectoryId
-        })
+        errorPrefix: 'Failed to move items',
     });
-
-    if (!response.ok) {
-        throw new Error(`Failed to move items: ${response.statusText}`);
-    }
-
-    return await response.json();
 }
 
 /**
  * Rename an item.
+ * @param {string | number} id
+ * @param {string} newName
+ * @returns {Promise<void>}
  */
 export async function renameItem(id, newName) {
-    const currentToken = getToken();
-    if (!currentToken) throw new Error("Unauthorized");
-
-    const response = await fetch('/api/file/rename', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-access-token': currentToken
-        },
-        body: JSON.stringify({
-            id: id,
-            newName: newName
-        })
+    await apiRequest('/api/file/rename', {
+        body: { id, newName },
+        errorPrefix: 'Failed to rename item',
     });
-
-    if (!response.ok) {
-        throw new Error(`Failed to rename item: ${response.statusText}`);
-    }
-
-    return await response.json();
 }
 
 /**
- * File Upload: Step 1 - Apply
+ * File Upload: Apply for signed OSS upload URL.
+ * @param {string | number} directoryId
+ * @param {string} fileName
+ * @param {number} size
+ * @param {string} md5
+ * @returns {Promise<{ fullUploadUrl: string, innerName: string }>}
  */
-async function uploadApply(directoryId, fileName, size, md5) {
-    const currentToken = getToken();
-    if (!currentToken) throw new Error("Unauthorized");
-
-    const response = await fetch('/api/file/upload/apply', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-access-token': currentToken
-        },
-        body: JSON.stringify({
-            directoryId: directoryId,
-            fileName: fileName,
-            size: size,
-            md5: md5
-        })
+function uploadApply(directoryId, fileName, size, md5) {
+    return apiRequest('/api/file/upload/apply', {
+        body: { directoryId, fileName, size, md5 },
+        errorPrefix: 'Upload apply failed',
     });
-
-    if (!response.ok) {
-        throw new Error(`Upload apply failed: ${response.statusText}`);
-    }
-
-    return await response.json();
 }
 
 /**
- * File Upload: Step 2 - Finish
+ * File Upload: Commit uploaded blob in VFS.
+ * @param {string | number} directoryId
+ * @param {string} fileName
+ * @param {number} size
+ * @param {string} md5
+ * @param {string} innerName
+ * @returns {Promise<void>}
  */
 async function uploadFinish(directoryId, fileName, size, md5, innerName) {
-    const currentToken = getToken();
-    if (!currentToken) throw new Error("Unauthorized");
-
-    const response = await fetch('/api/file/upload/finish', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-access-token': currentToken
-        },
-        body: JSON.stringify({
-            directoryId: directoryId,
-            fileName: fileName,
+    await apiRequest('/api/file/upload/finish', {
+        body: {
+            directoryId,
+            fileName,
             fileSize: size,
-            md5: md5,
-            innerName: innerName,
-            type: "2" // CLOUD
-        })
+            md5,
+            innerName,
+            type: '2', // CLOUD
+        },
+        errorPrefix: 'Upload finish failed',
     });
-
-    if (!response.ok) {
-        throw new Error(`Upload finish failed: ${response.statusText}`);
-    }
-
-    return await response.json();
 }
 
 /**
  * Upload a file (orchestrates apply, put, and finish).
+ * @param {string | number} directoryId
+ * @param {File} file
+ * @returns {Promise<void>}
  */
-export async function uploadFile(directoryId, file, onProgress) {
-    // 1. Calculate MD5 (optional but good for finish)
+export async function uploadFile(directoryId, file) {
+    // Calculate MD5 digest used for apply/finish integrity verification
     const md5 = await calculateFileMd5(file);
 
-    // 2. Apply
-    const applyData = await uploadApply(directoryId, file.name, file.size, md5);
-    const { fullUploadUrl, innerName } = applyData;
+    // Apply for signed OSS upload URL
+    const { fullUploadUrl, innerName } = await uploadApply(directoryId, file.name, file.size, md5);
 
-    // 3. POST/PUT file to blob storage as multipart
-    // We use FormData to ensure the server receives a multipart request.
+    // Upload binary to blob storage as multipart FormData
     const formData = new FormData();
     formData.append('file', file);
 
     const uploadResp = await fetch(fullUploadUrl, {
-        method: 'POST', // Both POST and PUT are supported by our oss.py handle_oss_upload
+        method: 'POST', // Both POST and PUT are supported by oss.py handle_oss_upload
         body: formData,
-        // Note: Do NOT set Content-Type header; fetch will set it with the correct boundary
+        // Note: Do NOT set Content-Type header; fetch sets it with the multipart boundary
     });
 
     if (!uploadResp.ok) {
         throw new Error(`File binary upload failed: ${uploadResp.statusText}`);
     }
 
-    // 4. Finish
-    return await uploadFinish(directoryId, file.name, file.size, md5, innerName);
+    // Commit uploaded blob into the VFS
+    await uploadFinish(directoryId, file.name, file.size, md5, innerName);
 }
 
 /**
- * Helper to calculate file MD5.
+ * @param {Blob} file
+ * @returns {Promise<string>}
  */
 function calculateFileMd5(file) {
     return new Promise((resolve, reject) => {
         const reader = new FileReader();
-        reader.onload = (e) => {
-            const hash = SparkMD5.ArrayBuffer.hash(e.target.result);
+        reader.onload = () => {
+            if (!(reader.result instanceof ArrayBuffer)) {
+                reject(new Error('Expected ArrayBuffer from FileReader'));
+                return;
+            }
+            const hash = SparkMD5.ArrayBuffer.hash(reader.result);
             resolve(hash);
         };
         reader.onerror = reject;
         reader.readAsArrayBuffer(file);
     });
 }
+
 /**
- * Fetch processing status for a list of files.
- * @param {Array<number>} fileIds
- * @returns {Promise<{success: boolean, statusMap: Object}>}
+ * Fetch processing status map (`fileId -> status`) for a list of files.
+ * @param {Array<string | number>} fileIds
+ * @returns {Promise<Record<string, ProcessingStatus>>}
  */
 export async function fetchProcessingStatus(fileIds) {
-    const currentToken = getToken();
-    if (!currentToken) throw new Error("Unauthorized");
-
-    const response = await fetch('/api/extended/file/processing/status', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-access-token': currentToken
-        },
-        body: JSON.stringify({ fileIds: fileIds })
+    const data = await apiRequest('/api/extended/file/processing/status', {
+        body: { fileIds: fileIds.map(String) },
+        errorPrefix: 'Failed to fetch processing status',
     });
-
-    if (response.status === 401) {
-        logout();
-        throw new Error("Unauthorized");
-    }
-
-    if (!response.ok) {
-        throw new Error(`Failed to fetch processing status: ${response.statusText}`);
-    }
-
-    const data = await response.json();
-    return {
-        success: true,
-        statusMap: data.statusMap
-    };
+    return data?.statusMap || {};
 }
 
 /**
  * Get a signed download URL for a stored file.
+ * @param {string | number} fileId
+ * @returns {Promise<string>}
  */
 export async function fetchDownloadUrl(fileId) {
-    const currentToken = getToken();
-    if (!currentToken) throw new Error("Unauthorized");
-
-    const response = await fetch('/api/file/download/url', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-access-token': currentToken
-        },
-        body: JSON.stringify({ id: fileId })
+    const data = await apiRequest('/api/file/download/url', {
+        body: { id: fileId },
+        errorPrefix: 'Download failed',
     });
-
-    if (!response.ok) {
-        if (response.status === 401) {
-            logout();
-            throw new Error("Unauthorized");
-        }
-        throw new Error(`Download failed: ${response.statusText}`);
-    }
-
-    const data = await response.json();
-    if (!data.url) throw new Error("No download URL returned");
+    if (!data.url) throw new Error('No download URL returned');
     return data.url;
 }
 
@@ -782,41 +783,29 @@ export async function fetchDownloadUrl(fileId) {
  * way the browser streams it to disk with a progress bar and the server never
  * holds it in memory. The signature carries the identity, so no header is
  * needed on the request that actually moves the file.
+ *
+ * @param {string | number} fileId
  */
 export async function downloadFile(fileId) {
     const url = await fetchDownloadUrl(fileId);
     triggerDownload(url);
 }
 
-/** Convert all notebook pages to PDF and download using the signed URL. */
+/**
+ * Convert all notebook pages to PDF and download using the signed URL.
+ * @param {string | number} fileId
+ */
 export async function exportNoteAsPdf(fileId) {
-    const currentToken = getToken();
-    if (!currentToken) throw new Error("Unauthorized");
-
-    const response = await fetch('/api/file/note/to/pdf', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-access-token': currentToken
-        },
-        // An empty page list exports the entire notebook, including unpreviewed pages.
-        body: JSON.stringify({ id: fileId, pageNoList: [] })
+    const data = await apiRequest('/api/file/note/to/pdf', {
+        body: { id: String(fileId), pageNoList: [] },
+        errorPrefix: 'PDF export failed',
     });
-
-    if (!response.ok) {
-        if (response.status === 401) {
-            logout();
-            throw new Error("Unauthorized");
-        }
-        throw new Error(`PDF export failed: ${response.statusText}`);
-    }
-
-    const data = await response.json();
-    if (data.success === false) throw new Error(data.errorMsg || "PDF export failed");
-    if (!data.url) throw new Error("No PDF download URL returned");
+    if (data?.success === false) throw new Error(data.errorMsg || 'PDF export failed');
+    if (!data?.url) throw new Error('No PDF download URL returned');
     triggerDownload(data.url);
 }
 
+/** @param {string} url */
 function triggerDownload(url) {
     const link = document.createElement('a');
     link.href = url;
@@ -824,4 +813,97 @@ function triggerDownload(url) {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+}
+
+/**
+ * Fetch a lightweight single-page cover preview URL (page 0) for a notebook.
+ * @param {string | number} fileId
+ * @returns {Promise<string | null>}
+ */
+export async function fetchNoteCover(fileId) {
+    const data = await apiRequest('/api/extended/file/note/cover', {
+        body: { fileId: String(fileId) },
+        fallbackValue: null,
+    });
+    return data?.url || null;
+}
+
+/**
+ * Fetch structural and per-page metadata for a .note file.
+ * @param {string | number} fileId
+ * @returns {Promise<NoteMetadata | null>}
+ */
+export function fetchNoteMetadata(fileId) {
+    return apiRequest('/api/extended/file/note/metadata', {
+        body: { fileId: String(fileId) },
+        fallbackValue: null,
+    });
+}
+
+/**
+ * List MCP OAuth clients the user has authorized.
+ * @returns {Promise<OAuthGrant[]>}
+ */
+export async function fetchOAuthGrants() {
+    const data = await apiRequest('/api/extended/oauth/grants', {
+        method: 'GET',
+        errorPrefix: 'Failed to load connected clients',
+    });
+    return Array.isArray(data?.grants) ? data.grants : [];
+}
+
+/**
+ * Disconnect an MCP OAuth client, ending its access and refresh tokens.
+ * @param {string} grantId
+ * @returns {Promise<void>}
+ */
+export async function revokeOAuthGrant(grantId) {
+    await apiRequest(`/api/extended/oauth/grants/${encodeURIComponent(grantId)}`, {
+        method: 'DELETE',
+        errorPrefix: 'Failed to disconnect client',
+    });
+}
+
+/**
+ * List the user's static Bearer API keys.
+ * @returns {Promise<ApiKeyInfo[]>}
+ */
+export async function fetchApiKeys() {
+    const data = await apiRequest('/api/extended/keys', {
+        method: 'GET',
+        errorPrefix: 'Failed to load API keys',
+    });
+    return Array.isArray(data?.keys) ? data.keys : [];
+}
+
+/**
+ * Create a static Bearer API key. The raw `key` is only ever returned here.
+ * @param {string} name
+ * @param {number | null} [expiresInDays=null]
+ * @returns {Promise<CreatedApiKey>}
+ */
+export async function createApiKey(name, expiresInDays = null) {
+    const data = await apiRequest('/api/extended/keys', {
+        body: { name, expiresInDays },
+        errorPrefix: 'Failed to create API key',
+    });
+    return {
+        id: data.id,
+        name: data.name,
+        key: data.key,
+        createdAt: data.createdAt,
+        expiresAt: data.expiresAt ?? null,
+    };
+}
+
+/**
+ * Revoke a static Bearer API key.
+ * @param {string} keyId
+ * @returns {Promise<void>}
+ */
+export async function revokeApiKey(keyId) {
+    await apiRequest(`/api/extended/keys/${encodeURIComponent(keyId)}`, {
+        method: 'DELETE',
+        errorPrefix: 'Failed to revoke API key',
+    });
 }

@@ -1,12 +1,25 @@
+"""Content-addressable blob storage interface and local filesystem implementation.
+
+Defines the abstract `BlobStorage` interface and `LocalBlobStorage`, which stores
+immutable user files (`USER_DATA_BUCKET`) and derived cache artifacts (`CACHE_BUCKET`)
+under `<storage_dir>/<bucket>/<key[:2]>/<key>`. Writes are staged to `<storage_dir>/temp`
+and atomically renamed on completion, while expired `.tmp` staging files and abandoned
+`.part.N` multipart upload chunks are periodically reclaimed.
+
+Used by `supernote.server.services.file.FileService`, `supernote.server.routes.oss`,
+and `supernote.server.services.integrity.IntegrityService`.
+"""
+
 import asyncio
 import hashlib
 import logging
 import os
 import secrets
+import shutil
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,6 +33,7 @@ logger = logging.getLogger(__name__)
 TEMP_FILE_TTL_SECONDS = 86400.0  # 24 hours
 CLEANUP_INTERVAL_SECONDS = 3600.0  # Run opportunistic cleanup at most once per hour
 STREAM_CHUNK_SIZE = 1024 * 1024  # 1 MB chunks to minimize aiofiles thread-pool hops
+MIN_BLOB_KEY_LENGTH = 3
 
 
 def _compute_file_md5(path: Path) -> str:
@@ -95,8 +109,17 @@ class BlobStorage(ABC):
         """Get physical path to the blob (optional, useful for serving files)."""
 
     @abstractmethod
-    async def list_blobs(self, bucket: str) -> list[str]:
+    async def list_blobs(self, bucket: str, prefix: str | None = None) -> list[str]:
         """Return sorted logical keys of all stored blobs in the given bucket.
+
+        When `prefix` is provided (minimum 3 characters), only keys starting
+        with `prefix` are returned. Excludes temporary staging files and
+        unmerged multipart `.part.N` chunks.
+        """
+
+    @abstractmethod
+    async def list_blob_sizes(self, bucket: str) -> list[tuple[str, int]]:
+        """Return sorted `(key, size_bytes)` pairs for all stored blobs in `bucket`.
 
         Excludes temporary staging files and unmerged multipart `.part.N` chunks.
         """
@@ -104,6 +127,10 @@ class BlobStorage(ABC):
     @abstractmethod
     async def cleanup(self) -> CleanupStats:
         """Remove expired temporary staging files and abandoned upload chunks."""
+
+    @abstractmethod
+    def get_available_bytes(self) -> int | None:
+        """Return available free bytes on the storage backend, or None if unbounded/unknown."""
 
 
 class LocalBlobStorage(BlobStorage):
@@ -118,9 +145,17 @@ class LocalBlobStorage(BlobStorage):
         self.root.mkdir(parents=True, exist_ok=True)
         self._last_cleanup = time.time()
 
+    def get_available_bytes(self) -> int | None:
+        """Return available free bytes on the filesystem backing storage_root."""
+        try:
+            return shutil.disk_usage(self.root).free
+        except OSError as err:
+            logger.warning("Failed to query disk usage for %s: %s", self.root, err)
+            return None
+
     def _get_path(self, bucket: str, key: str) -> Path:
         """Get physical path to the blob."""
-        if len(key) < 3:
+        if len(key) < MIN_BLOB_KEY_LENGTH:
             raise ValueError(f"Invalid blob path: {bucket}/{key}")
         clean_bucket = Path(bucket).name
         prefix_dir = (self.root / clean_bucket / key[:2]).resolve()
@@ -242,29 +277,84 @@ class LocalBlobStorage(BlobStorage):
         """Get physical path to the blob."""
         return self._get_path(bucket, key)
 
-    async def list_blobs(self, bucket: str) -> list[str]:
+    @staticmethod
+    def _validate_prefix(bucket: str, prefix: str) -> None:
+        if (
+            len(prefix) < MIN_BLOB_KEY_LENGTH
+            or prefix.startswith("/")
+            or "\\" in prefix
+            or prefix[:2].rstrip("/") in {"", ".", ".."}
+            or any(part in {".", ".."} for part in prefix.split("/"))
+        ):
+            raise ValueError(f"Invalid blob prefix: {bucket}/{prefix}")
+
+    async def list_blobs(self, bucket: str, prefix: str | None = None) -> list[str]:
         """Return sorted logical keys of all stored blobs in the given bucket."""
-        return await asyncio.to_thread(self._list_blobs_sync, bucket)
+        if prefix is not None:
+            self._validate_prefix(bucket, prefix)
+        return await asyncio.to_thread(self._list_blobs_sync, bucket, prefix)
 
-    def _list_blobs_sync(self, bucket: str) -> list[str]:
-        clean_bucket = Path(bucket).name
-        bucket_dir = (self.root / clean_bucket).resolve()
-        if not bucket_dir.is_relative_to(self.root) or not bucket_dir.is_dir():
-            return []
+    def _list_blobs_sync(self, bucket: str, prefix: str | None = None) -> list[str]:
+        return sorted(key for key, _ in self._iter_bucket_files(bucket, prefix))
 
-        keys: list[str] = []
-        for shard_dir in bucket_dir.iterdir():
-            if not shard_dir.is_dir():
+    async def list_blob_sizes(self, bucket: str) -> list[tuple[str, int]]:
+        """Return sorted `(key, size_bytes)` pairs for all stored blobs in `bucket`."""
+        return await asyncio.to_thread(self._list_blob_sizes_sync, bucket)
+
+    def _list_blob_sizes_sync(self, bucket: str) -> list[tuple[str, int]]:
+        entries: list[tuple[str, int]] = []
+        for key, file_path in self._iter_bucket_files(bucket):
+            try:
+                size = file_path.stat().st_size
+            except FileNotFoundError:
                 continue
-            for root, _, files in os.walk(shard_dir):
+            entries.append((key, size))
+        entries.sort(key=lambda item: item[0])
+        return entries
+
+    def _iter_bucket_files(
+        self, bucket: str, prefix: str | None = None
+    ) -> Iterator[tuple[str, Path]]:
+        if prefix is not None:
+            self._validate_prefix(bucket, prefix)
+
+        clean_bucket = Path(bucket).name
+        if not clean_bucket or clean_bucket in {".", "..", "temp"}:
+            return
+        bucket_dir = (self.root / clean_bucket).resolve()
+        if (
+            bucket_dir == self.root
+            or not bucket_dir.is_relative_to(self.root)
+            or not bucket_dir.is_dir()
+        ):
+            return
+
+        # Keys are sharded by their first two characters, so a validated prefix
+        # (>= 3 chars) narrows the walk to at most one directory in one shard.
+        if prefix is not None:
+            shard_dirs = [(bucket_dir / prefix[:2]).resolve()]
+            start_rel = prefix.rpartition("/")[0]
+        else:
+            shard_dirs = [
+                resolved
+                for d in bucket_dir.iterdir()
+                if d.is_dir() and (resolved := d.resolve()).parent == bucket_dir
+            ]
+            start_rel = ""
+
+        for shard_dir in shard_dirs:
+            start_dir = (shard_dir / start_rel).resolve()
+            if not start_dir.is_relative_to(shard_dir) or not start_dir.is_dir():
+                continue
+            for root, _, files in os.walk(start_dir):
                 root_path = Path(root)
                 for filename in files:
                     if parse_file_chunk_name(filename) is not None:
                         continue
                     file_path = root_path / filename
-                    keys.append(file_path.relative_to(shard_dir).as_posix())
-        keys.sort()
-        return keys
+                    key = file_path.relative_to(shard_dir).as_posix()
+                    if prefix is None or key.startswith(prefix):
+                        yield key, file_path
 
     async def cleanup(self) -> CleanupStats:
         """Remove expired temporary staging files and abandoned upload chunks."""

@@ -1,14 +1,16 @@
 import hashlib
 import logging
 import time
+from unittest.mock import patch
 
 import jwt
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 
 from supernote.models.auth import Equipment, LoginVO
 from supernote.models.base import ErrorCode
 from supernote.models.equipment import UserEquipmentVO
+from supernote.models.extended import OAuthGrantVO
 from supernote.models.user import (
     UpdateEmailDTO,
     UpdatePasswordDTO,
@@ -17,10 +19,19 @@ from supernote.models.user import (
     UserRegisterDTO,
 )
 from supernote.server.config import AuthConfig, ServerConfig
+from supernote.server.db.models.api_key import ApiKeyDO
+from supernote.server.db.models.oauth_grant import OAuthGrantDO
 from supernote.server.db.models.user import UserDO
 from supernote.server.db.session import DatabaseSessionManager
 from supernote.server.services.coordination import CoordinationService
-from supernote.server.services.user import JWT_SECRET_KEY, UserService
+from supernote.server.services.user import (
+    JWT_SECRET_KEY,
+    MAX_API_KEY_NAME_LENGTH,
+    MAX_API_KEYS_PER_USER,
+    MAX_OAUTH_GRANTS_PER_USER,
+    AuthMethod,
+    UserService,
+)
 from supernote.server.utils.hashing import hash_with_salt
 
 
@@ -749,22 +760,24 @@ async def test_jwt_secret_key_explicit_config_takes_precedence(
     coordination_service: CoordinationService,
 ) -> None:
     """Explicit AuthConfig.secret_key takes precedence over system:jwt_secret_key in CoordinationService."""
-    await coordination_service.set_value(JWT_SECRET_KEY, "db-secret-key", ttl=3600)
+    explicit_secret = "explicit-secret-key-32-characters-long!!"
+    db_secret = "database-secret-key-32-characters-long!!"
+    await coordination_service.set_value(JWT_SECRET_KEY, db_secret, ttl=3600)
 
     service = UserService(
-        AuthConfig(secret_key="explicit-secret", enable_registration=True),
+        AuthConfig(secret_key=explicit_secret, enable_registration=True),
         coordination_service,
         session_manager,
     )
-    assert await service.get_secret_key() == "explicit-secret"
-    assert await coordination_service.get_value(JWT_SECRET_KEY) == "db-secret-key"
+    assert await service.get_secret_key() == explicit_secret
+    assert await coordination_service.get_value(JWT_SECRET_KEY) == db_secret
 
     pw_md5 = hashlib.md5(b"password123").hexdigest()
     email = "explicit_jwt@example.com"
     await service.register(UserRegisterDTO(email=email, password=pw_md5))
 
     token = await service.create_session(email)
-    decoded = jwt.decode(token, "explicit-secret", algorithms=["HS256"])
+    decoded = jwt.decode(token, explicit_secret, algorithms=["HS256"])
     assert decoded["sub"] == email
 
 
@@ -853,3 +866,526 @@ async def test_legacy_session_token_migration_and_revocation(
         ttl=ttl,
     )
     assert await user_service.verify_token(missing_user_token) is None
+
+
+async def test_admin_set_user_quota(user_service: UserService) -> None:
+    """Verify admin_set_user_quota updates UserDO.total_capacity and validates inputs."""
+    email = "quota_user@example.com"
+    pw_md5 = hashlib.md5(b"password123").hexdigest()
+    created = await user_service.register(UserRegisterDTO(email=email, password=pw_md5))
+    assert created.total_capacity == "0"
+
+    await user_service.admin_set_user_quota(email, 20 * 1024**3)
+    updated = await user_service.get_user_by_email(email)
+    assert updated is not None
+    assert updated.total_capacity == str(20 * 1024**3)
+
+    await user_service.admin_set_user_quota(email, 0)
+    reset = await user_service.get_user_by_email(email)
+    assert reset is not None
+    assert reset.total_capacity == "0"
+
+    with pytest.raises(ValueError, match="non-negative"):
+        await user_service.admin_set_user_quota(email, -1)
+
+    with pytest.raises(ValueError, match="non-negative"):
+        await user_service.admin_set_user_quota(email, True)
+
+    with pytest.raises(ValueError, match="not found"):
+        await user_service.admin_set_user_quota("missing@example.com", 1024)
+
+
+async def test_api_key_lifecycle_storage_and_verification(
+    user_service: UserService,
+    coordination_service: CoordinationService,
+    session_manager: DatabaseSessionManager,
+) -> None:
+    """Verify static Bearer API key creation, SHA-256 storage, verification, and revocation."""
+    pw_md5 = hashlib.md5(b"password123").hexdigest()
+    user1 = await user_service.register(
+        UserRegisterDTO(email="apikey1@example.com", password=pw_md5)
+    )
+    user2 = await user_service.register(
+        UserRegisterDTO(email="apikey2@example.com", password=pw_md5)
+    )
+
+    with pytest.raises(ValueError, match="Key name cannot be empty"):
+        await user_service.create_api_key(user1.id, "   ")
+
+    with pytest.raises(ValueError, match="not found"):
+        await user_service.create_api_key(999999, "Ghost Key")
+
+    raw_token, vo = await user_service.create_api_key(user1.id, "  CLI Agent  ")
+    assert raw_token.startswith("sn_")
+    assert len(raw_token) == 35
+    assert len(vo.id) == 16
+    assert vo.name == "CLI Agent"
+    assert vo.key_prefix == f"{raw_token[:11]}..."
+    assert vo.created_at <= int(time.time())
+    assert vo.last_used_at is None
+    assert vo.expires_at is None
+
+    # Raw token is never persisted in plaintext
+    assert await coordination_service.get_value(raw_token) is None
+    assert await coordination_service.get_value(f"api_key:{raw_token}") is None
+
+    sha256_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    async with session_manager.session() as db:
+        stored_row = (
+            await db.execute(
+                select(ApiKeyDO).where(
+                    ApiKeyDO.user_id == user1.id, ApiKeyDO.id == vo.id
+                )
+            )
+        ).scalar_one()
+        assert stored_row.name == "CLI Agent"
+        assert stored_row.key_prefix == vo.key_prefix
+        assert stored_row.created_at == vo.created_at
+        assert stored_row.sha256_hash == sha256_hash
+        assert stored_row.last_used_at is None
+
+    # User isolation in list_api_keys and revoke_api_key
+    _, user2_vo = await user_service.create_api_key(user2.id, "Obsidian")
+    assert [k.id for k in await user_service.list_api_keys(user1.id)] == [vo.id]
+    assert [k.id for k in await user_service.list_api_keys(user2.id)] == [user2_vo.id]
+    assert await user_service.revoke_api_key(user2.id, vo.id) is False
+    assert await user_service.revoke_api_key(user1.id, "missing_key") is False
+
+    # verify_token authenticates static sn_... keys and records last_used_at
+    assert await user_service.verify_api_key("") is None
+    assert await user_service.verify_api_key("not_an_sn_token") is None
+    assert (
+        await user_service.verify_token("sn_0123456789abcdef0123456789abcdef") is None
+    )
+    session_state = await user_service.verify_token(raw_token)
+    assert session_state is not None
+    assert session_state.email == "apikey1@example.com"
+    assert session_state.user_id == user1.id
+    assert session_state.equipment_no is None
+    assert session_state.auth_method == AuthMethod.API_KEY
+    assert session_state.is_api_key is True
+
+    interactive_token = await user_service.create_session("apikey1@example.com")
+    interactive_state = await user_service.verify_token(interactive_token)
+    assert interactive_state is not None
+    assert interactive_state.auth_method == AuthMethod.SESSION
+    assert interactive_state.is_api_key is False
+
+    listed_after_use = await user_service.list_api_keys(user1.id)
+    assert listed_after_use[0].last_used_at is not None
+    assert listed_after_use[0].last_used_at > 0
+
+    # Logout ignores static API keys rather than revoking them
+    await user_service.logout(raw_token)
+    assert await user_service.verify_token(raw_token) is not None
+
+    # Email updates resolve dynamically to the user's updated email
+    await user_service.update_email(
+        "apikey1@example.com", UpdateEmailDTO(email="apikey1_new@example.com")
+    )
+    updated_state = await user_service.verify_token(raw_token)
+    assert updated_state is not None
+    assert updated_state.email == "apikey1_new@example.com"
+
+    # Deactivating the user immediately rejects their static API keys
+    async with session_manager.session() as db:
+        db_user = (
+            await db.execute(select(UserDO).where(UserDO.id == user1.id))
+        ).scalar_one()
+        db_user.is_active = False
+        await db.commit()
+    assert await user_service.verify_token(raw_token) is None
+
+    async with session_manager.session() as db:
+        db_user = (
+            await db.execute(select(UserDO).where(UserDO.id == user1.id))
+        ).scalar_one()
+        db_user.is_active = True
+        await db.commit()
+    assert await user_service.verify_token(raw_token) is not None
+
+    # Explicit revocation rejects subsequent verify_token calls and is idempotent
+    assert await user_service.revoke_api_key(user1.id, vo.id) is True
+    assert await user_service.revoke_api_key(user1.id, vo.id) is False
+    assert await user_service.verify_token(raw_token) is None
+    assert await user_service.list_api_keys(user1.id) == []
+
+    # Account deletion purges all remaining API keys for that user
+    user2_token, _ = await user_service.create_api_key(user2.id, "Second Key")
+    assert await user_service.verify_token(user2_token) is not None
+    await user_service.clear_account("apikey2@example.com")
+    assert await user_service.verify_token(user2_token) is None
+    assert await user_service.list_api_keys(user2.id) == []
+
+
+async def test_api_key_adversarial_bounds_expiry_debouncing_and_recovery(
+    user_service: UserService,
+    session_manager: DatabaseSessionManager,
+) -> None:
+    """Verify API key input bounds, per-user cap, expiry, telemetry debouncing, and FK cascade."""
+    pw_md5 = hashlib.md5(b"password123").hexdigest()
+    new_pw_md5 = hashlib.md5(b"rotated_password").hexdigest()
+    user = await user_service.register(
+        UserRegisterDTO(email="hardened@example.com", password=pw_md5)
+    )
+
+    # Name length and control-character bounds
+    with pytest.raises(ValueError, match="cannot exceed"):
+        await user_service.create_api_key(user.id, "a" * (MAX_API_KEY_NAME_LENGTH + 1))
+
+    for bad_name in (
+        "Inject\x1b[31mANSI",
+        "Null\x00Byte",
+        "Line\nBreak",
+        "Del\x7fChar",
+    ):
+        with pytest.raises(ValueError, match="control characters"):
+            await user_service.create_api_key(user.id, bad_name)
+
+    # Strict token format gate rejects malformed and oversized tokens without hashing
+    for malformed in (
+        "sn_short",
+        "sn_" + "g" * 32,
+        "sn_" + "a" * 33,
+        "sn_" + "a" * 100_000,
+    ):
+        assert await user_service.verify_api_key(malformed) is None
+
+    # Expiration validation and enforcement
+    now = int(time.time())
+    with pytest.raises(ValueError, match="future"):
+        await user_service.create_api_key(user.id, "Already Expired", expires_at=now)
+
+    exp_token, exp_vo = await user_service.create_api_key(
+        user.id, "Short Lived", expires_at=now + 10
+    )
+    assert exp_vo.expires_at == now + 10
+    with patch("supernote.server.services.user.time.time", return_value=float(now + 5)):
+        state = await user_service.verify_api_key(exp_token)
+        assert state is not None
+        assert state.expires_at == now + 10
+    with patch(
+        "supernote.server.services.user.time.time", return_value=float(now + 10)
+    ):
+        assert await user_service.verify_api_key(exp_token) is None
+    await user_service.revoke_api_key(user.id, exp_vo.id)
+
+    # Telemetry last_used_at debouncing (60s window)
+    live_token, live_vo = await user_service.create_api_key(user.id, "Burst Key")
+    t0 = 1_800_000_000
+    with patch("supernote.server.services.user.time.time", return_value=float(t0)):
+        assert await user_service.verify_api_key(live_token) is not None
+    assert (await user_service.list_api_keys(user.id))[0].last_used_at == t0
+
+    with patch("supernote.server.services.user.time.time", return_value=float(t0 + 30)):
+        assert await user_service.verify_api_key(live_token) is not None
+    assert (await user_service.list_api_keys(user.id))[0].last_used_at == t0
+
+    with patch("supernote.server.services.user.time.time", return_value=float(t0 + 61)):
+        assert await user_service.verify_api_key(live_token) is not None
+    assert (await user_service.list_api_keys(user.id))[0].last_used_at == t0 + 61
+
+    # Password rotation revokes interactive sessions while preserving static API keys
+    session_tok = await user_service.create_session("hardened@example.com")
+    assert await user_service.verify_token(session_tok) is not None
+    await user_service.update_password(
+        "hardened@example.com", UpdatePasswordDTO(password=new_pw_md5)
+    )
+    assert await user_service.verify_token(session_tok) is None
+    assert await user_service.verify_api_key(live_token) is not None
+    await user_service.revoke_api_key(user.id, live_vo.id)
+
+    # Per-user key cap enforcement
+    for idx in range(MAX_API_KEYS_PER_USER):
+        await user_service.create_api_key(user.id, f"Key {idx}")
+    with pytest.raises(ValueError, match="Maximum of"):
+        await user_service.create_api_key(user.id, "Overflow Key")
+
+    # SQLite PRAGMA foreign_keys=ON enforces ON DELETE CASCADE when UserDO is deleted directly
+    async with session_manager.session() as db:
+        await db.execute(delete(UserDO).where(UserDO.id == user.id))
+        await db.commit()
+    assert await user_service.list_api_keys(user.id) == []
+
+
+async def _oauth_user(user_service: UserService, email: str) -> int:
+    pw_md5 = hashlib.md5(b"password123").hexdigest()
+    user = await user_service.register(UserRegisterDTO(email=email, password=pw_md5))
+    return user.id
+
+
+async def test_verify_oauth_token_valid(user_service: UserService) -> None:
+    """An access token from a grant authenticates as that grant's user and client."""
+    user_id = await _oauth_user(user_service, "oauthuser@example.com")
+    access, _ = await user_service.create_oauth_grant(
+        user_id, "https://client.example.com/", ["supernote:all"]
+    )
+
+    state = await user_service.verify_token(access)
+
+    assert state is not None
+    assert state.email == "oauthuser@example.com"
+    assert state.user_id == user_id
+    assert state.equipment_no is None
+    assert state.expires_at is not None and state.expires_at > time.time()
+    assert state.auth_method == AuthMethod.OAUTH
+    assert state.actor_id == "https://client.example.com/"
+    assert state.is_api_key is False
+    assert state.is_interactive_session is False
+
+
+async def test_oauth_tokens_are_stored_only_as_digests(
+    user_service: UserService, session_manager: DatabaseSessionManager
+) -> None:
+    user_id = await _oauth_user(user_service, "digest@example.com")
+    access, refresh = await user_service.create_oauth_grant(
+        user_id, "https://client.example.com/", ["supernote:all"]
+    )
+    async with session_manager.session() as db:
+        grant = (await db.execute(select(OAuthGrantDO))).scalar_one()
+    assert grant.access_token_hash == hashlib.sha256(access.encode()).hexdigest()
+    assert grant.refresh_token_hash == hashlib.sha256(refresh.encode()).hexdigest()
+
+
+async def test_verify_oauth_token_rejects_expired_access_token(
+    user_service: UserService, session_manager: DatabaseSessionManager
+) -> None:
+    user_id = await _oauth_user(user_service, "oauthexpired@example.com")
+    access, _ = await user_service.create_oauth_grant(user_id, "c", ["supernote:all"])
+    async with session_manager.session() as db:
+        await db.execute(
+            update(OAuthGrantDO).values(access_expires_at=int(time.time()) - 1)
+        )
+        await db.commit()
+    assert await user_service.verify_token(access) is None
+
+
+async def test_verify_oauth_token_rejects_inactive_user(
+    user_service: UserService, session_manager: DatabaseSessionManager
+) -> None:
+    user_id = await _oauth_user(user_service, "oauthinactive@example.com")
+    access, refresh = await user_service.create_oauth_grant(
+        user_id, "c", ["supernote:all"]
+    )
+    async with session_manager.session() as db:
+        await db.execute(update(UserDO).values(is_active=False))
+        await db.commit()
+    assert await user_service.verify_token(access) is None
+    assert await user_service.load_oauth_refresh_token(refresh) is None
+
+
+@pytest.mark.parametrize("token", ["", "unknown-token", "x" * 5000])
+async def test_verify_oauth_token_rejects_unknown_tokens(
+    user_service: UserService, token: str
+) -> None:
+    assert await user_service.verify_oauth_token(token) is None
+
+
+async def test_refresh_replaces_the_access_token(user_service: UserService) -> None:
+    user_id = await _oauth_user(user_service, "oauthrefresh@example.com")
+    access, refresh = await user_service.create_oauth_grant(
+        user_id, "c", ["supernote:all"]
+    )
+
+    renewed = await user_service.refresh_oauth_grant(refresh)
+
+    assert renewed is not None and renewed != access
+    assert await user_service.verify_token(access) is None
+    assert await user_service.verify_token(renewed) is not None
+
+
+async def test_refresh_of_a_revoked_grant_fails(user_service: UserService) -> None:
+    user_id = await _oauth_user(user_service, "oauthgone@example.com")
+    _, refresh = await user_service.create_oauth_grant(user_id, "c", ["supernote:all"])
+    [grant] = await user_service.list_oauth_grants(user_id)
+    assert await user_service.revoke_oauth_grant(user_id, grant.id)
+    assert await user_service.refresh_oauth_grant(refresh) is None
+
+
+async def test_revoking_a_refresh_token_ends_the_grant(
+    user_service: UserService,
+) -> None:
+    user_id = await _oauth_user(user_service, "oauthrfc@example.com")
+    access, refresh = await user_service.create_oauth_grant(
+        user_id, "c", ["supernote:all"]
+    )
+    await user_service.revoke_oauth_token(refresh)
+    assert await user_service.list_oauth_grants(user_id) == []
+    assert await user_service.verify_token(access) is None
+
+
+async def test_revoking_an_access_token_keeps_the_grant(
+    user_service: UserService,
+) -> None:
+    user_id = await _oauth_user(user_service, "oauthrfc2@example.com")
+    access, refresh = await user_service.create_oauth_grant(
+        user_id, "c", ["supernote:all"]
+    )
+    await user_service.revoke_oauth_token(access)
+    assert await user_service.verify_token(access) is None
+    assert len(await user_service.list_oauth_grants(user_id)) == 1
+    assert await user_service.refresh_oauth_grant(refresh) is not None
+
+
+async def test_list_oauth_grants(
+    user_service: UserService, session_manager: DatabaseSessionManager
+) -> None:
+    user_id = await _oauth_user(user_service, "oauthlist@example.com")
+    await user_service.create_oauth_grant(
+        user_id, "https://a.example.com/", ["supernote:all"]
+    )
+    async with session_manager.session() as db:
+        row = (await db.execute(select(OAuthGrantDO))).scalar_one()
+
+    assert await user_service.list_oauth_grants(user_id) == [
+        OAuthGrantVO(
+            id=row.id,
+            client_id="https://a.example.com/",
+            scopes=["supernote:all"],
+            created_at=row.created_at,
+            expires_at=row.expires_at,
+            last_used_at=None,
+        )
+    ]
+
+
+async def test_revoke_oauth_grant_ends_its_tokens(user_service: UserService) -> None:
+    user_id = await _oauth_user(user_service, "oauthrevoke@example.com")
+    access, _ = await user_service.create_oauth_grant(user_id, "c", ["supernote:all"])
+    [grant] = await user_service.list_oauth_grants(user_id)
+
+    assert await user_service.revoke_oauth_grant(user_id, grant.id) is True
+    assert await user_service.list_oauth_grants(user_id) == []
+    assert await user_service.verify_token(access) is None
+
+
+async def test_revoke_oauth_grant_is_scoped_to_its_user(
+    user_service: UserService,
+) -> None:
+    owner_id = await _oauth_user(user_service, "oauthowner@example.com")
+    other_id = await _oauth_user(user_service, "oauthother@example.com")
+    access, _ = await user_service.create_oauth_grant(owner_id, "c", ["supernote:all"])
+    [grant] = await user_service.list_oauth_grants(owner_id)
+
+    assert await user_service.revoke_oauth_grant(other_id, grant.id) is False
+    assert await user_service.verify_token(access) is not None
+
+
+async def test_using_an_access_token_records_last_used(
+    user_service: UserService,
+) -> None:
+    user_id = await _oauth_user(user_service, "oauthused@example.com")
+    access, _ = await user_service.create_oauth_grant(user_id, "c", ["supernote:all"])
+    assert await user_service.verify_token(access) is not None
+    [grant] = await user_service.list_oauth_grants(user_id)
+    assert grant.last_used_at is not None
+
+
+async def test_expired_grants_are_hidden_and_pruned(
+    user_service: UserService, session_manager: DatabaseSessionManager
+) -> None:
+    user_id = await _oauth_user(user_service, "oauthprune@example.com")
+    await user_service.create_oauth_grant(user_id, "old", ["supernote:all"])
+    async with session_manager.session() as db:
+        await db.execute(update(OAuthGrantDO).values(expires_at=int(time.time()) - 1))
+        await db.commit()
+    assert await user_service.list_oauth_grants(user_id) == []
+
+    await user_service.create_oauth_grant(user_id, "new", ["supernote:all"])
+
+    async with session_manager.session() as db:
+        clients = (await db.execute(select(OAuthGrantDO.client_id))).scalars().all()
+    assert clients == ["new"]
+
+
+async def test_grants_per_user_are_capped_by_evicting_the_oldest(
+    user_service: UserService, session_manager: DatabaseSessionManager
+) -> None:
+    user_id = await _oauth_user(user_service, "oauthcap@example.com")
+    for i in range(MAX_OAUTH_GRANTS_PER_USER):
+        await user_service.create_oauth_grant(user_id, f"c{i}", ["supernote:all"])
+    async with session_manager.session() as db:
+        for i in range(MAX_OAUTH_GRANTS_PER_USER):
+            await db.execute(
+                update(OAuthGrantDO)
+                .where(OAuthGrantDO.client_id == f"c{i}")
+                .values(created_at=1000 + i)
+            )
+        await db.commit()
+
+    await user_service.create_oauth_grant(user_id, "newest", ["supernote:all"])
+
+    clients = [g.client_id for g in await user_service.list_oauth_grants(user_id)]
+    assert len(clients) == MAX_OAUTH_GRANTS_PER_USER
+    assert "c0" not in clients
+    assert clients[-1] == "newest"
+
+
+async def test_password_change_ends_oauth_grants(user_service: UserService) -> None:
+    user_id = await _oauth_user(user_service, "oauthpw@example.com")
+    access, _ = await user_service.create_oauth_grant(user_id, "c", ["supernote:all"])
+    await user_service.update_password(
+        "oauthpw@example.com",
+        UpdatePasswordDTO(password=hashlib.md5(b"new").hexdigest()),
+    )
+    assert await user_service.list_oauth_grants(user_id) == []
+    assert await user_service.verify_token(access) is None
+
+
+async def test_admin_password_reset_ends_oauth_grants(
+    user_service: UserService,
+) -> None:
+    user_id = await _oauth_user(user_service, "oauthreset@example.com")
+    await user_service.create_oauth_grant(user_id, "c", ["supernote:all"])
+    await user_service.admin_reset_password(
+        "oauthreset@example.com", hashlib.md5(b"new").hexdigest()
+    )
+    assert await user_service.list_oauth_grants(user_id) == []
+
+
+async def test_session_state_actor_across_auth_methods(
+    user_service: UserService,
+    coordination_service: CoordinationService,
+) -> None:
+    """Verify SessionState.actor resolves canonical identifiers for web, device, API key, and OAuth."""
+    pw_md5 = hashlib.md5(b"password123").hexdigest()
+    user = await user_service.register(
+        UserRegisterDTO(email="actor_test@example.com", password=pw_md5)
+    )
+
+    web_token = await user_service.create_session("actor_test@example.com")
+    web_session = await user_service.verify_token(web_token)
+    assert web_session is not None
+    assert web_session.actor == "user:web"
+
+    dev_token = await user_service.create_session(
+        "actor_test@example.com", equipment_no="SN12345"
+    )
+    dev_session = await user_service.verify_token(dev_token)
+    assert dev_session is not None
+    assert dev_session.actor == "device:SN12345"
+
+    raw_key, created_key = await user_service.create_api_key(user.id, "Magic Todo")
+    key_session = await user_service.verify_token(raw_key)
+    assert key_session is not None
+    assert key_session.actor == f"api_key:{created_key.id}"
+
+    long_client_id = "c" * 80
+    oauth_token, _ = await user_service.create_oauth_grant(
+        user.id, long_client_id, ["supernote:all"]
+    )
+    oauth_session = await user_service.verify_token(oauth_token)
+    assert oauth_session is not None
+    assert oauth_session.actor == f"oauth:{long_client_id}"[:64]
+    assert len(oauth_session.actor) == 64
+
+
+async def test_forgot_password_reset_ends_oauth_grants(
+    user_service: UserService,
+) -> None:
+    user_id = await _oauth_user(user_service, "oauthforgot@example.com")
+    await user_service.create_oauth_grant(user_id, "c", ["supernote:all"])
+    assert await user_service.retrieve_password(
+        "oauthforgot@example.com", hashlib.md5(b"new").hexdigest()
+    )
+    assert await user_service.list_oauth_grants(user_id) == []

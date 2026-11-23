@@ -5,13 +5,19 @@ import asyncio
 import pytest
 
 from supernote.models.base import BooleanEnum
+from supernote.models.schedule import ScheduleTaskLinkDTO
 from supernote.models.summary import SummaryItem, SummaryTagItem
 from supernote.server.events import (
+    DomainEventRecorded,
     Event,
     LocalEventBus,
     NoteDeletedEvent,
+    NotePagesDeltaEvent,
+    NotePageTranscribedEvent,
     NoteProcessingCompletedEvent,
     NoteUpdatedEvent,
+    ScheduleTaskCreatedEvent,
+    ScheduleTaskUpdatedEvent,
     ScheduleUpdatedEvent,
     SummaryDeletedEvent,
     SummaryTagDeletedEvent,
@@ -22,6 +28,7 @@ from supernote.server.events import (
     VfsItemCreatedEvent,
     VfsItemDeletedEvent,
     VfsItemMovedEvent,
+    bind_event_actor,
 )
 
 
@@ -226,3 +233,121 @@ async def test_local_event_bus_isolates_subscriber_exceptions(
 
     assert healthy_received == [ev]
     assert "Error handling event" in caplog.text
+
+
+async def test_local_event_bus_inline_subscribers_execute_in_order() -> None:
+    """Verify inline=True subscribers run synchronously before publish returns."""
+    bus = LocalEventBus()
+    order: list[str] = []
+
+    async def inline_first(event: DomainEventRecorded) -> None:
+        order.append(f"inline_1:{event.seq}")
+
+    async def inline_second(event: DomainEventRecorded) -> None:
+        order.append(f"inline_2:{event.seq}")
+
+    async def background_handler(event: DomainEventRecorded) -> None:
+        order.append(f"bg:{event.seq}")
+
+    bus.subscribe(DomainEventRecorded, inline_first, inline=True)
+    bus.subscribe(DomainEventRecorded, background_handler, inline=False)
+    bus.subscribe(DomainEventRecorded, inline_second, inline=True)
+
+    recorded = DomainEventRecorded(
+        user_id=1,
+        seq=7,
+        timestamp_ms=1000,
+        event_type="vfs.created",
+        actor="user:web",
+        entity_type="file",
+        entity_id="99",
+    )
+    await bus.publish(recorded)
+    assert order == ["inline_1:7", "inline_2:7"]
+
+    await asyncio.sleep(0)
+    assert order == ["inline_1:7", "inline_2:7", "bg:7"]
+
+
+def test_note_pages_delta_event_payload_includes_deleted_page_texts() -> None:
+    """Verify NotePagesDeltaEvent serializes deleted_page_texts in to_payload()."""
+    delta_ev = NotePagesDeltaEvent(
+        user_id=1,
+        file_id=42,
+        file_path="Daily.note",
+        deleted_pages=["P1"],
+        deleted_page_texts={"P1": "• Old bullet"},
+    )
+    assert delta_ev.to_payload() == {
+        "file_id": "42",
+        "file_path": "Daily.note",
+        "added_pages": [],
+        "modified_pages": [],
+        "moved_pages": [],
+        "deleted_pages": ["P1"],
+        "deleted_page_texts": {"P1": "• Old bullet"},
+    }
+
+
+def test_note_page_transcribed_event_payload_includes_previous_text() -> None:
+    """Verify NotePageTranscribedEvent serializes previous_text in to_payload()."""
+    transcribed_ev = NotePageTranscribedEvent(
+        user_id=1,
+        file_id=42,
+        file_path="Daily.note",
+        page_id="P1",
+        page_index=0,
+        text_content="X Old bullet",
+        previous_text="• Old bullet",
+    )
+    assert transcribed_ev.to_payload() == {
+        "file_id": "42",
+        "file_path": "Daily.note",
+        "page_id": "P1",
+        "page_index": 0,
+        "text_content": "X Old bullet",
+        "previous_text": "• Old bullet",
+    }
+
+
+def test_schedule_task_updated_event_unlinked_file_id_fallback() -> None:
+    """Verify ScheduleTaskUpdatedEvent resolves related_file_id from old link when unlinking."""
+    old_link = ScheduleTaskLinkDTO(
+        app_name="Note", path="/Note/Daily.note", page=1, file_id="42", page_id="P1"
+    ).to_b64()
+    unlinked_ev = ScheduleTaskUpdatedEvent(
+        user_id=1,
+        task_id="t1",
+        title="Old bullet",
+        links=None,
+        changed_fields={"links": [old_link, None]},
+    )
+    assert unlinked_ev.related_file_id == 42
+    assert unlinked_ev.to_payload() == {
+        "task_id": "t1",
+        "task_list_id": None,
+        "title": "Old bullet",
+        "detail": None,
+        "status": "needsAction",
+        "due_time": None,
+        "links": None,
+        "changed_fields": {"links": [old_link, None]},
+    }
+
+
+def test_bind_event_actor_applies_to_user_events_only() -> None:
+    """Verify bind_event_actor overrides default user:web actor without clobbering device or processor actors."""
+    task_ev = ScheduleTaskCreatedEvent(user_id=1, task_id="t1", title="Buy milk")
+    device_ev = ScheduleTaskCreatedEvent(
+        user_id=1, task_id="t2", title="From tablet", equipment_no="SN999"
+    )
+    proc_ev = NotePageTranscribedEvent(
+        user_id=1, file_id=42, file_path="Daily.note", page_id="P1", text_content="hi"
+    )
+
+    assert task_ev.actor == "user:web"
+    with bind_event_actor("api_key:key_123"):
+        assert task_ev.actor == "api_key:key_123"
+        assert device_ev.actor == "device:SN999"
+        assert proc_ev.actor == "system:processor"
+    assert task_ev.actor == "user:web"

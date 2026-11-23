@@ -4,229 +4,238 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Supernote Cloud - Web Viewer</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <title>Open Private Cloud</title>
+    <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+    <script>tailwind.config = { darkMode: 'class' };</script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/spark-md5/3.0.2/spark-md5.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/js-sha256/1.0.0/sha256.min.js"></script>
-    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/js-sha256/1.1.0/sha256.min.js"></script>
+    <script src="https://cdn.socket.io/4.8.4/socket.io.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/style.css">
     <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
-    <!-- Import Map for Vue (No Build) -->
+    <!-- Import Map for Browser ES Modules (No Build) -->
     <script type="importmap">
         {
           "imports": {
-            "vue": "https://unpkg.com/vue@3/dist/vue.esm-browser.js"
+            "vue": "https://unpkg.com/vue@3.5.46/dist/vue.esm-browser.js",
+            "marked": "https://unpkg.com/marked@18.2.1/lib/marked.esm.js",
+            "dompurify": "https://unpkg.com/dompurify@3.5.0/dist/purify.es.mjs"
           }
         }
     </script>
 </head>
 
-<body class="bg-slate-50 text-slate-900 antialiased min-h-screen">
+<body class="bg-[#F7F6F2] text-slate-900 antialiased min-h-screen selection:bg-slate-900 selection:text-white">
     <div id="app" class="flex flex-col min-h-screen" v-cloak>
-        <header class="sticky top-0 z-50 bg-white/70 backdrop-blur-md border-b border-slate-200">
-            <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-                <div class="flex justify-between items-center h-16">
-                    <div class="flex items-center gap-3">
-                        <div
-                            class="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center text-white font-bold shadow-lg shadow-indigo-200">
-                            S</div>
-                        <h1 class="text-xl font-semibold tracking-tight">Supernote <span
-                                class="text-indigo-600">Lite</span></h1>
+        <!-- Top Navigation Header -->
+        <header class="sticky top-0 z-50 bg-[#F7F6F2]/90 backdrop-blur-md border-b border-stone-200/90">
+            <div class="max-w-7xl mx-auto px-3 sm:px-6 lg:px-8">
+                <div class="flex justify-between items-center gap-1.5 sm:gap-2 h-14">
+                    <!-- Brand Identity -->
+                    <div class="flex items-center min-w-0">
+                        <button @click="isLoggedIn && !pendingOAuthRequest ? switchTab('files') : null" type="button"
+                            aria-label="Open Private Cloud"
+                            class="flex items-center gap-2 sm:gap-2.5 min-w-0 text-left group focus:outline-none">
+                            <div class="w-7 h-7 sm:w-8 sm:h-8 bg-slate-900 rounded-lg flex items-center justify-center text-white shadow-sm group-hover:bg-slate-800 transition-colors shrink-0">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                        d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z">
+                                    </path>
+                                </svg>
+                            </div>
+                            <div class="flex items-baseline gap-1.5 min-w-0">
+                                <span class="text-sm sm:text-base font-bold tracking-tight text-slate-900 truncate"><span v-if="isLoggedIn && !pendingOAuthRequest" class="hidden sm:inline">Open </span><template v-else>Open </template>Private Cloud</span>
+                                <span class="hidden md:inline text-xs font-mono font-medium uppercase tracking-widest text-stone-500 shrink-0">for Supernote</span>
+                            </div>
+                        </button>
                     </div>
 
-                    <!-- Navigation Tabs -->
-                    <div v-if="isLoggedIn" class="flex items-center gap-2 bg-slate-100 p-1 rounded-xl">
-                        <button @click="switchTab('files')"
-                            :class="(activeTab === 'files' || activeTab === 'explorer') ? 'bg-white text-indigo-700 font-semibold shadow-sm' : 'text-slate-600 hover:text-slate-900 font-medium'"
-                            class="flex items-center gap-2 px-4 py-1.5 rounded-lg text-sm transition-all">
-                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <!-- Primary View Switcher -->
+                    <div v-if="isLoggedIn && !pendingOAuthRequest" class="flex items-center gap-0.5 sm:gap-1 bg-stone-200/70 p-0.5 sm:p-1 rounded-xl border border-stone-300/40 shrink-0">
+                        <button @click="switchTab('files')" type="button"
+                            :class="activeTab === 'files' ? 'bg-white text-slate-900 font-semibold shadow-sm' : 'text-stone-600 hover:text-slate-900 font-medium'"
+                            class="flex items-center gap-1.5 sm:gap-2 px-2.5 sm:px-3.5 py-1.5 rounded-lg text-xs whitespace-nowrap transition-all">
+                            <svg class="hidden sm:block w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"></path>
                             </svg>
-                            Files
+                            <span>Files</span>
                         </button>
-                        <button @click="switchTab('tasks')"
-                            :class="activeTab === 'tasks' ? 'bg-white text-indigo-700 font-semibold shadow-sm' : 'text-slate-600 hover:text-slate-900 font-medium'"
-                            class="flex items-center gap-2 px-4 py-1.5 rounded-lg text-sm transition-all">
-                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <button @click="switchTab('tasks')" type="button"
+                            :class="activeTab === 'tasks' ? 'bg-white text-slate-900 font-semibold shadow-sm' : 'text-stone-600 hover:text-slate-900 font-medium'"
+                            class="flex items-center gap-1.5 sm:gap-2 px-2.5 sm:px-3.5 py-1.5 rounded-lg text-xs whitespace-nowrap transition-all">
+                            <svg class="hidden sm:block w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
                             </svg>
-                            Tasks & Schedule
+                            <span>Tasks<span class="hidden sm:inline"> &amp; Schedule</span></span>
+                        </button>
+                        <button @click="switchTab('settings')" type="button" aria-label="Settings"
+                            :class="activeTab === 'settings' ? 'bg-white text-slate-900 font-semibold shadow-sm' : 'text-stone-600 hover:text-slate-900 font-medium'"
+                            class="flex items-center gap-1.5 sm:gap-2 px-2.5 sm:px-3.5 py-1.5 rounded-lg text-xs whitespace-nowrap transition-all">
+                            <svg class="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"></path>
+                            </svg>
+                            <span class="hidden sm:inline">Settings</span>
                         </button>
                     </div>
 
-                    <div v-if="isLoggedIn" class="flex items-center gap-4">
-                        <button @click="openSystemPanel"
-                            class="text-slate-500 hover:text-slate-700 transition-colors" title="System Status">
-                            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                    d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z">
+                    <!-- Right Utilities -->
+                    <div v-if="isLoggedIn" class="flex items-center gap-0.5 sm:gap-2 shrink-0">
+                        <template v-if="!pendingOAuthRequest">
+                            <button @click="openSearchWithQuery('')" type="button"
+                                aria-label="Global Search"
+                                :title="'Global Search (' + searchShortcutLabel + ')'"
+                                class="flex items-center gap-2 p-2 sm:px-3 sm:py-1.5 bg-white hover:bg-stone-50 text-stone-600 hover:text-slate-900 rounded-lg text-xs font-medium border border-stone-200/90 shadow-sm transition-all">
+                                <svg class="w-3.5 h-3.5 text-stone-500 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+                                </svg>
+                                <span class="hidden sm:inline text-stone-500">Search...</span>
+                                <kbd class="hidden md:inline-block px-1.5 py-0.5 bg-stone-100 text-stone-600 text-[10px] font-mono rounded border border-stone-200/80">{{ searchShortcutLabel }}</kbd>
+                            </button>
+
+                            <button @click="openSystemPanel" type="button"
+                                aria-label="System Status"
+                                title="System Status"
+                                class="flex items-center gap-1.5 p-2 sm:px-2.5 sm:py-1.5 rounded-lg text-xs font-medium text-stone-600 hover:text-slate-900 hover:bg-stone-200/60 transition-colors">
+                                <svg class="w-4 h-4 text-stone-600 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.75"
+                                        d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z">
+                                    </path>
+                                </svg>
+                                <span class="hidden md:inline">System</span>
+                            </button>
+
+                            <div class="h-4 w-px bg-stone-200 hidden sm:block"></div>
+                        </template>
+
+                        <button @click="handleLogout" type="button"
+                            aria-label="Sign Out"
+                            title="Sign Out"
+                            class="flex items-center gap-1.5 p-2 sm:px-2.5 sm:py-1.5 rounded-lg text-xs font-medium text-stone-600 hover:text-slate-900 hover:bg-stone-200/60 transition-colors">
+                            <svg class="w-4 h-4 sm:hidden shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.75"
+                                    d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1">
                                 </path>
                             </svg>
-                        </button>
-                        <button @click="handleLogout"
-                            class="text-sm font-medium text-slate-500 hover:text-slate-800 transition-colors">
-                            Sign Out
+                            <span class="hidden sm:inline">Sign Out</span>
                         </button>
                     </div>
                 </div>
             </div>
         </header>
 
-        <main class="flex-grow max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <!-- Main Workspace Container -->
+        <main class="flex-grow max-w-7xl w-full mx-auto px-3 sm:px-6 lg:px-8 py-5 sm:py-6">
             <template v-if="isLoggedIn">
-                <template v-if="activeTab === 'files' || activeTab === 'explorer' || activeTab === 'dashboard'">
-                <!-- Breadcrumbs -->
-                <nav
-                    class="flex mb-8 text-sm font-medium text-slate-500 items-center overflow-x-auto whitespace-nowrap pb-2">
-                    <div v-for="(crumb, index) in breadcrumbs" :key="crumb.id" class="flex items-center">
-                        <button @click="navigateTo(index)"
-                            :class="index === breadcrumbs.length - 1 ? 'text-slate-900 font-bold' : 'hover:text-indigo-600 transition-colors'"
-                            class="flex items-center">
-                            <svg v-if="index === 0" class="w-4 h-4 mr-1" fill="currentColor" viewBox="0 0 20 20">
-                                <path
-                                    d="M10.707 2.293a1 1 0 00-1.414 0l-7 7a1 1 0 001.414 1.414L4 10.414V17a1 1 0 001 1h2a1 1 0 001-1v-2a1 1 0 011-1h2a1 1 0 011 1v2a1 1 0 001 1h2a1 1 0 001-1v-6.586l.293.293a1 1 0 001.414-1.414l-7-7z">
-                                </path>
-                            </svg>
-                            {{ crumb.name }}
-                        </button>
-                        <span v-if="index < breadcrumbs.length - 1" class="mx-2 text-slate-300">/</span>
+                <oauth-consent-card v-if="pendingOAuthRequest"
+                    :request="pendingOAuthRequest"
+                    :is-submitting="isSubmittingOAuth"
+                    :completed-outcome="oauthCompletedOutcome"
+                    @approve="handleOAuthApprove"
+                    @deny="handleOAuthDeny"
+                    @dismiss="dismissOAuthConsent"></oauth-consent-card>
+                <template v-else-if="activeTab === 'files'">
+                    <!-- Directory Browser View -->
+                    <file-browser-panel v-if="view === 'grid'"
+                        :files="files"
+                        :current-directory-id="currentDirectoryId"
+                        :breadcrumbs="breadcrumbs"
+                        :is-loading="isLoading"
+                        :error="error"
+                        :processing-statuses="processingStatuses"
+                        :selected-ids="selectedIds"
+                        :create-folder="createNewFolder"
+                        :upload-files="uploadFiles"
+                        :delete-items="deleteSelectedItems"
+                        :move-items="moveSelectedItems"
+                        :rename-item="handleRenameItem"
+                        @open-item="openItem"
+                        @navigate-to="navigateTo"
+                        @open-recycle-bin="openRecycleBin"
+                        @update-selected-ids="selectedIds = $event"></file-browser-panel>
+
+                    <!-- Recycle Bin View -->
+                    <recycle-bin-panel v-else-if="view === 'recycle'"
+                        :items="recycleItems"
+                        :selected-ids="recycleSelectedIds"
+                        :is-loading="isLoadingRecycle"
+                        :is-mutating="isMutatingRecycle"
+                        :error="recycleError"
+                        :load-recycle-bin="loadRecycleBin"
+                        :restore-items="restoreRecycleItems"
+                        :delete-items-permanently="deleteRecycleItemsPermanently"
+                        :empty-recycle-bin="emptyRecycleBin"
+                        @close="closeRecycleBin"
+                        @restored="handleRecycleRestored"
+                        @update-selected-ids="recycleSelectedIds = $event"></recycle-bin-panel>
+
+                    <!-- Document / Notebook Viewer -->
+                    <div v-else-if="view === 'viewer'" class="min-h-full">
+                        <!-- Compact Context Breadcrumbs Above Viewer -->
+                        <nav class="flex items-center text-xs text-stone-600 mb-3 overflow-x-auto whitespace-nowrap" aria-label="Viewer Breadcrumb">
+                            <div v-for="(crumb, index) in breadcrumbs" :key="crumb.id" class="flex items-center">
+                                <button @click="navigateTo(index)" type="button"
+                                    class="hover:text-slate-900 font-medium transition-colors flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-stone-200/50">
+                                    <svg v-if="index === 0" class="w-3.5 h-3.5 text-stone-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                            d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6">
+                                        </path>
+                                    </svg>
+                                    <span>{{ crumb.name }}</span>
+                                </button>
+                                <span class="mx-1 text-stone-400">/</span>
+                            </div>
+                            <span class="text-slate-900 font-semibold truncate px-1.5">{{ selectedFile?.name }}</span>
+                        </nav>
+
+                        <file-viewer :file="selectedFile" :initial-page="selectedPageIndex"
+                            :page-jump-seq="selectedPageJumpSeq" @close="closeViewer"
+                            @page-change="handleViewerPageChange"
+                            @open-file="handleSearchSelectFile"
+                            @search="openSearchWithQuery"></file-viewer>
                     </div>
-                </nav>
-                <!-- Actions Bar -->
-                <div class="flex flex-wrap items-center justify-between gap-4 mb-8">
-                    <div class="flex items-center gap-2">
-                        <button @click="triggerUpload"
-                            class="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-xl font-medium transition-all shadow-lg shadow-indigo-100">
-                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                    d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path>
-                            </svg>
-                            Upload
-                        </button>
-                        <button @click="showNewFolderModal = true"
-                            class="flex items-center gap-2 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-4 py-2 rounded-xl font-medium transition-all">
-                            <svg class="w-5 h-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                    d="M12 4v16m8-8H4"></path>
-                            </svg>
-                            New Folder
-                        </button>
-                    </div>
-
-                    <div v-if="selectedIds.length > 0" class="flex items-center gap-2 animate-in slide-in-from-right">
-                        <span class="text-sm text-slate-500 font-medium mr-2">{{ selectedIds.length }} selected</span>
-                        <button @click="handleMoveSelected"
-                            class="text-sm bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 px-3 py-1.5 rounded-lg transition-colors">
-                            Move
-                        </button>
-                        <button @click="handleDeleteSelected"
-                            class="text-sm bg-rose-50 border border-rose-100 hover:bg-rose-100 text-rose-600 px-3 py-1.5 rounded-lg transition-colors">
-                            Delete
-                        </button>
-                        <button @click="selectedIds = []"
-                            class="text-sm text-slate-400 hover:text-slate-600 underline px-2">
-                            Clear
-                        </button>
-                    </div>
-                </div>
-
-                <!-- Hidden Upload Input -->
-                <input type="file" ref="fileInput" class="hidden" multiple @change="handleFileUpload">
-
-                <!-- New Folder Modal -->
-                <div v-if="showNewFolderModal"
-                    class="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-sm"
-                    @click.self="showNewFolderModal = false">
-                    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6 animate-in zoom-in-95">
-                        <h3 class="text-lg font-bold text-slate-900 mb-4">Create New Folder</h3>
-                        <input v-model="newFolderName" type="text" placeholder="Folder name"
-                            class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all mb-6"
-                            @keyup.enter="handleCreateFolder">
-                        <div class="flex justify-end gap-3">
-                            <button @click="showNewFolderModal = false"
-                                class="px-4 py-2 text-slate-500 hover:text-slate-700 font-medium">Cancel</button>
-                            <button @click="handleCreateFolder" :disabled="!newFolderName"
-                                class="px-6 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-xl font-bold shadow-lg shadow-indigo-200 transition-all">
-                                Create
-                            </button>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Error State -->
-                <div v-if="error" class="bg-red-50 text-red-600 p-4 rounded-xl mb-6">
-                    {{ error }}
-                    <div v-if="error === 'Unauthorized'" class="mt-2 text-sm">
-                        Please log in via the CLI or check your token.
-                    </div>
-                </div>
-
-                <!-- Loading State -->
-                <div v-if="isLoading" class="flex justify-center py-20">
-                    <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600"></div>
-                </div>
-
-                <!-- Grid View -->
-                <div v-if="view === 'grid' && !isLoading" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-                    <!-- Folders -->
-                    <file-card v-for="folder in folders" :key="folder.id" :file="folder"
-                        :is-selected="selectedIds.includes(folder.id)"
-                        :processing-status="processingStatuses[folder.id]" @open="openItem" @select="toggleSelection"
-                        @rename="triggerRename"></file-card>
-
-                    <!-- Files -->
-                    <file-card v-for="file in regularFiles" :key="file.id" :file="file"
-                        :is-selected="selectedIds.includes(file.id)" :processing-status="processingStatuses[file.id]"
-                        @open="openItem" @select="toggleSelection" @rename="triggerRename"></file-card>
-                </div>
-
-                <!-- Viewer -->
-                <div v-if="view === 'viewer'" class="min-h-full">
-                    <file-viewer :file="selectedFile" @close="closeViewer"></file-viewer>
-                </div>
-
-                <!-- Modals -->
-                <move-modal v-if="showMoveModal" :item-ids="selectedIds" @close="showMoveModal = false"
-                    @confirm="onConfirmMove"></move-modal>
-
-                <rename-modal v-if="showRenameModal" :item="itemToRename" @close="showRenameModal = false"
-                    @confirm="onConfirmRename"></rename-modal>
                 </template>
 
                 <!-- Tasks & Schedule Dashboard Panel -->
                 <template v-else-if="activeTab === 'tasks'">
-                    <task-panel></task-panel>
+                    <task-panel :focus-task="focusedTaskRequest"></task-panel>
+                </template>
+                <template v-else-if="activeTab === 'settings'">
+                    <settings-panel></settings-panel>
                 </template>
             </template>
 
             <!-- Login Screen -->
             <template v-else>
-                <login-card @login="handleLogin"></login-card>
+                <login-card :oauth-request="pendingOAuthRequest" :is-submitting="isLoggingIn" @login="handleLogin"></login-card>
             </template>
 
+            <!-- Global Search Modal -->
+            <search-modal v-if="isLoggedIn && !pendingOAuthRequest && showSearchModal" :initial-query="searchInitialQuery"
+                @close="closeSearchModal"
+                @select-file="handleSearchSelectFile" @select-task="handleSearchSelectTask"></search-modal>
+
             <!-- System Panel -->
-            <system-panel v-if="showSystemPanel" @close="closeSystemPanel"></system-panel>
+            <system-panel v-if="isLoggedIn && !pendingOAuthRequest && showSystemPanel" @close="closeSystemPanel" @open-file="handleSystemOpenFile"></system-panel>
         </main>
 
         <!-- Toast Notifications Stack -->
-        <div class="fixed bottom-4 right-4 z-[200] flex flex-col gap-2 max-w-sm w-full pointer-events-none"
+        <div class="fixed bottom-4 left-4 right-4 sm:left-auto z-[200] flex flex-col gap-2 sm:max-w-sm sm:w-full pointer-events-none"
             role="region" aria-label="Notifications" aria-live="polite">
             <div v-for="toast in toasts" :key="toast.id"
                 :class="{
-                    'bg-rose-50 dark:bg-rose-950/90 border-rose-200 dark:border-rose-800 text-rose-800 dark:text-rose-200': toast.type === 'error',
-                    'bg-emerald-50 dark:bg-emerald-950/90 border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200': toast.type === 'success',
-                    'bg-white dark:bg-slate-900/90 border-slate-200 dark:border-slate-800 text-slate-800 dark:text-slate-200': toast.type !== 'error' && toast.type !== 'success'
+                    'bg-rose-50 border-rose-200 text-rose-800': toast.type === 'error',
+                    'bg-emerald-50 border-emerald-200 text-emerald-800': toast.type === 'success',
+                    'bg-white border-stone-200 text-slate-800': toast.type !== 'error' && toast.type !== 'success'
                 }"
-                class="pointer-events-auto flex items-start justify-between gap-3 px-4 py-3 rounded-xl border shadow-lg backdrop-blur-md text-sm font-medium transition-all animate-in slide-in-from-bottom-2">
+                class="pointer-events-auto flex items-start justify-between gap-3 px-4 py-3 rounded-xl border shadow-lg backdrop-blur-md text-xs font-medium transition-all animate-fade-in">
                 <div class="flex items-start gap-2.5 min-w-0">
-                    <svg v-if="toast.type === 'error'" class="w-5 h-5 text-rose-500 dark:text-rose-400 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <svg v-if="toast.type === 'error'" class="w-4 h-4 text-rose-500 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
                     </svg>
-                    <svg v-else-if="toast.type === 'success'" class="w-5 h-5 text-emerald-500 dark:text-emerald-400 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <svg v-else-if="toast.type === 'success'" class="w-4 h-4 text-emerald-500 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
                     </svg>
-                    <svg v-else class="w-5 h-5 text-indigo-500 dark:text-indigo-400 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <svg v-else class="w-4 h-4 text-slate-600 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
                     </svg>
                     <span class="break-words leading-snug">{{ toast.message }}</span>
@@ -234,7 +243,7 @@
                 <button @click="dismissToast(toast.id)"
                     class="text-current opacity-60 hover:opacity-100 p-0.5 rounded-lg transition-opacity shrink-0"
                     aria-label="Dismiss notification">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
                     </svg>
                 </button>

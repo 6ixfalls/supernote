@@ -4,10 +4,12 @@ These tests verify that the server correctly handles X-Forwarded-* headers
 when deployed behind a reverse proxy, with different proxy modes.
 """
 
+import argparse
 import dataclasses
+import logging
 import subprocess
 import sys
-from pathlib import Path
+from typing import Any
 
 import pytest
 from aiohttp.test_utils import TestClient
@@ -15,12 +17,31 @@ from pytest_aiohttp import AiohttpClient
 from sqlalchemy import delete, select
 
 from supernote.models.file_device import FileUploadApplyLocalDTO
-from supernote.server.app import bootstrap_ephemeral_user, create_app
-from supernote.server.config import ServerConfig
+from supernote.server.app import (
+    bootstrap_ephemeral_user,
+    create_app,
+    run,
+)
+from supernote.server.components.fake_ai import FakeAiComponent
+from supernote.server.components.search import SEARCH_SERVICE_KEY
+from supernote.server.components.webhooks import WebhooksComponent
+from supernote.server.config import AiConfig, ModelConfig, ProviderConfig, ServerConfig
+from supernote.server.core import ComponentLoader, ServerCore
 from supernote.server.db.models.user import UserDO
+from supernote.server.keys import (
+    COMPONENT_LOADER_KEY,
+    CORE_KEY,
+    EMBEDDING_MODEL_KEY,
+    INTEGRITY_SERVICE_KEY,
+    OCR_MODEL_KEY,
+    PROCESSOR_SERVICE_KEY,
+    SESSION_MANAGER_KEY,
+    USER_SERVICE_KEY,
+)
 from supernote.server.services.processor_modules.png_conversion import (
     PngConversionModule,
 )
+from supernote.server.trace import ACCESS_LOG_FORMAT, SanitizedAccessLogger
 
 
 def test_import_does_not_load_google_genai() -> None:
@@ -186,33 +207,14 @@ async def test_upload_url_with_port_in_forwarded_host(
     )
 
 
-async def test_static_frontend_sha256_fallback(client: TestClient) -> None:
-    """Verify that index.html and client.js include fallback for SHA-256 in insecure contexts."""
-    resp = await client.get("/")
-    assert resp.status == 200
-    assert resp.headers.get("Cache-Control") == "no-cache"
-    html = await resp.text()
-    assert "js-sha256" in html
-    assert "socket.io" in html
-
-    resp = await client.get("/static/js/api/client.js")
-    assert resp.status == 200
-    assert resp.headers.get("Cache-Control") == "no-cache"
-    js = await resp.text()
-    assert "crypto.subtle" in js
-    assert "window.sha256" in js
-    assert "connectSocket" in js
-    assert "supernote:task-sync" in js
-    assert "supernote:file-sync" in js
-    assert "supernote:digest-sync" in js
-
-
 @pytest.mark.parametrize(
     "path",
     [
         "/",
-        "/static/js/main.js",
         "/static/style.css",
+        "/static/js/main.js",
+        "/static/js/api/client.js",
+        "/static/js/composables/useToast.js",
     ],
 )
 async def test_static_frontend_cache_control_no_cache(
@@ -249,7 +251,8 @@ async def test_static_frontend_disabled_when_web_enabled_false(
         (False, True, None, False),
     ],
 )
-def test_png_module_registration_matrix(
+async def test_png_module_registration_matrix(
+    aiohttp_client: AiohttpClient,
     server_config: ServerConfig,
     web_enabled: bool,
     web_notebook_preview: bool,
@@ -264,7 +267,8 @@ def test_png_module_registration_matrix(
         gemini_api_key=gemini_api_key,
     )
     app = create_app(cfg)
-    page_modules = app["processor_service"].page_modules
+    await aiohttp_client(app)
+    page_modules = app[PROCESSOR_SERVICE_KEY].page_modules
     has_png = any(isinstance(m, PngConversionModule) for m in page_modules)
     assert has_png is expected_png
 
@@ -272,7 +276,7 @@ def test_png_module_registration_matrix(
 async def test_bootstrap_ephemeral_user(client: TestClient) -> None:
     """Verify bootstrap_ephemeral_user registers debug@example.com as an admin with system folders."""
     assert client.app is not None
-    session_manager = client.app["session_manager"]
+    session_manager = client.app[SESSION_MANAGER_KEY]
     async with session_manager.session() as session:
         await session.execute(delete(UserDO))
         await session.commit()
@@ -287,55 +291,196 @@ async def test_bootstrap_ephemeral_user(client: TestClient) -> None:
         ).scalar_one()
         assert user.is_admin is True
 
-    integrity_service = client.app["integrity_service"]
+    integrity_service = client.app[INTEGRITY_SERVICE_KEY]
     report = await integrity_service.verify_user_storage(user.id)
     assert report.scanned == 8
     assert report.ok == 8
 
 
-STATIC_DIR = Path(__file__).resolve().parents[2] / "supernote" / "server" / "static"
+def test_run_configures_default_info_level_and_sanitized_access_logger(
+    monkeypatch: pytest.MonkeyPatch,
+    server_config: ServerConfig,
+) -> None:
+    """Verify run() defaults root logging to INFO and wires SanitizedAccessLogger into web.run_app."""
+    monkeypatch.delenv("SUPERNOTE_LOG_LEVEL", raising=False)
+    cfg = dataclasses.replace(server_config, log_level="INFO")
+    monkeypatch.setattr(ServerConfig, "load", lambda _dir=None: cfg)
+
+    captured_kwargs: dict[str, Any] = {}
+
+    def fake_run_app(app: Any, **kwargs: Any) -> None:
+        captured_kwargs["app"] = app
+        captured_kwargs.update(kwargs)
+
+    monkeypatch.setattr("supernote.server.app.web.run_app", fake_run_app)
+
+    run(argparse.Namespace(config_dir=None))
+
+    assert logging.getLogger().level == logging.INFO
+    assert logging.getLogger("aiosqlite").level == logging.INFO
+    assert logging.getLogger("asyncio").level == logging.INFO
+    assert captured_kwargs["access_log_class"] is SanitizedAccessLogger
+    assert captured_kwargs["access_log_format"] == ACCESS_LOG_FORMAT
 
 
-def test_use_toast_composable_exists() -> None:
-    """Verify that the shared useToast composable exists and exports toast helpers."""
-    toast_path = STATIC_DIR / "js" / "composables" / "useToast.js"
-    assert toast_path.is_file(), "useToast.js composable must exist"
-    content = toast_path.read_text(encoding="utf-8")
-    assert "export function useToast" in content
-    assert "export function showToast" in content
-    assert "export function dismissToast" in content
+def test_run_respects_config_and_env_log_level(
+    monkeypatch: pytest.MonkeyPatch,
+    server_config: ServerConfig,
+) -> None:
+    """Verify run() applies config.log_level while keeping noisy library loggers at INFO+."""
+    monkeypatch.setattr("supernote.server.app.web.run_app", lambda *_a, **_kw: None)
+
+    try:
+        monkeypatch.delenv("SUPERNOTE_LOG_LEVEL", raising=False)
+        debug_cfg = dataclasses.replace(server_config, log_level="DEBUG")
+        monkeypatch.setattr(ServerConfig, "load", lambda _dir=None: debug_cfg)
+
+        run(argparse.Namespace(config_dir=None))
+        assert logging.getLogger().level == logging.DEBUG
+        assert logging.getLogger("aiosqlite").level == logging.INFO
+        assert logging.getLogger("asyncio").level == logging.INFO
+
+        monkeypatch.setenv("SUPERNOTE_LOG_LEVEL", "WARNING")
+        warn_cfg = dataclasses.replace(server_config, log_level="WARNING")
+        monkeypatch.setattr(ServerConfig, "load", lambda _dir=None: warn_cfg)
+
+        run(argparse.Namespace(config_dir=None))
+        assert logging.getLogger().level == logging.WARNING
+        assert logging.getLogger("aiosqlite").level == logging.WARNING
+        assert logging.getLogger("asyncio").level == logging.WARNING
+    finally:
+        logging.getLogger().setLevel(logging.INFO)
+        logging.getLogger("aiosqlite").setLevel(logging.INFO)
+        logging.getLogger("asyncio").setLevel(logging.INFO)
 
 
-def test_index_html_renders_toast_container() -> None:
-    """Verify that index.html includes the non-blocking toast notification stack."""
-    index_path = STATIC_DIR / "index.html"
-    html = index_path.read_text(encoding="utf-8")
-    assert 'v-for="toast in toasts"' in html
-    assert "dismissToast(toast.id)" in html
-    assert "toast.message" in html
-
-
-def test_no_blocking_alert_calls_in_static_js() -> None:
-    """Verify that no blocking window.alert() calls remain in static JS files."""
-    js_dir = STATIC_DIR / "js"
-    offending_files: list[str] = []
-    for js_file in sorted(js_dir.rglob("*.js")):
-        content = js_file.read_text(encoding="utf-8")
-        if "alert(" in content:
-            offending_files.append(str(js_file.relative_to(STATIC_DIR)))
-    assert offending_files == [], (
-        f"Found blocking alert() calls in: {', '.join(offending_files)}"
+async def test_jwt_auth_middleware_blocks_api_key_on_interactive_route(
+    client: TestClient,
+    auth_headers: dict[str, str],
+) -> None:
+    """Verify jwt_auth_middleware rejects static API keys on @interactive_session_only handlers."""
+    create_resp = await client.post(
+        "/api/extended/keys",
+        json={"name": "Middleware Check"},
+        headers=auth_headers,
     )
+    assert create_resp.status == 200
+    raw_key = (await create_resp.json())["key"]
+    api_key_headers = {"Authorization": f"Bearer {raw_key}"}
+
+    # Standard API route succeeds with Bearer API key
+    ok_resp = await client.post(
+        "/api/file/capacity/query", json={}, headers=api_key_headers
+    )
+    assert ok_resp.status == 200
+
+    # @interactive_session_only route returns 403 before reaching the handler
+    forbidden_resp = await client.get("/api/extended/keys", headers=api_key_headers)
+    assert forbidden_resp.status == 403
+    assert "Interactive session required" in (await forbidden_resp.json())["errorMsg"]
 
 
-async def test_toast_static_asset_served(client: TestClient) -> None:
-    """Verify that /static/js/composables/useToast.js and index.html are served properly."""
-    resp = await client.get("/static/js/composables/useToast.js")
+async def test_jwt_auth_middleware_accepts_oauth_token_on_file_apis_and_blocks_interactive_route(
+    client: TestClient,
+    create_test_user: None,
+) -> None:
+    """Verify OAuth 2.1 Bearer tokens authenticate file/extended APIs and are blocked on @interactive_session_only routes."""
+    user_service = client.app[USER_SERVICE_KEY]
+    user_id = await user_service.get_user_id("test@example.com")
+
+    oauth_token, _ = await user_service.create_oauth_grant(
+        user_id, "composer_app", ["supernote:all"]
+    )
+    oauth_headers = {"Authorization": f"Bearer {oauth_token}"}
+
+    # File and extended REST endpoints succeed with OAuth 2.1 Bearer token
+    list_resp = await client.post(
+        "/api/file/list/query",
+        json={"directoryId": 0, "pageNo": 1, "pageSize": 20},
+        headers=oauth_headers,
+    )
+    assert list_resp.status == 200
+    assert (await list_resp.json())["success"] is True
+
+    events_resp = await client.get("/api/extended/events", headers=oauth_headers)
+    assert events_resp.status == 200
+
+    # @interactive_session_only routes remain forbidden (403)
+    forbidden_resp = await client.get("/api/extended/keys", headers=oauth_headers)
+    assert forbidden_resp.status == 403
+    assert "Interactive session required" in (await forbidden_resp.json())["errorMsg"]
+
+
+async def test_create_app_wires_server_core_and_skips_disabled_webhooks(
+    aiohttp_client: AiohttpClient,
+    server_config: ServerConfig,
+) -> None:
+    """Verify `create_app` exposes `ServerCore` + `ComponentLoader` and omits disabled webhooks."""
+    config = dataclasses.replace(server_config, web_enabled=False)
+    app = create_app(config)
+
+    assert isinstance(app[CORE_KEY], ServerCore)
+    assert isinstance(app[COMPONENT_LOADER_KEY], ComponentLoader)
+    assert app[COMPONENT_LOADER_KEY].get("webhooks") is None
+
+    test_client = await aiohttp_client(app)
+    resp = await test_client.get("/api/health")
     assert resp.status == 200
-    js_text = await resp.text()
-    assert "useToast" in js_text
 
-    index_resp = await client.get("/")
-    assert index_resp.status == 200
-    html_text = await index_resp.text()
-    assert "toast in toasts" in html_text
+
+async def test_create_app_registers_and_runs_webhooks_component_when_enabled(
+    aiohttp_client: AiohttpClient,
+    server_config: ServerConfig,
+    session_manager: Any,
+) -> None:
+    """Verify enabled webhooks are registered and started via `ComponentLoader`."""
+    config = dataclasses.replace(
+        server_config,
+        web_enabled=False,
+        webhooks={
+            "enabled": True,
+            "endpoints": [
+                {
+                    "url": "http://127.0.0.1:9999/hook",
+                    "user": "test@example.com",
+                    "secret": "secret",
+                }
+            ],
+        },
+    )
+    app = create_app(config)
+
+    comp = app[COMPONENT_LOADER_KEY].get("webhooks")
+    assert isinstance(comp, WebhooksComponent)
+
+    test_client = await aiohttp_client(app)
+    resp = await test_client.get("/api/health")
+    assert resp.status == 200
+
+
+async def test_create_app_loads_fake_ai_only_when_configured(
+    aiohttp_client: AiohttpClient,
+    server_config: ServerConfig,
+) -> None:
+    """Verify `create_app` registers `fake_ai` only when configured and resolves models via `AiRegistrar` on startup."""
+    default_app = create_app(dataclasses.replace(server_config, web_enabled=False))
+    assert default_app[COMPONENT_LOADER_KEY].get("fake_ai") is None
+
+    fake_config = dataclasses.replace(
+        server_config,
+        web_enabled=False,
+        ai=AiConfig(
+            providers={"local_fake": ProviderConfig(type="Fake")},
+            ocr=ModelConfig(provider="local_fake", model="fake-ocr"),
+            embedding=ModelConfig(provider="local_fake", model="fake-embed"),
+        ),
+    )
+    fake_app = create_app(fake_config)
+    assert isinstance(fake_app[COMPONENT_LOADER_KEY].get("fake_ai"), FakeAiComponent)
+
+    await aiohttp_client(fake_app)
+    ocr_model = fake_app[OCR_MODEL_KEY]
+    assert ocr_model is not None
+    assert ocr_model.model_id == "fake-ocr"
+    assert fake_app[EMBEDDING_MODEL_KEY] is not None
+    assert fake_app[SEARCH_SERVICE_KEY].embedding_model is fake_app[EMBEDDING_MODEL_KEY]

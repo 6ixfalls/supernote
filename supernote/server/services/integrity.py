@@ -1,3 +1,13 @@
+"""Two-way storage integrity verification between SQLite VFS records and blob storage.
+
+`IntegrityService` audits `UserFileDO`, `RecycleFileDO`, `SummaryDO`, `NotePageContentDO`,
+and `SystemTaskDO` against physical blobs in `USER_DATA_BUCKET` and `CACHE_BUCKET`
+(`supernote.server.services.blob.BlobStorage`). It detects missing blobs, size/MD5
+mismatches, invalid storage keys, orphan blobs on disk, and broken VFS parent chains,
+returning structured `supernote.models.system.IntegrityReportVO` diagnostics with
+remediation hints. Invoked via `supernote.server.routes.admin` (`supernote admin integrity`).
+"""
+
 import logging
 from collections import defaultdict
 
@@ -20,6 +30,7 @@ from supernote.server.db.session import DatabaseSessionManager
 from supernote.server.services.blob import BlobStorage
 from supernote.server.utils.paths import (
     get_conversion_pdf_path,
+    get_full_conversion_pdf_path,
     get_page_png_path,
     is_valid_page_id,
 )
@@ -352,7 +363,10 @@ class IntegrityService:
 
         disk_cache_keys = await self.blob_storage.list_blobs(CACHE_BUCKET)
         for key in disk_cache_keys:
-            if key not in referenced_cache_keys:
+            full_export_key = get_full_conversion_pdf_path(key)
+            if key not in referenced_cache_keys and (
+                full_export_key not in referenced_cache_keys
+            ):
                 report.scanned += 1
                 detail = f"Unreferenced cache blob in {CACHE_BUCKET}: {key}"
                 logger.warning(f"Integrity Warning: {detail}")

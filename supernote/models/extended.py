@@ -1,7 +1,11 @@
-"""Module for server-specific extension models.
+"""Data models for self-hosted server intelligence extensions (`/api/extended/*`).
 
-These are for APIs that are not part of the standard API offering, specific
-to our new server.
+This module defines request DTOs and response VOs for features specific to the self-hosted Supernote
+server, including hybrid semantic search (`WebSearchRequestDTO`, `WebSearchResponseVO`,
+`SearchResultChunkVO`), page OCR transcripts (`WebTranscriptRequestDTO`, `WebTranscriptResponseVO`,
+`PageTranscriptVO`), AI summary listings (`WebSummaryListRequestDTO`, `WebSummaryListVO`), and
+background task inspection (`FileProcessingStatusDTO`, `FileProcessingStatusVO`, `SystemTaskVO`,
+`SystemTaskListVO`). Consumed by `supernote.client.extended.ExtendedClient`.
 """
 
 from dataclasses import dataclass, field
@@ -14,11 +18,15 @@ from supernote.models.base import BaseResponse, ProcessingStatus
 from supernote.models.summary import SummaryItem
 
 
+def _serialize_str_list(values: list[int]) -> list[str]:
+    return [str(v) for v in values]
+
+
 @dataclass
 class WebSummaryListRequestDTO(DataClassJSONMixin):
     """Request DTO for listing summaries by file ID (Web Extension)."""
 
-    file_id: int = field(metadata=field_options(alias="fileId"))
+    file_id: int = field(metadata=field_options(alias="fileId", serialize=str))
     """The ID of the file to list summaries for."""
 
     class Config(BaseConfig):
@@ -51,10 +59,10 @@ class SystemTaskVO(DataClassJSONMixin):
     Used by: GET /api/extended/system/tasks
     """
 
-    id: int
+    id: int = field(metadata=field_options(serialize=str))
     """The unique ID of the system task."""
 
-    file_id: int = field(metadata=field_options(alias="fileId"))
+    file_id: int = field(metadata=field_options(alias="fileId", serialize=str))
     """The ID of the file associated with this task."""
 
     task_type: str = field(metadata=field_options(alias="taskType"))
@@ -103,7 +111,9 @@ class FileProcessingStatusDTO(DataClassJSONMixin):
         /api/extended/file/processing/status (POST)
     """
 
-    file_ids: list[int] = field(metadata=field_options(alias="fileIds"))
+    file_ids: list[int] = field(
+        metadata=field_options(alias="fileIds", serialize=_serialize_str_list)
+    )
 
     class Config(BaseConfig):
         serialize_by_alias = True
@@ -128,7 +138,7 @@ class FileProcessingStatusVO(BaseResponse):
 class SearchResultVO(DataClassJSONMixin):
     """VO for a single semantic search result."""
 
-    file_id: int = field(metadata=field_options(alias="fileId"))
+    file_id: int = field(metadata=field_options(alias="fileId", serialize=str))
     file_name: str = field(metadata=field_options(alias="fileName"))
     page_index: int = field(metadata=field_options(alias="pageIndex"))
     page_id: str = field(metadata=field_options(alias="pageId"))
@@ -175,7 +185,7 @@ class WebSearchResponseVO(BaseResponse):
 class WebTranscriptRequestDTO(DataClassJSONMixin):
     """Request DTO for retrieving a notebook transcript (Web Extension)."""
 
-    file_id: int = field(metadata=field_options(alias="fileId"))
+    file_id: int = field(metadata=field_options(alias="fileId", serialize=str))
     """The unique ID of the notebook."""
 
     start_index: int | None = field(
@@ -210,6 +220,245 @@ class WebTranscriptResponseVO(BaseResponse):
     """Response VO for transcript retrieval (Web Extension)."""
 
     pages: list[PageTranscriptVO] = field(default_factory=list)
+
+    class Config(BaseConfig):
+        serialize_by_alias = True
+
+
+@dataclass
+class ApiKeyVO(DataClassJSONMixin):
+    """VO representing static Bearer API key metadata.
+
+    Used by: GET /api/extended/keys
+    """
+
+    id: str
+    name: str
+    key_prefix: str = field(metadata=field_options(alias="keyPrefix"))
+    created_at: int = field(metadata=field_options(alias="createdAt"))
+    last_used_at: int | None = field(
+        metadata=field_options(alias="lastUsedAt"), default=None
+    )
+    expires_at: int | None = field(
+        metadata=field_options(alias="expiresAt"), default=None
+    )
+
+    class Config(BaseConfig):
+        serialize_by_alias = True
+
+
+@dataclass
+class CreateApiKeyDTO(DataClassJSONMixin):
+    """Request DTO to create a new static Bearer API key.
+
+    Used by: POST /api/extended/keys
+    """
+
+    name: str
+    expires_in_days: int | None = field(
+        metadata=field_options(alias="expiresInDays"), default=None
+    )
+
+    class Config(BaseConfig):
+        serialize_by_alias = True
+
+
+@dataclass
+class CreateApiKeyResponseVO(BaseResponse):
+    """Response VO after creating a new static Bearer API key.
+
+    Used by: POST /api/extended/keys
+    """
+
+    id: str = ""
+    name: str = ""
+    key: str = ""
+    created_at: int = field(metadata=field_options(alias="createdAt"), default=0)
+    expires_at: int | None = field(
+        metadata=field_options(alias="expiresAt"), default=None
+    )
+
+    class Config(BaseConfig):
+        serialize_by_alias = True
+
+
+@dataclass
+class ApiKeyListResponseVO(BaseResponse):
+    """Response VO listing static Bearer API keys.
+
+    Used by: GET /api/extended/keys
+    """
+
+    keys: list[ApiKeyVO] = field(default_factory=list)
+
+    class Config(BaseConfig):
+        serialize_by_alias = True
+
+
+@dataclass
+class OAuthGrantVO(DataClassJSONMixin):
+    """VO representing an OAuth client the user has authorized.
+
+    Used by: GET /api/extended/oauth/grants
+    """
+
+    id: str
+    client_id: str = field(metadata=field_options(alias="clientId"))
+    """IndieAuth client URL that requested access."""
+
+    scopes: list[str]
+    created_at: int = field(metadata=field_options(alias="createdAt"))
+    expires_at: int = field(metadata=field_options(alias="expiresAt"))
+    last_used_at: int | None = field(
+        metadata=field_options(alias="lastUsedAt"), default=None
+    )
+
+    class Config(BaseConfig):
+        serialize_by_alias = True
+
+
+@dataclass
+class OAuthGrantListResponseVO(BaseResponse):
+    """Response VO listing authorized OAuth clients.
+
+    Used by: GET /api/extended/oauth/grants
+    """
+
+    grants: list[OAuthGrantVO] = field(default_factory=list)
+
+    class Config(BaseConfig):
+        serialize_by_alias = True
+
+
+@dataclass
+class WebNoteCoverRequestDTO(DataClassJSONMixin):
+    """Request DTO for retrieving a single-page cover preview URL for a notebook."""
+
+    file_id: int = field(metadata=field_options(alias="fileId", serialize=str))
+    """The unique ID of the notebook."""
+
+    class Config(BaseConfig):
+        serialize_by_alias = True
+
+
+@dataclass
+class WebNoteCoverVO(BaseResponse):
+    """Response VO for single-page notebook cover preview URL."""
+
+    url: str | None = None
+
+    class Config(BaseConfig):
+        serialize_by_alias = True
+
+
+@dataclass
+class WebAiStatusVO(BaseResponse):
+    """Response VO for server AI processing configuration and health status.
+
+    Used by: GET /api/extended/ai/status
+    """
+
+    has_api_key: bool = field(metadata=field_options(alias="hasApiKey"), default=False)
+    ocr_enabled: bool = field(metadata=field_options(alias="ocrEnabled"), default=False)
+    ocr_model: str | None = field(
+        metadata=field_options(alias="ocrModel"), default=None
+    )
+    summary_enabled: bool = field(
+        metadata=field_options(alias="summaryEnabled"), default=False
+    )
+    summary_model: str | None = field(
+        metadata=field_options(alias="summaryModel"), default=None
+    )
+    vector_search_enabled: bool = field(
+        metadata=field_options(alias="vectorSearchEnabled"), default=False
+    )
+    embedding_model: str | None = field(
+        metadata=field_options(alias="embeddingModel"), default=None
+    )
+    model: str | None = None
+
+    class Config(BaseConfig):
+        serialize_by_alias = True
+
+
+@dataclass
+class WebNoteMetadataRequestDTO(DataClassJSONMixin):
+    """Request DTO for retrieving structured notebook and page metadata."""
+
+    file_id: int = field(metadata=field_options(alias="fileId", serialize=str))
+    """The unique ID of the notebook."""
+
+    class Config(BaseConfig):
+        serialize_by_alias = True
+
+
+@dataclass
+class NoteTitleVO(DataClassJSONMixin):
+    """Heading/outline entry anchored to a notebook page."""
+
+    page_index: int = field(metadata=field_options(alias="pageIndex"))
+    level: int = 1
+
+    class Config(BaseConfig):
+        serialize_by_alias = True
+
+
+@dataclass
+class NoteLinkVO(DataClassJSONMixin):
+    """Hyperlink entry anchored to a notebook page."""
+
+    page_index: int = field(metadata=field_options(alias="pageIndex"))
+    link_type: str = field(metadata=field_options(alias="linkType"))
+    target: str | None = None
+    target_file_id: int | None = field(
+        metadata=field_options(
+            alias="targetFileId",
+            serialize=lambda v: str(v) if v is not None else None,
+        ),
+        default=None,
+    )
+    target_page_index: int | None = field(
+        metadata=field_options(alias="targetPageIndex"), default=None
+    )
+
+    class Config(BaseConfig):
+        serialize_by_alias = True
+
+
+@dataclass
+class NotePageMetadataVO(DataClassJSONMixin):
+    """Per-page structural metadata, blank/star flags, and keywords."""
+
+    page_index: int = field(metadata=field_options(alias="pageIndex"))
+    page_id: str = field(metadata=field_options(alias="pageId"))
+    date: str | None = None
+    style: str | None = None
+    is_blank: bool = field(metadata=field_options(alias="isBlank"), default=False)
+    has_five_star: bool = field(
+        metadata=field_options(alias="hasFiveStar"), default=False
+    )
+    keywords: list[str] = field(default_factory=list)
+
+    class Config(BaseConfig):
+        serialize_by_alias = True
+
+
+@dataclass
+class WebNoteMetadataVO(BaseResponse):
+    """Response VO for structured notebook and per-page metadata.
+
+    Used by: POST /api/extended/file/note/metadata
+    """
+
+    file_id: int = field(
+        metadata=field_options(alias="fileId", serialize=str), default=0
+    )
+    equipment: str | None = None
+    total_pages: int = field(metadata=field_options(alias="totalPages"), default=0)
+    keywords: dict[str, list[int]] = field(default_factory=dict)
+    titles: list[NoteTitleVO] = field(default_factory=list)
+    links: list[NoteLinkVO] = field(default_factory=list)
+    pages: list[NotePageMetadataVO] = field(default_factory=list)
 
     class Config(BaseConfig):
         serialize_by_alias = True

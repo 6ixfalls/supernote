@@ -1,3 +1,13 @@
+"""Administrative and system maintenance client (`AdminClient`).
+
+This module provides `supernote.client.admin.AdminClient` for user account administration
+(`register`, `update_password`, `reset_password`, `admin_create_user`, `admin_list_users`),
+background processor queue control (`get_queue_status`, `stop_queue`, `start_queue`), system task
+inspection (`list_tasks`), note reprocessing (`admin_reprocess`), and two-way storage integrity
+verification (`verify_integrity`). See `supernote.client`, `supernote.models.system`, and
+`supernote.guides.cli_reference`.
+"""
+
 import logging
 
 from supernote.client.client import Client
@@ -8,6 +18,7 @@ from supernote.models.user import (
     RetrievePasswordDTO,
     UpdateEmailDTO,
     UpdatePasswordDTO,
+    UpdateUserQuotaDTO,
     UserRegisterDTO,
 )
 
@@ -90,6 +101,16 @@ class AdminClient:
             json={"email": email, "password": password_md5},
         )
         logger.info(f"Password reset for {email}")
+
+    async def admin_set_quota(self, email: str, total_capacity: int) -> None:
+        """Set a user's storage quota in bytes (0 = unlimited) through the admin API."""
+        dto = UpdateUserQuotaDTO(email=email, total_capacity=total_capacity)
+        await self.client.post_json(
+            "/api/admin/users/quota",
+            BaseResponse,
+            json=dto.to_dict(),
+        )
+        logger.info(f"Updated storage quota for {email} to {total_capacity} bytes")
 
     async def stop_queue(self) -> None:
         """Stop/pause the queue processing."""

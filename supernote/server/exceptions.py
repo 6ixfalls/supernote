@@ -1,4 +1,10 @@
-"""Module for centralized exception handling."""
+"""Domain exception hierarchy (`SupernoteError`) and HTTP error response serialization.
+
+Defines `SupernoteError` and its subclasses (`FileNotFound`, `FileAlreadyExists`,
+`InvalidPath`, `AccessDenied`, `RateLimitExceeded`, `TaskGroupNotFound`, `SummaryNotFound`,
+`DatabaseError`), mapping domain failures to protocol-compliant `supernote.models.base.ErrorCode`
+values and `aiohttp.web.Response` JSON payloads via `SupernoteError.to_response`.
+"""
 
 import logging
 from typing import Self
@@ -173,3 +179,21 @@ class RateLimitExceeded(SupernoteError):
         self, message: str, error_code: str | ErrorCode = ErrorCode.ACCESS_DENIED_SYSTEM
     ):
         super().__init__(message, error_code, status_code=429)
+
+
+class CursorExpiredError(SupernoteError):
+    """Raised when a requested event feed cursor predates retained event history."""
+
+    def __init__(
+        self, message: str, error_code: str | ErrorCode = ErrorCode.BAD_REQUEST
+    ):
+        super().__init__(message, error_code, status_code=410)
+
+
+class InvalidInputError(SupernoteError):
+    """Raised when a request query or parameter is invalid."""
+
+    def __init__(
+        self, message: str, error_code: str | ErrorCode = ErrorCode.BAD_REQUEST
+    ):
+        super().__init__(message, error_code, status_code=400)

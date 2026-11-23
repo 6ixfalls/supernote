@@ -1,4 +1,21 @@
+"""Base `ProcessorModule` state-machine abstraction and pipeline stages.
+
+Each module in `supernote.server.services.processor_modules` implements a single
+idempotent stage of the background `.note` processing pipeline orchestrated by
+`supernote.server.services.processor.ProcessorService` and checkpointed in
+`supernote.server.db.models.note_processing.SystemTaskDO`:
+
+- `supernote.server.services.processor_modules.page_hashing.PageHashingModule` (`TaskType.PAGE_HASHING`)
+- `supernote.server.services.processor_modules.png_conversion.PngConversionModule` (`TaskType.PNG_CONVERSION`)
+- `supernote.server.services.processor_modules.ocr.OcrModule` (`TaskType.OCR_EXTRACTION`)
+- `supernote.server.services.processor_modules.embedding.EmbeddingModule` (`TaskType.EMBEDDING_GENERATION`)
+- `supernote.server.services.processor_modules.summary.SummaryModule` (`TaskType.SUMMARY_GENERATION`)
+
+See `supernote.guides.note_processing_design` and `supernote.guides.mcp`.
+"""
+
 import abc
+import asyncio
 import logging
 import time
 
@@ -131,13 +148,17 @@ class ProcessorModule(abc.ABC):
             bool: True if the process is completed or skipped. False if it failed.
                   A False return value usually stalls the pipeline for this page/file.
         """
+        if not self.enabled:
+            return True
+
         if not await self.run_if_needed(file_id, session_manager, page_index, page_id):
+            PROCESSOR_TASKS_TOTAL.labels(module=self.name, status="skipped").inc()
             return True
 
         key = self.get_task_key(page_index, page_id)
         logger.info(f"Running {self.name} for file {file_id} (key={key})")
 
-        start_time = time.perf_counter()
+        start_time = time.monotonic()
         status_str = "failure"
         try:
             await self.process(
@@ -153,6 +174,9 @@ class ProcessorModule(abc.ABC):
             )
             status_str = "success"
             return True
+        except asyncio.CancelledError:
+            status_str = "cancelled"
+            raise
         except Exception as e:
             logger.error(f"Error in {self.name} for file {file_id}: {e}", exc_info=True)
             msg = str(e)
@@ -167,6 +191,18 @@ class ProcessorModule(abc.ABC):
             )
             return False
         finally:
-            duration = time.perf_counter() - start_time
+            duration = time.monotonic() - start_time
             PROCESSOR_TASKS_TOTAL.labels(module=self.name, status=status_str).inc()
-            PROCESSOR_TASK_DURATION_SECONDS.labels(module=self.name).observe(duration)
+            if status_str != "cancelled":
+                PROCESSOR_TASK_DURATION_SECONDS.labels(module=self.name).observe(
+                    duration
+                )
+
+    async def cleanup_file(
+        self,
+        file_id: int,
+        user_id: int,
+        session_manager: DatabaseSessionManager,
+    ) -> None:
+        """Clean up module-owned domain artifacts when a note file is deleted."""
+        return None

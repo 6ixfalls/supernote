@@ -1,0 +1,40 @@
+{
+  "files": {
+    "includes": [
+      "supernote/server/static/js/**/*.js",
+      "supernote/server/static/js/**/*.d.ts",
+      "tests/frontend/**/*.mjs"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 4,
+    "lineWidth": 100
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "single"
+    }
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "suspicious": {
+        "noAlert": "error"
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["supernote/server/static/js/**/*.d.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noExplicitAny": "off"
+          }
+        }
+      }
+    }
+  ]
+}

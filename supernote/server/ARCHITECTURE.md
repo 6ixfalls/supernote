@@ -1,357 +1,318 @@
-# Supernote Server Architecture & Protocol Guide
+# Open Private Cloud Server Architecture & Wire Protocol
 
-This document provides a comprehensive guide to the Supernote server architecture and protocol. It is intended to assist in re-implementing the server or creating compatible clients.
+This document describes the architecture of the **Open Private Cloud for Supernote** Python server (`supernote.server`) and the Supernote Private Cloud wire protocol it implements:
 
-## 1. Architecture Overview
+1. **The Supernote Private Cloud Wire Protocol** — the HTTP, OSS transfer, and Socket.IO contract required by physical Supernote hardware tablets (Nomad, Manta, A5X, A6X) and companion apps.
+2. **This Project's Python/Asyncio Server Architecture** — how `supernote.server` implements that wire protocol alongside a local Virtual File System (VFS), content-addressable blob storage, an event-driven AI note processing pipeline, an append-only domain event log, and a Model Context Protocol (MCP) server in a single lightweight Python process.
 
-The Supernote server is a **Spring Boot** application using **MyBatis** for data access and **Redis** for caching and session management.
+Open Private Cloud is an asynchronous Python server built to run as a lightweight, self-hosted service using a single SQLite database and local file storage:
 
--   **Framework**: Spring Boot
--   **Database**: MySQL (inferred from Mapper usage)
--   **Cache**: Redis (used for tokens, locks, and temporary codes)
--   **Storage**: Local file system (NAS mode) or S3-compatible storage (Cloud mode). The analyzed code focuses on the "Local/NAS" mode (`F_FileLocalController`).
--   **Authentication**: JWT (JSON Web Tokens) with HMAC256.
+- **HTTP / Web Framework**: `aiohttp` (`supernote.server.app`) serving device sync endpoints, Web UI routes, signed object storage endpoints, and the static Vue 3 Web UI (`supernote/server/static/`).
+- **Database**: SQLAlchemy 2.0 (async) with `aiosqlite` and Alembic migrations (`supernote/alembic/`) backed by a single SQLite file (`storage/system/supernote.db`).
+- **Coordination & Session State**: `CoordinationService` (`supernote.server.services.coordination.SqliteCoordinationService`, backed by `KeyValueDO`) manages login challenges, stateful JWT sessions, sync session locks, event log pruning watermarks, and single-use URL signing nonces.
+- **Virtual Filesystem, Quotas & Storage**: `VirtualFileSystem` (`supernote.server.services.vfs`) and `FileService` (`supernote.server.services.file`) track the logical folder tree in `UserFileDO` (`f_user_file`), soft-deleted items in `RecycleFileDO` (`f_recycle_file`), and enforce two-tier storage quotas (`UserDO.total_capacity` -> `default_user_quota` -> volume free space), while `LocalBlobStorage` (`supernote.server.services.blob`) stores binary file content on disk by bucket (`supernote-user-data`, `supernote-cache`).
+- **Authentication**: Challenge-response login issuing `HS256` JWTs (`x-access-token` header) backed by session state in `CoordinationService`, plus revocable static Bearer API keys (`sn_...` in `ApiKeyDO` / `f_api_key`) for CLI automation and MCP agents.
+- **Notebook Rendering & AI Processing**: `ConversionService` (`supernote.server.services.conversion`) and `ProcessorService` (`supernote.server.services.processor`) use the local `supernote.notebook` library to parse `.note` metadata (`NoteMetadataDO`, `NotePageMetadataDO`), render pages to PNG/PDF, and optionally run OCR, summarization, and vector embeddings (automatically skipping blank pages where `has_drawables == False`).
+- **Domain Event Log & Real-Time Messaging**: `EventLogService` (`supernote.server.components.events`) persists per-user domain events (`UserEventDO` in `f_user_event`) for cursor-based incremental sync, while `SocketIOServerManager` (`supernote.server.components.socketio`, powered by `python-socketio` with Engine.IO v3 compatibility middleware) subscribes to `LocalEventBus` and pushes sync notifications to connected Supernote devices.
 
-## 2. Authentication Protocol
+---
 
-The authentication flow uses a challenge-response mechanism involving a random code and timestamp to prevent replay attacks.
+## Supernote Private Cloud Wire Protocol
 
-### 2.1. Get Random Code (Challenge)
+Ratta's original Supernote Private Cloud server was designed around a Java/Spring Boot + MySQL + Redis + external TCP `QTServer` stack. To remain 100% wire-compatible with unmodified Supernote hardware firmware, `supernote.server` implements the exact REST endpoints, JSON payload conventions (`mashumaro` DTOs/VOs in `supernote.models`), cryptographic handshakes, and real-time Socket.IO events expected by the devices.
+
+### Challenge-Response Authentication & API Keys
+
+Hardware devices and web clients authenticate via a two-step challenge-response flow to prevent credential replay without requiring plaintext password transmission on the wire.
+
+```mermaid
+sequenceDiagram
+    participant Client as Supernote Device / SDK
+    participant Server as Open Private Cloud (auth.routes)
+    participant Coord as SqliteCoordinationService
+
+    Client->>Server: 1. POST /api/official/user/query/random/code (account)
+    Server->>Coord: Store challenge nonce (5-min TTL)
+    Server-->>Client: RandomCodeVO (randomCode, timestamp)
+    Note over Client: md5_pw = MD5(password)<br/>salted = SHA256(md5_pw + randomCode)
+    Client->>Server: 2. POST /api/official/user/account/login/new (or /login/equipment)
+    Server->>Coord: Pop & verify challenge nonce
+    Server->>Coord: Register stateful session token
+    Server-->>Client: LoginVO (token=JWT, userId)
+```
+
+#### Get Random Code (Challenge)
+
 **Endpoint**: `POST /api/official/user/query/random/code`
 
-**Request (`RandomCodeDTO`)**:
+**Request (`supernote.models.auth.RandomCodeDTO`)**:
 ```json
 {
   "account": "user@example.com",
-  "countryCode": "+1" // Optional if email
+  "countryCode": "+1"
 }
 ```
 
-**Response (`RandomCodeVO`)**:
+**Response (`supernote.models.auth.RandomCodeVO`)**:
 ```json
 {
+  "success": true,
   "randomCode": "12345678",
-  "timestamp": 1678888888000
+  "timestamp": "1678888888000"
 }
 ```
 
-### 2.2. Login
-**Endpoint**: `POST /api/official/user/account/login/new` (or `/api/official/user/account/login/equipment` for devices)
+`UserService` stores the challenge in `CoordinationService` under `challenge:{account}:{timestamp}` with a 5-minute TTL.
 
-**Request (`LoginDTO`)**:
+#### Submit Salted Login Hash
+
+**Endpoint**: `POST /api/official/user/account/login/new` (or `POST /api/official/user/account/login/equipment` for hardware device logins)
+
+**Request (`supernote.models.auth.LoginDTO`)**:
 ```json
 {
   "account": "user@example.com",
   "password": "SHA256_HASH_OF_PASSWORD",
-  "timestamp": 1678888888000, // From Step 2.1
-  "equipmentNo": "SN100B...", // Required for equipment login
-  "equipment": 3, // 1: Web, 2: App, 3: Terminal (Device), 4: User Platform
-  "loginMethod": "2" // 1: Phone, 2: Email, 3: WeChat
+  "timestamp": "1678888888000",
+  "equipmentNo": "SN100B...",
+  "equipment": 3,
+  "loginMethod": "2"
 }
 ```
+
+`equipment` indicates the client type (`1`: Web, `2`: App, `3`: Terminal/Device, `4`: Platform).
 
 **Password Hashing Logic**:
-1.  **MD5 Hash**: `md5_pass = MD5(plain_text_password)`
-2.  **SHA256 Hash**: `final_pass = SHA256(md5_pass + randomCode)`
-    *   *Note*: If the server stores plain text passwords (unlikely), step 1 might be skipped. However, legacy code suggests MD5 is the base storage format.
+1. **MD5 Hash**: `md5_pass = MD5(plain_text_password)` (stored on `UserDO.password_md5`).
+2. **Salted SHA256 Hash**: `client_hash = SHA256(md5_pass + randomCode)`.
+3. On verification, the server consumes (`pop_value`) the challenge from `CoordinationService` and compares `SHA256(user.password_md5 + random_code)` using constant-time `hmac.compare_digest`.
 
-**Response (`LoginVO`)**:
+**Response (`supernote.models.auth.LoginVO`)**:
 ```json
 {
+  "success": true,
   "token": "eyJ0eXAiOiJKV1Qi...",
-  "userId": 12345,
-  ...
+  "counts": "0",
+  "isBind": "Y",
+  "isBindEquipment": "Y",
+  "userName": "user@example.com",
+  "soldOutCount": 0
 }
 ```
 
-### 2.3. Token Usage
--   **Header**: `x-access-token: <token>`
--   **Secret**: The JWT signature secret is a long hardcoded string in `JwtTokenUserUtil`.
-    -   Legacy/Fallback Secret: `<REDACTED_SECRET>` (See `SENSITIVE.md`)
+#### Token Usage, Revocation & Static Bearer API Keys (`sn_...`)
 
-## 3. File Synchronization Protocol
+- **Session JWT Header**: `x-access-token: <token>` (also accepted via `Authorization: Bearer <token>`, cookie, or query parameter where applicable, plus CSRF validation via `GET /api/csrf` and `X-XSRF-TOKEN` on cookie-backed web routes).
+- **Signing Key**: Configured via `SUPERNOTE_JWT_SECRET` / `auth.secret_key`, or auto-generated as a random 256-bit secret and persisted in `CoordinationService` (`system:jwt_secret_key`).
+- **Stateful Session Validation**: Every authenticated JWT request verifies both the signature/expiration (`auth.expiration_hours` for web/CLI, `auth.device_expiration_hours` for hardware) and active session state in `CoordinationService`, allowing individual device unlinks, password resets, or global key rotation to revoke tokens immediately.
+- **Static Bearer API Keys (`sn_...`)**: Headless scripts, CLI automation, and MCP clients can authenticate with `Authorization: Bearer sn_...` keys created via `POST /api/extended/keys` (`supernote cloud keys create`). Raw keys are hashed with SHA-256 into `ApiKeyDO` (`f_api_key`). Sensitive account/key-mutation routes use `@interactive_session_only` (`supernote.server.routes.decorators.interactive_session_only`) to reject static API keys (`request["auth_method"] == "api_key"`).
+- **OAuth Client Grants**: Each OAuth authorization approved through `/login-bridge` is recorded as an `OAuthGrantDO` (`oauth_grants`) row when its code is exchanged. The row holds SHA-256 digests of the grant's current access token and its refresh token, so `UserService.load_oauth_access_token` verifies a Bearer token in one query for REST and `/mcp` alike. `GET /api/extended/oauth/grants` lists a user's authorized clients and `DELETE /api/extended/oauth/grants/{grantId}` (both `@interactive_session_only`) deletes the row. Revoking a refresh token through `/revoke`, or changing or resetting the password, ends the grant too.
 
-The file synchronization process involves a session lifecycle (Start -> List/Upload/Download -> End).
+---
 
-### 3.1. Start Sync Session
-**Endpoint**: `POST /api/file/2/files/synchronous/start`
+### 3-Step File Synchronization Protocol
 
-**Request**:
+Device synchronization (`/api/file/2/*` and `/api/file/3/*`) runs inside a locked session lifecycle (`Start -> List / Upload / Download / Delete -> End`) with a 3-step upload flow (`Apply -> Transfer -> Finish`):
+
+```mermaid
+sequenceDiagram
+    participant Device as Supernote Device
+    participant API as File / Sync Routes
+    participant OSS as OSS Routes (/api/oss/*)
+    participant Bus as LocalEventBus
+
+    Device->>API: POST /api/file/2/files/synchronous/start (equipmentNo)
+    Note over API: Acquire per-user sync lock (sync:lock:{user_id})
+    Device->>API: POST /api/file/3/files/list_folder_v3 (id, recursive)
+    API-->>Device: ListFolderLocalVO (entries with MD5 & paths)
+    Device->>API: Step A: POST /api/file/3/files/upload/apply (path, fileName, size)
+    API-->>Device: FileUploadApplyLocalVO (fullUploadUrl, partUploadUrl, innerName)
+    Device->>OSS: Step B: POST /api/oss/upload (or /upload/part) with signed URL
+    OSS-->>Device: UploadFileVO (md5)
+    Device->>API: Step C: POST /api/file/2/files/upload/finish (fileName, path, content_hash, innerName)
+    API->>Bus: Publish VfsItemCreatedEvent & NoteUpdatedEvent
+    API-->>Device: FileUploadFinishLocalVO
+    Device->>API: POST /api/file/2/files/synchronous/end (equipmentNo, flag="Y")
+    API->>Bus: Publish SyncCompletedEvent
+```
+
+#### Start Sync Session (`POST /api/file/2/files/synchronous/start`)
+
+**Request (`SynchronousStartLocalDTO`)**:
 ```json
 {
   "equipmentNo": "SN100B..."
 }
 ```
-**Logic**: Checks Redis lock to ensure no other device is syncing the same account.
 
-### 3.2. List Files
-**Endpoint**: `POST /api/file/3/files/list_folder_v3`
+Checks `CoordinationService` (`sync:lock:{user_id}`, 300 s TTL) to ensure no other device is concurrently syncing the same account. If another device holds the lock, the server returns HTTP `409` with error code `E0078` (`ErrorCode.ANOTHER_DEVICE_SYNCING`). Also returns `synType` indicating whether initial sync has already completed (`sync:initialized:{user_id}`).
 
-**Request**:
+#### List Files (`POST /api/file/3/files/list_folder_v3`)
+
+**Request (`ListFolderLocalDTO`)**:
 ```json
 {
-  "id": 0, // 0 for root directory
+  "id": 0,
   "recursive": true,
   "equipmentNo": "SN100B..."
 }
 ```
 
-**Response**:
+**Response (`ListFolderLocalVO`)**:
 ```json
 {
+  "success": true,
+  "equipmentNo": "SN100B...",
   "entries": [
     {
       "id": "1001",
       "name": "MyNote.note",
-      "tag": "file", // "file" or "folder"
+      "tag": "file",
       "size": 1024,
       "content_hash": "MD5_HASH",
       "path_display": "/MyNote.note",
+      "parent_path": "/",
+      "is_downloadable": true,
       "lastUpdateTime": 1678888888000
-    },
-    ...
+    }
   ]
 }
 ```
 
-**Sync Logic**:
-The synchronization appears to be **state-based**. The client lists the server's file state (MD5 hashes) and compares it with the local state.
--   **Upload**: If local file is new or has different MD5 -> Upload.
--   **Download**: If server file is new or has different MD5 -> Download.
--   **Delete**: If file is missing on one side (and marked for deletion) -> Delete (handled by `delete_folder_v3`).
+Synchronization is **state-based**: the client compares server MD5 hashes (`content_hash`) and paths against local state to decide uploads, downloads, or deletions (`POST /api/file/3/files/delete_folder_v3`).
 
-### 3.3. Upload File
-Uploads are a two-step process: Apply (Get URL) -> Upload -> Finish (Confirm).
+#### Upload File (`Apply -> Transfer -> Finish`)
 
-**Step A: Apply**
-**Endpoint**: `POST /api/file/3/files/upload/apply`
+- **Step A: Apply (`POST /api/file/3/files/upload/apply` or web `/api/file/upload/apply`)**:
+  Validates prospective upload `size` against the user's effective quota (`UserDO.total_capacity` or `default_user_quota`) and physical disk headroom (`LocalBlobStorage.get_available_bytes()`), raising `QuotaExceeded` (`E0012`) if exceeded. Allocates a `storage_key` (`innerName`) and returns signed URLs (`fullUploadUrl` and `partUploadUrl`).
+  ```json
+  {
+    "path": "/Note/MyNote.note",
+    "fileName": "MyNote.note",
+    "size": "1024",
+    "equipmentNo": "SN100B..."
+  }
+  ```
+- **Step B: Transfer (`POST /api/oss/upload` or `POST|PUT /api/oss/upload/part`)**:
+  Streams binary data into `LocalBlobStorage`, verifying the URL signature via `UrlSigner`. For chunked uploads, parts are staged under chunk keys and merged into `USER_DATA_BUCKET` when `partNumber == totalChunks`.
+- **Step C: Finish (`POST /api/file/2/files/upload/finish` or web `/api/file/upload/finish`)**:
+  Verifies the stored blob's MD5 against `content_hash`, re-verifies quota constraints inside the VFS transaction, commits the `UserFileDO` row in SQLite, and publishes domain events (`VfsItemCreatedEvent` / `VfsItemUpdatedEvent`, `NoteUpdatedEvent`) onto `LocalEventBus`.
 
-**Request**:
+#### Download File (`POST /api/file/3/files/download_v3` -> `GET /api/oss/download`)
+
+1. **Apply**: Looks up the `UserFileDO` entry by `id`, verifies ownership, and returns `FileDownloadLocalVO` containing a signed `url` (`/api/oss/download?path={id}&signature=...`).
+2. **Transfer**: Verifies the URL signature via `UrlSigner` (`single_use=False`) and streams bytes with HTTP `Range` support from `LocalBlobStorage`.
+
+#### End Sync Session (`POST /api/file/2/files/synchronous/end`)
+
+**Request (`SynchronousEndLocalDTO`)**:
 ```json
 {
-  "path": "/Folder/Note.note",
-  "fileName": "Note.note",
-  "size": "1024",
-  "equipmentNo": "SN100B..."
+  "equipmentNo": "SN100B...",
+  "flag": "Y"
 }
 ```
 
-**Response**:
-```json
-{
-  "fullUploadUrl": "http://server/api/oss/upload?signature=...&path=...",
-  "authorization": "...", // Signature
-  "timestamp": "...",
-  "nonce": "..."
-}
+Releases `sync:lock:{user_id}` if held by `equipmentNo`. When `flag != "N"`, marks `sync:initialized:{user_id}`, runs opportunistic expired recycle-bin pruning, and publishes `SyncCompletedEvent` onto `LocalEventBus`.
+
+---
+
+### Signed Object Storage URLs (`/api/oss/`)
+
+`UrlSigner` (`supernote.server.utils.url_signer.UrlSigner`) secures `/api/oss/*` upload and download URLs without requiring `x-access-token` headers on direct blob transfers:
+
+- **Mechanism**: Appends a `signature` query parameter containing an `HS256` JWT signed with the server secret key.
+- **Signed Claims**: Embeds the target `path`, `user` email, expiration (`exp`, default 15 minutes), and a unique `nonce` (`jti`).
+- **Single-Use vs. Reusable Tokens**: Upload URLs enforce single-use nonce consumption in `CoordinationService` (or consume on the final chunk for multipart uploads), while download URLs allow range requests within the expiry window (`single_use=False`).
+
+---
+
+### Real-Time Socket.IO Push Protocol (Engine.IO v3 & v4)
+
+Physical Supernote tablets maintain a persistent Socket.IO connection to receive instant push notifications when files, tasks, or digests change on the cloud.
+
+- **Engine.IO v3/v4 Compatibility**: Older Supernote firmware connects with Engine.IO v3 (`?EIO=3`), while modern clients use Engine.IO v4 (`?EIO=4`). `socketio_compat_middleware` and `_CompatAsyncServer` in `supernote.server.components.socketio` transparently bridge Engine.IO v3 handshakes and ping/pong frames onto `python-socketio`.
+- **Handshake Signature Verification**: Clients connect with `?token=<JWT>&type=<conn_type>&random=<ms>&sign=<hmac>`. `supernote.server.socket_auth.verify_handshake_signature` verifies `HMAC-SHA256(SOCKET_IO_KEY, f"{token}_{type}_{random}")` (alphanumeric base64) and validates the active session token in `UserService`.
+- **Heartbeats & Push Channels**:
+  - `ratta_ping` -> replies `"received"`.
+  - `ClientMessage` with payload `"status"` -> replies `"true"` on `ServerMessage`.
+  - Domain events on `LocalEventBus` are automatically broadcast to the user's Socket.IO room (`user_{user_id}`):
+    - `ServerMessage` (`FILE-SYN`): `STARTSYNC`, `ADDFILE`, `ADDFOLDER`, `MODIFYFILE`, `MOVEFILE`, `COPYFILE`, `DELETEFILE`, etc.
+    - `to-do` (`TASK-SYN`): `QUERY` notification when schedule tasks or task groups change.
+    - `digest` (`DIGEST-SYN`): `ADD_DIGEST`, `UPDATE_DIGEST`, `DELETE_DIGEST` when summaries or tags change.
+
+---
+
+## Python/Asyncio Server Architecture
+
+Rather than requiring a heavy multi-container deployment (Java + MySQL + Redis + S3 + QTServer), `supernote.server` consolidates the entire stack into a single self-contained Python `asyncio` application built on `aiohttp`, `SQLAlchemy[asyncio]`, and `aiosqlite`.
+
+```mermaid
+flowchart TB
+    Clients["Supernote Tablet · Web UI · Python SDK · MCP Clients"] --> HTTP["aiohttp Server (:8080) & FastMCP Server (:8081)<br/>REST Routes · Socket.IO · OAuth 2.1 / Bearer sn_..."]
+    HTTP --> Services["Domain Services<br/>FileService · UserService · ScheduleService · SearchService · ConversionService"]
+    Services --> Bus["LocalEventBus & EventLogService"]
+    Bus --> Pipeline["ProcessorService & WebhookService<br/>PageHashing → PNG → OCR → Embedding → Summary"]
+    Services --> Storage[("SQLite (supernote.db) & LocalBlobStorage")]
+    Pipeline --> Storage
 ```
 
-**Step B: Transfer**
-Upload the file content to `fullUploadUrl` using `POST` (multipart/form-data).
+### Replacing External Infrastructure with Embedded Components
 
-**Step C: Finish**
-**Endpoint**: `POST /api/file/2/files/upload/finish`
+| Legacy Java Component | `supernote.server` Component | Architectural Design |
+| :--- | :--- | :--- |
+| **Spring Boot + MyBatis + MySQL** | `aiohttp.web` + `SQLAlchemy[asyncio]` + `aiosqlite` + `Alembic` | Asynchronous relational persistence in `<storage_root>/system/supernote.db` with automatic schema migrations on startup (`run_migrations`). |
+| **Redis** (locks, tokens, nonces) | `supernote.server.services.coordination.SqliteCoordinationService` | Implements `CoordinationService` (`set_value`, `get_value`, `pop_value`, `increment`, `delete_by_prefix`) backed by the `key_values` (`KeyValueDO`) SQLite table with TTL expiration. Used for sync locks, stateful JWT sessions, single-use URL nonces, rate limiting, and queue pause state. |
+| **Physical Folder Tree / S3** | `VirtualFileSystem` (`UserFileDO`) + `LocalBlobStorage` | Decouples logical paths from physical storage. `f_user_file` stores the hierarchical directory adjacency list (`directory_id`), while `LocalBlobStorage` stores immutable blobs sharded by prefix (`<storage_root>/<bucket>/<key[:2]>/<key>`) in `supernote-user-data` (`USER_DATA_BUCKET`) and `supernote-cache` (`CACHE_BUCKET`). |
+| **External TCP `QTServer`** | `supernote.server.services.conversion.ConversionService` | Replaces the proprietary TCP socket conversion server by calling `supernote.notebook.ImageConverter` and `supernote.notebook.PdfConverter` directly in worker threads and caching outputs in `CACHE_BUCKET`. |
+| **Message Broker** | `supernote.server.events.LocalEventBus` + `EventLogService` | In-process `asyncio` pub/sub bus (`LocalEventBus`) paired with a persistent, cursor-paginated SQLite domain event log (`EventLogService` / `UserEventDO` in `f_user_event`), decoupling HTTP handlers from background AI processing (`ProcessorService`), real-time Socket.IO notifications, blob garbage collection, and outbound webhooks (`WebhookService`). |
 
-**Request**:
-```json
-{
-  "path": "/Folder/Note.note",
-  "fileName": "Note.note",
-  "size": "1024",
-  "content_hash": "MD5_HASH_OF_FILE",
-  "equipmentNo": "SN100B..."
-}
-```
+---
 
-### 3.4. Download File
-**Endpoint**: `POST /api/file/3/files/download_v3`
+### Core Database Schema (`supernote.server.db.models`)
 
-**Request**:
-```json
-{
-  "id": 1001,
-  "equipmentNo": "SN100B..."
-}
-```
+All timestamps follow the Supernote protocol convention of 64-bit Unix epoch milliseconds (`int(time.time() * 1000)`), and user-owned tables enforce multi-tenant scoping by `user_id`.
 
-**Response**:
-```json
-{
-  "url": "http://server/api/oss/download?path=...&signature=..."
-}
-```
+- **Users, Devices & Static API Keys (`supernote/server/db/models/user.py`, `api_key.py`)**:
+  - `UserDO` (`users`): Stores user accounts, `password_md5`, `is_admin`, and per-user storage quota override (`total_capacity`, where `0` defers to `default_user_quota` or volume free space).
+  - `DeviceDO` (`f_device`) & `EquipmentUserDO` (`f_equipment_user`): Track bound Supernote hardware tablets.
+  - `ApiKeyDO` (`f_api_key`): Stores revocable static Bearer API keys (`sn_...`) keyed by `(user_id, id)` with unique SHA-256 `key_hash`, `key_prefix`, `name`, `created_time`, and `last_used_time`.
+- **Virtual File System (`supernote/server/db/models/file.py`)**:
+  - `UserFileDO` (`f_user_file`): Adjacency-list tree where `directory_id = 0` is the user's root directory. Folders (`is_folder = "Y"`) are logical rows; files (`is_folder = "N"`) reference physical blobs via `storage_key` and `md5`. Soft-deleted items set `is_active = "N"`.
+  - `RecycleFileDO` (`f_recycle_file`) & `CapacityDO` (`f_capacity`): Track recycle bin entries and per-user storage usage.
+- **Note Metadata, Processing & Intelligence (`supernote/server/db/models/note_processing.py`)**:
+  - `NoteMetadataDO` (`f_note_metadata`): Keyed by `(user_id, file_id)`. Stores cached notebook-level `.note` binary metadata (`native_file_id`, `file_type`, `signature`, `total_pages`, `header_json`, `footer_json`).
+  - `NotePageMetadataDO` (`f_note_page_metadata`): Keyed by `(user_id, file_id, page_index)` across `0..total_pages - 1`. Stores `page_id`, `content_hash`, `page_style` (`PAGESTYLE`), `has_ink` (MAINLAYER/BGLAYER vector/bitmap ink), `has_drawables` (foreground ink, textboxes, or geometric shapes), `page_json`, `keywords_json` (`PAGE_KEYWORDS`), `titles_json` (`PAGE_TITLES`), and `links_json` (`PAGE_LINKS`).
+  - `NotePageContentDO` (`f_note_page_content`): Keyed by `(user_id, file_id, page_id)`. Stores the page's 0-based `page_index`, layer metadata `content_hash`, extracted `text_content` (OCR), JSON `embedding` vector, and `embedding_model` identifier.
+  - `SystemTaskDO` (`f_system_task`): Keyed by `(user_id, file_id, task_type, key)` where `key` is `"global"` or `"page_{page_id}"`. Tracks `ProcessingStatus` (`PENDING`, `PROCESSING`, `COMPLETED`, `FAILED`), module `data` (version/model tag), `retry_count`, and `last_error`.
+- **Summaries, Schedule & Domain Event Log (`supernote/server/db/models/summary.py`, `schedule.py`, `event_log.py`)**:
+  - `SummaryDO` (`f_summary`) & `SummaryTagDO` (`f_summary_tag`): Store user-created digests/categories/annotations and server-generated AI synthesis summaries.
+  - `ScheduleTaskGroupDO` (`t_schedule_task_group`), `ScheduleTaskDO` (`t_schedule_task`), `ScheduleRecurTaskDO` (`t_schedule_recur_task`), and `ScheduleSortDO` (`t_schedule_sort`): Store synced device tasks and task lists.
+  - `UserEventDO` (`f_user_event`): Append-only domain event log keyed by monotonic `seq` with `(user_id, seq)` index, storing `event_type`, `actor`, `entity_type`, `entity_id`, `related_file_id`, and JSON `payload` (pruned after `event_log_retention_days`).
 
-### 3.5. End Sync Session
-**Endpoint**: `POST /api/file/2/files/synchronous/end`
+---
 
-**Request**:
-```json
-{
-  "equipmentNo": "SN100B..."
-}
-```
+### Asynchronous Note Processing Pipeline (`ProcessorService`)
 
-## 4. Internal Security & Signing
+When a `.note` file is uploaded or updated (`NoteUpdatedEvent`) or when a device sync session finishes (`SyncCompletedEvent`), `supernote.server.services.processor.ProcessorService` enqueues the `file_id` for background processing without blocking the HTTP response.
 
-### 4.1. OSS/Local File Signing
-The `O_OssLocalController` uses a signature to secure direct file access.
+1. **Global Pre-Processing (`PageHashingModule`, `version="v2"`)**:
+   - Parses `.note` metadata via `supernote.notebook.parse_metadata`, computes an MD5 hash for each page's metadata (`PAGEID`), selectively loads uncached page streams (`load(..., page_number=i)`) to detect foreground ink/drawables, upserts `NoteMetadataDO`, `NotePageMetadataDO`, and `NotePageContentDO`, and invalidates downstream `SystemTaskDO` checkpoints only for modified or deleted pages.
+2. **Per-Page Parallel Processing (bounded by `page_concurrency`)**:
+   - `PngConversionModule` (`TaskType.PNG_CONVERSION`): Renders only the target page (`load_notebook(..., page_number=page_index)`) to PNG and stores it in `CACHE_BUCKET`.
+   - `OcrModule` (`TaskType.OCR_EXTRACTION`): If `NotePageMetadataDO.has_drawables` is `False` (blank page), writes `text_content = ""` without requiring a PNG or calling the OCR LLM. Otherwise formats the prompt (routing by filename stem -> normalized `page_style` -> `default` and injecting `Page Keywords:` from `NotePageMetadataDO.keyword_texts`), sends the cached page PNG to `OcrModel`, and writes `text_content` to `NotePageContentDO`.
+   - `EmbeddingModule` (`TaskType.EMBEDDING_GENERATION`): Skips blank pages (`content.is_blank`); generates a vector embedding from non-blank `text_content` via `EmbeddingModel` and stores it on `NotePageContentDO`.
+3. **Global Post-Processing (`SummaryModule`)**:
+   - Once all pages have completed OCR, assembles the non-blank page transcripts in memory and invokes `SummaryModel` to generate a chronological synthesis (`SummaryDO`) under the shared `"AI Summaries"` Digest category.
+   - Emits `NoteProcessingCompletedEvent` upon completion.
 
--   **Secret Key**: `<REDACTED_SECRET>` (See `SENSITIVE.md` for local dev, generate a new one for your server)
--   **Path Encryption**: Base64 (URL Safe, No Padding) of the UTF-8 path.
--   **Signature Algorithm**: `HMAC-SHA256` (Hex encoded).
+For full pipeline semantics, state machine rules, and failure recovery details, see `supernote.guides.note_processing_design` ([`docs/note_processing_design.md`](../../docs/note_processing_design.md)).
 
-**Upload Signature**:
-`SHA256Hex(encryptedPath + timestamp + nonce + fileSize + secretKey)`
+---
 
-**Download Signature**:
-`SHA256Hex(encryptedPath + timestamp + nonce + secretKey)`
+### Dual-Port Model Context Protocol (MCP) Server
 
-## 5. Data Models
+When `mcp_enabled` is configured, `create_app` in `supernote.server.app` exposes the user's notebook knowledge base to AI assistants using a dual-port OAuth 2.1 + FastMCP architecture:
 
-### 5.1. UserFileDO (Database)
-Represents a file or folder.
--   `id`: Long (Primary Key)
--   `userId`: Long
--   `directoryId`: Long (Parent Folder ID, 0 for root)
--   `fileName`: String
--   `isFolder`: "Y" or "N"
--   `md5`: String (File content hash)
--   `size`: Long
--   `createTime`: Date
--   `updateTime`: Date
-
-### 5.2. FileActionDO
-Tracks changes for synchronization logic.
--   `action`: "A" (Add), "D" (Delete), "U" (Update), "M" (Move/Rename)
--   `fileId`: Long
--   `md5`: String
-
-## 6. Re-implementation Plan
-
-To re-implement this server:
-
-1.  **Database Schema**: Recreate tables for `user_file`, `file_action`, `user`, `user_equipment`.
-2.  **Auth Service**: Implement the Challenge-Response login and JWT issuance.
-3.  **File Service**:
-    -   Implement `list_folder` (recursive query).
-    -   Implement `upload/apply` (generate signed URLs).
-    -   Implement `upload/finish` (update DB, handle versioning).
-    -   Implement `download` (generate signed URLs).
-4.  **Storage Service**: Implement the `/api/oss/` endpoints to handle actual file I/O and validate signatures.
-
-## 7. Deep Dive: File Synchronization & Architecture
-
-This section provides a detailed breakdown of the file synchronization logic, data structures, and corner cases to consider during re-implementation.
-
-### 7.1. Core Data Structures
-
-#### 7.1.1. UserFileDO (The "Truth")
-The `UserFileDO` table represents the current state of the file system.
--   **`directoryId`**: Implements a hierarchical structure. `0` is the root.
--   **`innerName`**: The actual filename on the disk/storage (likely a UUID or hash to prevent collisions), while `fileName` is the display name.
--   **`md5`**: Critical for sync. The client compares this hash to determine if a file has changed.
--   **`isFolder`**: "Y" or "N". Folders are virtual; they exist as rows in this table but don't necessarily have a physical file on disk (size 0).
-
-#### 7.1.2. FileActionDO (The "Journal")
-The `FileActionDO` table acts as an event log or journal of changes. This is likely used to help clients catch up on changes they missed, or for the "History" feature.
--   **`action`**:
-    -   `A`: Add (Create/Upload)
-    -   `D`: Delete
-    -   `U`: Update (Content change)
-    -   `M`: Move/Rename
-    -   `R`: Rename (specifically for files?)
-    -   `DM`: Delete Move (part of a move operation?)
-    -   `DR`: Delete Rename
--   **`path` / `newPath`**: Stores the full path context for the action.
-
-### 7.2. Synchronization Logic Details
-
-#### 7.2.1. Listing Files (`listFolder` / `listFolderV2`)
--   **Recursive vs. Flat**: The API supports both. `recursive=true` fetches the entire tree.
--   **Path Handling**: The server calculates `path_display` dynamically by traversing the `directoryId` hierarchy or using cached path logic.
--   **Comparison**: The client sends a request, gets the list of `EntriesVO`, and performs a local diff:
-    -   **Server has, Client missing**: Download.
-    -   **Client has, Server missing**: Upload (if new) or Delete locally (if server deleted it - *Note: This requires checking the Action log or assuming the server is the source of truth*).
-    -   **MD5 Mismatch**: Conflict! The server logic seems to favor "Last Write Wins" or "Server Wins" in simple cases, but the existence of `FileActionDO` suggests more complex conflict resolution might be possible.
-
-#### 7.2.2. Upload Flow (`uploadApply` -> `uploadFinish`)
-1.  **Apply**:
-    -   Client sends metadata (path, size, name).
-    -   Server generates a **Signed URL** (`O_OssLocalController`).
-    -   **Corner Case**: If a file with the same name exists, the server might return an error or handle it in the `finish` step.
-2.  **Transfer**:
-    -   Client uploads binary data to the signed URL.
-    -   The file is stored temporarily or directly in the target path (depending on implementation).
-3.  **Finish**:
-    -   Client confirms upload with the final MD5.
-    -   **Critical Logic**:
-        -   If the file exists (`querybyNameAndDirectoryId` returns result):
-            -   Update `md5`, `size`, `innerName`.
-            -   Log `U` (Update) action.
-        -   If the file is new:
-            -   Insert new `UserFileDO`.
-            -   Log `A` (Add) action.
-    -   **Socket Notification**: The server sends a Socket.IO message (`finishFolderMessage`) to notify other connected devices of the change.
-
-#### 7.2.3. Deletion (`deleteFolder`)
--   **Soft vs. Hard Delete**:
-    -   The code moves the file to a "Recycle Bin" (implied by `RecycleFileDO` and `RecycleFileMapper` usage in other parts, though `deleteFolder` in `FileLocalServiceImpl` seems to perform a hard delete from `UserFileDO` and insert into `FileActionDO` with action `D`).
-    -   **Corner Case**: Deleting a folder must recursively delete all children (`deleteUnder`). The `FileLocalServiceImpl` handles this by finding all children and deleting them.
-
-### 7.3. Corner Cases & "Gotchas"
-
-1.  **Path Separators**: The code explicitly handles `/` stripping (`path.substring(1)`). Ensure your implementation is consistent with leading slashes.
-2.  **Concurrency**:
-    -   **Redis Locks**: The server uses `cloudLockedSeconds` (Redis key `lock_cloud_userId`) to prevent simultaneous syncs from the same user on different devices.
-    -   **Race Conditions**: If two devices upload the same file name simultaneously, the "Finish" step might race. The database transaction in `uploadFinish` should handle this, but "Last Write Wins" is the likely outcome.
-3.  **Special Characters**: The `FileUtil` or `LocalFileUtil` likely has logic to sanitize filenames. The `innerName` concept (storing files by UUID/Hash on disk) avoids filesystem issues with special characters.
-4.  **Large Files**: The `upload/part` endpoint in `O_OssLocalController` suggests support for **Chunked Uploads**. If you implement the client, you should support chunking for reliability.
-5.  **Empty Folders**: Since folders are virtual rows in the DB, ensure `createFolder` correctly inserts a row with `isFolder="Y"` and `size=0`.
-
-### 7.4. Re-implementation Checklist
-
--   [ ] **Database**: `user_file` table with `directory_id` adjacency list pattern.
--   [ ] **Storage**: Store files on disk using a content-addressable scheme (e.g., `storage/MD5_HASH`) or UUIDs (`innerName`) to avoid duplicates and filename issues.
--   [ ] **Locking**: Implement the Redis-based locking mechanism to prevent sync corruption.
--   [ ] **Socket.IO**: (Optional but recommended) Implement the notification events so clients update in real-time.
-
-## 8. File Conversion Architecture
-
-The server delegates file conversion tasks (Note -> PDF, Note -> PNG) to an external service referred to as **QTServer**.
-
-### 8.1. Protocol
--   **Transport**: Raw TCP Socket.
--   **Address**: Configurable via `ip` and `port` (likely internal network).
--   **Message Format**:
-    -   **Header**: 8-byte ASCII string representing the length of the JSON payload (zero-padded).
-    -   **Body**: JSON payload.
-    -   *Example*: `00000123{"busCode":"T01",...}`
-
-### 8.2. Operations
-
-#### 8.2.1. Note to PDF (`T01`)
--   **BusCode**: `T01`
--   **Input**: `TransferDTO`
-    -   `downloadUrl`: URL where QTServer can download the source `.note` file.
-    -   `postAuthorization`: Signature for uploading the result.
-    -   `url`: Upload destination URL.
--   **Output**: `TransferVO` (Status/Result).
-
-#### 8.2.2. Note to PNG (`T02`)
--   **BusCode**: `T02`
--   **Input**: `TransferPngDTO`
-    -   `downloadUrl`: Source file URL.
-    -   `transferUrlDTOList`: List of upload URLs for each page image.
--   **Output**: `TransferVO`.
-
-#### 8.2.3. Get Page Count (`T03`)
--   **BusCode**: `T03`
--   **Input**: `TransferNotePageDTO`
-    -   `downloadUrl`: Source file URL.
--   **Output**: `TransferPageVO` (Contains page count/metadata).
-
-### 8.3. Implementation Note
-Since the conversion logic is proprietary (likely involving the Ratta Supernote rendering engine), a re-implementation of the server would need to:
-1.  **the `.note` format** already described in `supernote` python library.
-2.  **Implement a local renderer** (using the python library) to replace the external QTServer calls.
-3.  **Mock the QTServer protocol** OR rewrite the `FileLocalServiceImpl` to call the python library directly instead of opening a TCP socket.
+- **OAuth 2.1 Authorization Server (Main HTTP Port, e.g. `:8080`)**: Mounts `supernote.server.components.oauth.http.create_auth_app` via `aiohttp_asgi.ASGIResource` to serve `/.well-known/oauth-authorization-server`, `/authorize`, `/login-bridge`, and `/token`, authenticating against `UserService`, keeping short-lived authorization codes in `SqliteCoordinationService` and access/refresh tokens as digests on `oauth_grants` rows.
+- **MCP Resource Server (Dedicated MCP Port, e.g. `:8081/mcp`)**: Runs `supernote.server.components.mcp.server.create_mcp_server` in a background `asyncio.Task` (authenticating both OAuth 2.1 Bearer tokens and static `sn_...` API keys), hosting tools registered via `McpRegistrar` by vertical components (`events`, `search`, `transcript`, `schedule`).

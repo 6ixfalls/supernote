@@ -4,16 +4,30 @@ from unittest.mock import patch
 import pytest
 
 from supernote.server.utils.paths import (
+    AI_SUMMARIES_GROUP_NAME,
+    flatten_vfs_path,
     generate_inner_name,
+    get_ai_summaries_group_id,
     get_conversion_pdf_path,
+    get_conversion_pdf_prefix,
     get_file_chunk_path,
+    get_full_conversion_pdf_path,
     get_page_png_path,
-    get_summary_group_id,
     get_summary_id,
-    get_transcript_id,
     is_valid_page_id,
     parse_file_chunk_name,
 )
+
+
+def test_flatten_vfs_path() -> None:
+    assert flatten_vfs_path("/NOTE/Note/Work/daily.note") == "Note/Work/daily.note"
+    assert (
+        flatten_vfs_path("DOCUMENT/Document/Archive/paper.pdf")
+        == "Document/Archive/paper.pdf"
+    )
+    assert flatten_vfs_path("/EXPORT/summary.pdf") == "Export/summary.pdf"
+    assert flatten_vfs_path("Note/daily.note") == "Note/daily.note"
+    assert flatten_vfs_path("") == ""
 
 
 def test_get_page_png_path() -> None:
@@ -40,21 +54,49 @@ def test_parse_file_chunk_name() -> None:
 
 
 def test_get_summary_id() -> None:
-    assert get_summary_id("file_key") == "file_key-summary"
+    sid = get_summary_id(1, 42)
+    assert len(sid) == 32
+    assert sid == sid.lower()
+    int(sid, 16)
+    assert sid == get_summary_id(1, 42)
+    assert sid != get_summary_id(1, 43)
+    assert sid != get_summary_id(2, 42)
 
 
-def test_get_summary_group_id() -> None:
-    assert get_summary_group_id("file_key") == "file_key-group"
-
-
-def test_get_transcript_id() -> None:
-    assert get_transcript_id("file_key") == "file_key-transcript"
+def test_get_ai_summaries_group_id() -> None:
+    assert AI_SUMMARIES_GROUP_NAME == "AI Summaries"
+    gid = get_ai_summaries_group_id(1)
+    assert len(gid) == 32
+    assert gid == gid.lower()
+    int(gid, 16)
+    assert gid == get_ai_summaries_group_id(1)
+    assert gid != get_ai_summaries_group_id(2)
+    assert gid != get_summary_id(1, 42)
 
 
 def test_get_conversion_pdf_path() -> None:
     assert (
         get_conversion_pdf_path(1, 2, "md5hash") == "conversions/1/2/note_md5hash.pdf"
     )
+    assert get_conversion_pdf_path(1, 2, "md5hash", []) == (
+        "conversions/1/2/note_md5hash.pdf"
+    )
+
+    selection = get_conversion_pdf_path(1, 2, "md5hash", [0, 2])
+    assert selection.startswith("conversions/1/2/note_md5hash_pages_")
+    assert selection != get_conversion_pdf_path(1, 2, "md5hash", [2, 0])
+    assert selection.startswith(get_conversion_pdf_prefix(1, 2, "md5hash"))
+
+    with pytest.raises(ValueError, match="file_md5"):
+        get_conversion_pdf_prefix(1, 2, "")
+
+
+def test_get_full_conversion_pdf_path() -> None:
+    full = get_conversion_pdf_path(1, 2, "md5hash")
+    selection = get_conversion_pdf_path(1, 2, "md5hash", [3])
+    assert get_full_conversion_pdf_path(selection) == full
+    assert get_full_conversion_pdf_path(full) is None
+    assert get_full_conversion_pdf_path("2/pages/P1.png") is None
 
 
 def test_generate_inner_name() -> None:

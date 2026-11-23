@@ -9,9 +9,9 @@ repos:
         args:
           - --allow-multiple-documents
       - id: check-added-large-files
-        exclude: '^tests/testdata/.*\.note$'
+        exclude: '^(tests/testdata|evals/ocr/notebooks)/.*\.(note|mark)$'
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.17.2
+    rev: v0.17.6
     hooks:
       - id: ruff-check
         args:
@@ -22,15 +22,32 @@ repos:
     hooks:
       - id: ty
         name: ty check
-        entry: uv run ty check
+        entry: uv run --no-project ty check . --ignore import-not-found
         language: system
+        pass_filenames: false
+      - id: tsc
+        name: tsc check
+        entry: tsc -p tsconfig.json --noEmit
+        language: node
+        additional_dependencies:
+          - typescript@7.0.2
+        files: '^(tsconfig\.json|supernote/server/static/js/.*\.(js|d\.ts))$'
+        pass_filenames: false
+      - id: biome
+        name: biome check
+        entry: biome check --write --error-on-warnings supernote/server/static/js tests/frontend
+        language: node
+        additional_dependencies:
+          - "@biomejs/biome@2.6.8"
+        files: '^(biome\.json|supernote/server/static/js/.*\.(js|d\.ts)|tests/frontend/.*\.mjs)$'
         pass_filenames: false
   - repo: https://github.com/codespell-project/codespell
     rev: v2.4.3
     hooks:
       - id: codespell
+        exclude: '^evals/ocr/(dataset\.yaml|results/.*\.json)$'
         args:
-          - --ignore-words-list=folde
+          - --ignore-words-list=folde,linkprotocal
   - repo: https://github.com/adrienverge/yamllint.git
     rev: v1.38.0
     hooks:

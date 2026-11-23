@@ -1,6 +1,10 @@
 """Tests for top-level supernote package initialization, exports, and repository structure conformance."""
 
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 import supernote
 
@@ -12,8 +16,9 @@ TEST_ROOT = REPO_ROOT / "tests"
 # Required top-level package exports for supernote/__init__.py
 REQUIRED_PACKAGE_EXPORTS = {"notebook", "models"}
 
-# Test file names globally excluded from 1:1 module path matching (package markers and pytest fixtures)
+# Test file names and directories globally excluded from 1:1 module path matching
 IGNORED_TEST_FILENAMES = {"__init__.py", "conftest.py"}
+IGNORED_TEST_DIRNAMES = {"fixtures", "integration"}
 
 # Module and test naming constants for package init files
 INIT_MODULE_NAME = "__init__.py"
@@ -25,10 +30,28 @@ INIT_TEST_NAME = "test_init.py"
 ALLOWLIST_NON_CONFORMING_TESTS = set()
 
 
-def test_package_exports():
+def test_package_exports() -> None:
     """Verify top-level package exports and attribute integrity for supernote."""
     assert hasattr(supernote, "__all__")
     assert REQUIRED_PACKAGE_EXPORTS.issubset(supernote.__all__)
+
+
+def test_top_level_package_lazy_imports() -> None:
+    """Verify subpackages are lazily loaded via PEP 562 __getattr__."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, supernote; assert 'supernote.server' not in sys.modules; assert 'supernote.client' not in sys.modules",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert supernote.notebook is not None
+    with pytest.raises(AttributeError):
+        _ = supernote.nonexistent_submodule
 
 
 def test_all_test_files_conform_to_1to1_mapping():
@@ -45,7 +68,9 @@ def test_all_test_files_conform_to_1to1_mapping():
         for t in TEST_ROOT.rglob("*.py")
         if not any(part.startswith(".") for part in t.parts)
         and t.name not in IGNORED_TEST_FILENAMES
-        and not any(part == "integration" for part in t.relative_to(TEST_ROOT).parts)
+        and not any(
+            part in IGNORED_TEST_DIRNAMES for part in t.relative_to(TEST_ROOT).parts
+        )
         and t.relative_to(TEST_ROOT) not in expected_1to1
         and str(t.relative_to(TEST_ROOT)) not in ALLOWLIST_NON_CONFORMING_TESTS
     ]

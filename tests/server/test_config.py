@@ -11,7 +11,6 @@ from supernote.server.config import (
     ModelConfig,
     ProviderConfig,
     ServerConfig,
-    WebhookEndpointConfig,
 )
 
 
@@ -132,12 +131,11 @@ def test_configured_base_url_from_env(tmp_path: Path) -> None:
 
 
 def test_server_config_webhooks_default_disabled(tmp_path: Path) -> None:
-    """Webhooks are disabled with no endpoints by default."""
+    """Webhooks config defaults to an empty mapping (disabled)."""
     config_dir = tmp_path / "config"
     config = ServerConfig.load(config_dir)
 
-    assert config.webhooks.enabled is False
-    assert config.webhooks.endpoints == []
+    assert config.webhooks == {}
 
 
 def test_server_config_load_webhooks_from_file(tmp_path: Path) -> None:
@@ -164,13 +162,17 @@ def test_server_config_load_webhooks_from_file(tmp_path: Path) -> None:
 
     config = ServerConfig.load(config_dir)
 
-    assert config.webhooks.enabled is True
-    assert len(config.webhooks.endpoints) == 1
-    endpoint = config.webhooks.endpoints[0]
-    assert endpoint.url == "https://n8n.homelab.local/webhook/supernote"
-    assert endpoint.user == "alice@example.com"
-    assert endpoint.secret == "hmac-secret-key"
-    assert endpoint.events == ["note.sync_completed"]
+    assert config.webhooks == {
+        "enabled": True,
+        "endpoints": [
+            {
+                "url": "https://n8n.homelab.local/webhook/supernote",
+                "user": "alice@example.com",
+                "secret": "hmac-secret-key",
+                "events": ["note.sync_completed"],
+            }
+        ],
+    }
 
 
 def test_server_config_webhooks_enabled_env_var_override(tmp_path: Path) -> None:
@@ -178,31 +180,7 @@ def test_server_config_webhooks_enabled_env_var_override(tmp_path: Path) -> None
     config_dir = tmp_path / "config"
     with patch.dict(os.environ, {"SUPERNOTE_WEBHOOKS_ENABLED": "true"}):
         config = ServerConfig.load(config_dir)
-        assert config.webhooks.enabled is True
-
-
-@pytest.mark.parametrize(
-    "invalid_url",
-    [
-        "",
-        "ftp://example.com/webhook",
-        "file:///etc/passwd",
-        "javascript:alert(1)",
-        "http:///missing-host",
-        "not-a-url",
-    ],
-)
-def test_webhook_endpoint_config_rejects_invalid_urls(invalid_url: str) -> None:
-    """WebhookEndpointConfig only accepts http and https URLs with a valid host."""
-    with pytest.raises(ValueError, match="http or https scheme"):
-        WebhookEndpointConfig(url=invalid_url, user="alice@example.com")
-
-
-@pytest.mark.parametrize("invalid_user", ["", "   "])
-def test_webhook_endpoint_config_rejects_empty_user(invalid_user: str) -> None:
-    """WebhookEndpointConfig requires a non-empty user email address."""
-    with pytest.raises(ValueError, match="non-empty user email"):
-        WebhookEndpointConfig(url="https://example.com/webhook", user=invalid_user)
+        assert config.webhooks["enabled"] is True
 
 
 def test_server_config_proxy_env_vars(tmp_path: Path) -> None:
@@ -344,6 +322,18 @@ def test_server_config_load_partial_ai_keeps_omitted_capabilities_none(
 
 def test_server_config_legacy_gemini_syncs_to_ai(tmp_path: Path) -> None:
     """Legacy gemini_* fields and env vars populate config.ai automatically."""
+    default_gemini = ServerConfig(gemini_api_key="default-key")
+    assert default_gemini.ai.ocr == ModelConfig(
+        provider="gemini",
+        model="gemini-3.5-flash-lite",
+        max_concurrency=5,
+    )
+    assert default_gemini.ai.summary == ModelConfig(
+        provider="gemini",
+        model="gemini-3.5-flash-lite",
+        max_concurrency=5,
+    )
+
     direct = ServerConfig(
         gemini_api_key="legacy-key",
         gemini_ocr_model="gemini-custom-ocr",
@@ -397,7 +387,7 @@ def test_server_config_legacy_gemini_syncs_to_ai(tmp_path: Path) -> None:
 
 
 def test_model_config_validation() -> None:
-    """ModelConfig validates non-empty provider, model, and positive max_concurrency."""
+    """ModelConfig validates non-empty provider, model, positive max_concurrency, and prompt_override."""
     with pytest.raises(ValueError, match="non-empty provider"):
         ModelConfig(provider="  ", model="gemini-3.6-flash")
 
@@ -407,11 +397,26 @@ def test_model_config_validation() -> None:
     with pytest.raises(ValueError, match="max_concurrency must be >= 1"):
         ModelConfig(provider="gemini", model="gemini-3.6-flash", max_concurrency=0)
 
+    with pytest.raises(ValueError, match="prompt_override must be non-empty"):
+        ModelConfig(provider="local", model="DeepSeek-OCR-8bit", prompt_override="")
+
+    with pytest.raises(ValueError, match="prompt_override must be non-empty"):
+        ModelConfig(provider="local", model="DeepSeek-OCR-8bit", prompt_override="   ")
+
+    cfg = ModelConfig(
+        provider="local",
+        model="DeepSeek-OCR-8bit",
+        max_concurrency=1,
+        prompt_override="Convert the document to markdown.",
+    )
+    assert cfg.prompt_override == "Convert the document to markdown."
+
 
 def test_server_config_trace_log_flags(tmp_path: Path) -> None:
     """Verify trace_log_file and trace_log_unsafe defaults and env overrides."""
     config = ServerConfig()
     assert config.trace_log_unsafe is False
+    assert config.log_level == "INFO"
 
     config_dir = tmp_path / "config"
     custom_trace = str(tmp_path / "custom_trace.log")
@@ -425,3 +430,141 @@ def test_server_config_trace_log_flags(tmp_path: Path) -> None:
         loaded = ServerConfig.load(config_dir)
         assert loaded.trace_log_file == custom_trace
         assert loaded.trace_log_unsafe is True
+
+    empty_dir = tmp_path / "config_empty_trace"
+    with patch.dict(os.environ, {"SUPERNOTE_TRACE_LOG_FILE": ""}):
+        disabled_trace = ServerConfig.load(empty_dir)
+        assert disabled_trace.trace_log_file == ""
+
+
+def test_server_config_log_level_and_token_expiration_env_overrides(
+    tmp_path: Path,
+) -> None:
+    """Verify log_level and JWT/device token expiration env overrides and validation."""
+    assert ServerConfig(log_level="debug").log_level == "DEBUG"
+    assert ServerConfig(log_level=" info ").log_level == "INFO"
+    assert ServerConfig(log_level="error").log_level == "ERROR"
+
+    for invalid_level in ("VERBOSE", "WARN", "CRITICAL"):
+        with pytest.raises(ValueError, match="Invalid log level"):
+            ServerConfig(log_level=invalid_level)
+
+    config_dir = tmp_path / "config"
+    with patch.dict(
+        os.environ,
+        {
+            "SUPERNOTE_LOG_LEVEL": "warning",
+            "SUPERNOTE_JWT_EXPIRATION_HOURS": "12",
+            "SUPERNOTE_DEVICE_EXPIRATION_HOURS": "720",
+        },
+    ):
+        loaded = ServerConfig.load(config_dir)
+        assert loaded.log_level == "WARNING"
+        assert loaded.auth.expiration_hours == 12
+        assert loaded.auth.device_expiration_hours == 720
+
+
+def test_ai_provider_type_defaults_to_entry_name() -> None:
+    """An entry's backend type is its `type`, or else its name."""
+    ai = AiConfig(
+        providers={
+            "openai": ProviderConfig(base_url="http://localhost:11434/v1"),
+            "llamacpp": ProviderConfig(
+                type="openai", base_url="http://localhost:8080/v1"
+            ),
+        }
+    )
+    assert ai.provider_type("openai") == "openai"
+    assert ai.provider_type("llamacpp") == "openai"
+    assert ai.provider_type("gemini") == "gemini"
+
+
+def test_server_config_load_named_ai_providers(tmp_path: Path) -> None:
+    """Two entries of one type load from config.yaml under their own names."""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    data = {
+        "ai": {
+            "providers": {
+                "ollama": {"type": "openai", "base_url": "http://localhost:11434/v1"},
+                "llamacpp": {"type": "openai", "base_url": "http://localhost:8080/v1"},
+            },
+            "summary": {"provider": "ollama", "model": "gemma3:27b"},
+            "embedding": {"provider": "llamacpp", "model": "embeddinggemma"},
+        }
+    }
+    with open(config_dir / "config.yaml", "w") as f:
+        yaml.safe_dump(data, f)
+
+    config = ServerConfig.load(config_dir)
+
+    assert config.ai.providers["ollama"] == ProviderConfig(
+        type="openai", base_url="http://localhost:11434/v1"
+    )
+    assert config.ai.provider_type("llamacpp") == "openai"
+
+
+def test_default_user_quota_config_and_env(tmp_path: Path) -> None:
+    """Verify default_user_quota defaults to 0 and parses YAML and env overrides."""
+    assert ServerConfig().default_user_quota == 0
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    quota_20gb = 20 * 1024**3
+    quota_500mb = 500 * 1024**2
+    with open(config_dir / "config.yaml", "w") as f:
+        yaml.safe_dump({"default_user_quota": quota_20gb}, f)
+
+    loaded = ServerConfig.load(config_dir)
+    assert loaded.default_user_quota == quota_20gb
+
+    with patch.dict(os.environ, {"SUPERNOTE_DEFAULT_USER_QUOTA": str(quota_500mb)}):
+        env_loaded = ServerConfig.load(config_dir)
+        assert env_loaded.default_user_quota == quota_500mb
+
+    with patch.dict(os.environ, {"SUPERNOTE_DEFAULT_USER_QUOTA": "0"}):
+        unlimited_loaded = ServerConfig.load(config_dir)
+        assert unlimited_loaded.default_user_quota == 0
+
+    with patch.dict(os.environ, {"SUPERNOTE_DEFAULT_USER_QUOTA": "invalid-size"}):
+        fallback_loaded = ServerConfig.load(config_dir)
+        assert fallback_loaded.default_user_quota == quota_20gb
+
+    with patch.dict(os.environ, {"SUPERNOTE_DEFAULT_USER_QUOTA": "-10"}):
+        neg_env_loaded = ServerConfig.load(config_dir)
+        assert neg_env_loaded.default_user_quota == quota_20gb
+
+    with pytest.raises(ValueError):
+        ServerConfig(default_user_quota=-100)
+
+
+def test_event_log_retention_days_config_and_env(tmp_path: Path) -> None:
+    """Verify event_log_retention_days defaults to 90 and parses env overrides."""
+    assert ServerConfig().event_log_retention_days == 90
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    with open(config_dir / "config.yaml", "w") as f:
+        yaml.safe_dump({"event_log_retention_days": 30}, f)
+
+    loaded = ServerConfig.load(config_dir)
+    assert loaded.event_log_retention_days == 30
+
+    with patch.dict(os.environ, {"SUPERNOTE_EVENT_LOG_RETENTION_DAYS": "14"}):
+        env_loaded = ServerConfig.load(config_dir)
+        assert env_loaded.event_log_retention_days == 14
+
+    with patch.dict(os.environ, {"SUPERNOTE_EVENT_LOG_RETENTION_DAYS": "0"}):
+        zero_loaded = ServerConfig.load(config_dir)
+        assert zero_loaded.event_log_retention_days == 0
+
+    with patch.dict(os.environ, {"SUPERNOTE_EVENT_LOG_RETENTION_DAYS": "invalid"}):
+        fallback_loaded = ServerConfig.load(config_dir)
+        assert fallback_loaded.event_log_retention_days == 30
+
+    with patch.dict(os.environ, {"SUPERNOTE_EVENT_LOG_RETENTION_DAYS": "-5"}):
+        neg_loaded = ServerConfig.load(config_dir)
+        assert neg_loaded.event_log_retention_days == 30
+
+    with pytest.raises(ValueError):
+        ServerConfig(event_log_retention_days=-1)

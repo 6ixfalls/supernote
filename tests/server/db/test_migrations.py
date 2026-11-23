@@ -11,6 +11,7 @@ from sqlalchemy import MetaData, create_engine, text
 from supernote.server.config import ServerConfig
 from supernote.server.db.base import Base
 from supernote.server.db.migrations import run_migrations
+from supernote.server.utils.paths import get_ai_summaries_group_id, get_summary_id
 from tests.server.db.models.test_init import (
     INTERNAL_TABLES_ALLOWLIST,
     assert_metadata_user_id_conformance,
@@ -85,7 +86,7 @@ def test_migration_upgrades_successfully(migrated_db: str) -> None:
         # Check if the 'alembic_version' table exists and has the head revision
         result = conn.execute(text("SELECT version_num FROM alembic_version"))
         version = result.scalar()
-        assert version == "c3d4e5f6a7b8"
+        assert version == "c7d8e9f0a1b2"
 
         # Check if a known table exists (e.g. users)
         result = conn.execute(text("SELECT count(*) FROM users"))
@@ -181,7 +182,7 @@ def test_orphaned_v0_20_0_migration_self_healing(tmp_path: Path) -> None:
     engine = create_engine(migration_db_url)
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
-        assert version == "c3d4e5f6a7b8"
+        assert version == "c7d8e9f0a1b2"
 
         # Verify task columns and types
         tasks = conn.execute(
@@ -761,4 +762,440 @@ def test_seed_sync_initialized_for_existing_users_migration(
         assert rows[0][2] > 0
 
     command.downgrade(alembic_config, "a2b3c4d5e6f7")
+    engine.dispose()
+
+
+def test_reset_legacy_default_user_quota_migration(
+    tmp_path: Path, alembic_config: Config
+) -> None:
+    """Verify migration d5e6f7a8b9c0 resets untouched 10 GiB placeholders to '0' while preserving custom quotas."""
+    db_path = tmp_path / "reset_legacy_quota.db"
+    shutil.copy(Path("tests/fixtures/db_v1.sqlite").absolute(), db_path)
+    url = f"sqlite:///{db_path}"
+    alembic_config.set_main_option("sqlalchemy.url", url)
+    command.upgrade(alembic_config, "c3d4e5f6a7b8")
+
+    engine = create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM users"))
+        conn.execute(
+            text(
+                "INSERT INTO users (id, email, password_md5, is_active, total_capacity, is_admin) "
+                "VALUES "
+                "(101, 'default@example.com', '098f6bcd4621d373cade4e832627b4f6', 1, '10737418240', 1), "
+                "(102, 'custom@example.com', '098f6bcd4621d373cade4e832627b4f6', 1, '53687091200', 0)"
+            )
+        )
+
+    command.upgrade(alembic_config, "d5e6f7a8b9c0")
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT email, total_capacity FROM users ORDER BY id")
+        ).fetchall()
+        assert [tuple(r) for r in rows] == [
+            ("default@example.com", "0"),
+            ("custom@example.com", "53687091200"),
+        ]
+
+    command.downgrade(alembic_config, "c3d4e5f6a7b8")
+    with engine.connect() as conn:
+        rows_down = conn.execute(
+            text("SELECT email, total_capacity FROM users ORDER BY id")
+        ).fetchall()
+        assert [tuple(r) for r in rows_down] == [
+            ("default@example.com", "10737418240"),
+            ("custom@example.com", "53687091200"),
+        ]
+
+    engine.dispose()
+
+
+def test_add_note_and_page_metadata_tables_migration(
+    tmp_path: Path, alembic_config: Config
+) -> None:
+    """Verify migration e6f7a8b9c0d1 creates and downgrades f_note_metadata and f_note_page_metadata cleanly."""
+    db_path = tmp_path / "note_metadata_tables.db"
+    shutil.copy(Path("tests/fixtures/db_v1.sqlite").absolute(), db_path)
+    url = f"sqlite:///{db_path}"
+    alembic_config.set_main_option("sqlalchemy.url", url)
+
+    command.upgrade(alembic_config, "e6f7a8b9c0d1")
+
+    engine = create_engine(url)
+    reflected = MetaData()
+    reflected.reflect(bind=engine)
+    assert "f_note_metadata" in reflected.tables
+    assert "f_note_page_metadata" in reflected.tables
+    assert "content_hash" in reflected.tables["f_note_page_metadata"].columns
+
+    command.downgrade(alembic_config, "d5e6f7a8b9c0")
+    reflected_down = MetaData()
+    reflected_down.reflect(bind=engine)
+    assert "f_note_metadata" not in reflected_down.tables
+    assert "f_note_page_metadata" not in reflected_down.tables
+    engine.dispose()
+
+
+def test_add_user_event_log_table_migration(
+    tmp_path: Path, alembic_config: Config
+) -> None:
+    """Verify migration f2a3b4c5d6e7 creates f_user_event keyed by (user_id, seq) and downgrades cleanly."""
+    db_path = tmp_path / "user_event_log.db"
+    shutil.copy(Path("tests/fixtures/db_v1.sqlite").absolute(), db_path)
+    url = f"sqlite:///{db_path}"
+    alembic_config.set_main_option("sqlalchemy.url", url)
+
+    command.upgrade(alembic_config, "f2a3b4c5d6e7")
+
+    engine = create_engine(url)
+    reflected = MetaData()
+    reflected.reflect(bind=engine)
+    assert "f_user_event" in reflected.tables
+    pk_cols = [col.name for col in reflected.tables["f_user_event"].primary_key.columns]
+    assert pk_cols == ["user_id", "seq"]
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO f_user_event "
+                "(user_id, seq, timestamp_ms, event_type, actor, entity_type, entity_id, payload) "
+                "VALUES (1, 100, 1000, 'vfs.created', 'user:web', 'file', '10', '{}'), "
+                "       (2, 100, 1000, 'vfs.created', 'user:web', 'file', '20', '{}')"
+            )
+        )
+        count = conn.execute(text("SELECT count(*) FROM f_user_event")).scalar_one()
+        assert count == 2
+
+    command.downgrade(alembic_config, "e6f7a8b9c0d1")
+    reflected_down = MetaData()
+    reflected_down.reflect(bind=engine)
+    assert "f_user_event" not in reflected_down.tables
+
+    engine.dispose()
+
+
+def test_api_keys_table_migration(tmp_path: Path, alembic_config: Config) -> None:
+    """Verify migration e8f9a0b1c2d3 creates and drops the api_keys table cleanly."""
+    db_path = tmp_path / "api_keys_migration.db"
+    shutil.copy(Path("tests/fixtures/db_v1.sqlite").absolute(), db_path)
+    url = f"sqlite:///{db_path}"
+    alembic_config.set_main_option("sqlalchemy.url", url)
+    command.upgrade(alembic_config, "e8f9a0b1c2d3")
+
+    engine = create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO users (id, email, password_md5, is_active, total_capacity, is_admin) "
+                "VALUES (201, 'keyowner@example.com', '098f6bcd4621d373cade4e832627b4f6', 1, '0', 0)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO api_keys (user_id, id, name, key_prefix, sha256_hash, created_at, last_used_at, expires_at) "
+                "VALUES (201, 'key001', 'CLI', 'sn_00001111...', :digest, 1700000000, NULL, 1702592000)"
+            ),
+            {"digest": "a" * 64},
+        )
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT user_id, id, name, key_prefix, expires_at FROM api_keys WHERE id = 'key001'"
+            )
+        ).fetchone()
+        assert row is not None
+        assert tuple(row) == (201, "key001", "CLI", "sn_00001111...", 1702592000)
+
+    command.downgrade(alembic_config, "f2a3b4c5d6e7")
+    reflected = MetaData()
+    reflected.reflect(bind=engine)
+    assert "api_keys" not in reflected.tables
+    engine.dispose()
+
+
+def test_migrate_generated_summaries_preserves_annotations_and_categories(
+    tmp_path: Path, alembic_config: Config
+) -> None:
+    """Verify migration f3b4c5d6e7f8 preserves annotations, custom/Uncategorized placements, and detaches deleted files."""
+    db_path = tmp_path / "legacy_summary_edges.db"
+    shutil.copy(
+        Path("tests/fixtures/db_legacy_generated_summaries.sqlite").absolute(), db_path
+    )
+    url = f"sqlite:///{db_path}"
+    alembic_config.set_main_option("sqlalchemy.url", url)
+
+    engine = create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO f_user_file (id, user_id, directory_id, file_name, is_folder, size, is_active, create_time, update_time) VALUES "
+                "(8002, 1, 0, 'Custom.note', 'N', 100, 'Y', 100, 100), "
+                "(8003, 1, 0, 'Uncat.note', 'N', 100, 'Y', 100, 100), "
+                "(8004, 1, 0, 'Recycled.note', 'N', 100, 'N', 100, 100)"
+            )
+        )
+        # Annotate first-sync summary so it survives alongside second-sync winner
+        conn.execute(
+            text(
+                "UPDATE f_summary SET comment_str = 'Keep v1 note' "
+                "WHERE unique_identifier = '11111111-aaaa-4bbb-8ccc-000000000001-095.note-summary'"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO f_summary (id, user_id, file_id, unique_identifier, parent_unique_identifier, "
+                "content, data_source, comment_str, is_summary_group, is_deleted, create_time, update_time) VALUES "
+                "(901, 1, 8002, 'cust-summary', '2799b74528407f6aeeeff095f7685e9e', 'c', 'GEMINI', NULL, 0, 0, 100, 100), "
+                "(902, 1, 8003, 'uncat-summary', '', 'u', 'GEMINI', NULL, 0, 0, 100, 100), "
+                "(903, 1, 8004, 'rec-stale-summary', NULL, 'r1', 'GEMINI', NULL, 0, 0, 100, 100), "
+                "(904, 1, 8004, 'rec-kept-summary', NULL, 'r2', 'GEMINI', 'Saved note', 0, 0, 100, 100)"
+            )
+        )
+
+    command.upgrade(alembic_config, "f3b4c5d6e7f8")
+    command.downgrade(alembic_config, "e8f9a0b1c2d3")
+    command.upgrade(alembic_config, "f3b4c5d6e7f8")
+
+    with engine.connect() as conn:
+        leaves = {
+            r.unique_identifier: (r.file_id, r.parent_unique_identifier, r.comment_str)
+            for r in conn.execute(
+                text(
+                    "SELECT unique_identifier, file_id, parent_unique_identifier, comment_str "
+                    "FROM f_summary WHERE user_id = 1 AND is_deleted = 0 AND is_summary_group = 0"
+                )
+            )
+        }
+    engine.dispose()
+
+    ai_group = get_ai_summaries_group_id(1)
+    assert leaves[get_summary_id(1, 750000000000000001)] == (
+        750000000000000001,
+        ai_group,
+        None,
+    )
+    assert leaves["11111111-aaaa-4bbb-8ccc-000000000001-095.note-summary"] == (
+        750000000000000001,
+        "11111111-aaaa-4bbb-8ccc-000000000001-095.note-group",
+        "Keep v1 note",
+    )
+    assert leaves[get_summary_id(1, 8002)] == (
+        8002,
+        "2799b74528407f6aeeeff095f7685e9e",
+        None,
+    )
+    assert leaves[get_summary_id(1, 8003)] == (8003, "", None)
+    assert leaves["rec-kept-summary"] == (None, None, "Saved note")
+    assert "rec-stale-summary" not in leaves
+
+
+def test_reparent_uncategorized_ai_summaries_migration(
+    tmp_path: Path, alembic_config: Config
+) -> None:
+    """Verify migration a4b5c6d7e8f9 reparents uncategorized AI summaries with monotonic mtimes and leaves user Digests untouched."""
+    db_path = tmp_path / "reparent_uncat_ai.db"
+    shutil.copy(
+        Path("tests/fixtures/db_legacy_generated_summaries.sqlite").absolute(), db_path
+    )
+    url = f"sqlite:///{db_path}"
+    alembic_config.set_main_option("sqlalchemy.url", url)
+    command.upgrade(alembic_config, "f3b4c5d6e7f8")
+
+    ai_group_u1 = get_ai_summaries_group_id(1)
+    ai_group_u2 = get_ai_summaries_group_id(2)
+    canon_u1 = get_summary_id(1, 8003)
+    canon_u2 = get_summary_id(2, 9001)
+    skewed_mtime = 9_999_999_999_999
+
+    engine = create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE f_summary SET name = 'My AI Notes' WHERE user_id = 1 AND unique_identifier = :g"
+            ),
+            {"g": ai_group_u1},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO f_summary (id, user_id, name, unique_identifier, is_summary_group, is_deleted, create_time, update_time) "
+                "VALUES (900, 2, 'Deleted AI', :g, 1, 1, 100, 100)"
+            ),
+            {"g": ai_group_u2},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO f_summary (id, user_id, file_id, unique_identifier, parent_unique_identifier, "
+                "content, data_source, comment_str, last_modified_time, is_summary_group, is_deleted, create_time, update_time) VALUES "
+                "(901, 1, 8003, :c1, '', 'ai text', 'GEMINI', NULL, :skew, 0, 0, 100, 100), "
+                "(902, 1, 8003, 'v0-note-summary', NULL, 'v0 text', 'GEMINI', 'Old v0 note', 100, 0, 0, 100, 100), "
+                "(903, 1, NULL, '15027213-9df5-4ede-a4c5-e1c881c1ef0c', '', 'pdf highlight', NULL, NULL, 100, 0, 0, 100, 100), "
+                "(904, 1, 8003, 'chapter-1-summary', '', 'user digest', 'USER', NULL, 100, 0, 0, 100, 100), "
+                "(905, 1, 8003, 'blank-src-summary', '', 'unknown digest', NULL, NULL, 100, 0, 0, 100, 100), "
+                "(906, 2, 9001, :c2, '', 'u2 ai text', 'GEMINI', NULL, 100, 0, 0, 100, 100)"
+            ),
+            {"c1": canon_u1, "c2": canon_u2, "skew": skewed_mtime},
+        )
+
+    command.upgrade(alembic_config, "a4b5c6d7e8f9")
+    # Second pass exercises the no-op early return when zero uncategorized AI summaries remain
+    command.downgrade(alembic_config, "f3b4c5d6e7f8")
+    command.upgrade(alembic_config, "a4b5c6d7e8f9")
+
+    with engine.connect() as conn:
+        groups = {
+            (r.user_id, r.unique_identifier): r.name
+            for r in conn.execute(
+                text(
+                    "SELECT user_id, unique_identifier, name "
+                    "FROM f_summary WHERE is_deleted = 0 AND is_summary_group = 1"
+                )
+            )
+        }
+        seeded_leaves = {
+            (r.user_id, r.unique_identifier): (
+                r.file_id,
+                r.parent_unique_identifier,
+                r.comment_str,
+            )
+            for r in conn.execute(
+                text(
+                    "SELECT user_id, unique_identifier, file_id, parent_unique_identifier, comment_str "
+                    "FROM f_summary WHERE is_deleted = 0 AND is_summary_group = 0 AND id BETWEEN 901 AND 906"
+                )
+            )
+        }
+        canon_u1_mtime = conn.execute(
+            text(
+                "SELECT last_modified_time FROM f_summary WHERE user_id = 1 AND id = 901"
+            )
+        ).scalar_one()
+    engine.dispose()
+
+    assert groups == {
+        (1, "2799b74528407f6aeeeff095f7685e9e"): "Reading Notes",
+        (1, ai_group_u1): "My AI Notes",
+        (2, ai_group_u2): "AI Summaries",
+    }
+    assert seeded_leaves == {
+        (1, canon_u1): (8003, ai_group_u1, None),
+        (1, "v0-note-summary"): (8003, ai_group_u1, "Old v0 note"),
+        (1, "15027213-9df5-4ede-a4c5-e1c881c1ef0c"): (None, "", None),
+        (1, "chapter-1-summary"): (8003, "", None),
+        (1, "blank-src-summary"): (8003, "", None),
+        (2, canon_u2): (9001, ai_group_u2, None),
+    }
+    assert canon_u1_mtime == skewed_mtime + 1
+
+
+def test_add_previous_text_migration_upgrade_and_downgrade(
+    tmp_path: Path, alembic_config: Config
+) -> None:
+    """Verify migration b5c6d7e8f9a0 adds and drops f_note_page_content.previous_text cleanly."""
+    db_path = tmp_path / "previous_text_migration.db"
+    shutil.copy(Path("tests/fixtures/db_v1_populated.sqlite").absolute(), db_path)
+    url = f"sqlite:///{db_path}"
+    alembic_config.set_main_option("sqlalchemy.url", url)
+
+    command.upgrade(alembic_config, "a4b5c6d7e8f9")
+    command.upgrade(alembic_config, "b5c6d7e8f9a0")
+
+    engine = create_engine(url)
+    with engine.connect() as conn:
+        cols_up = {
+            row[1]
+            for row in conn.execute(
+                text("PRAGMA table_info(f_note_page_content)")
+            ).fetchall()
+        }
+        assert "previous_text" in cols_up
+
+    command.downgrade(alembic_config, "a4b5c6d7e8f9")
+    with engine.connect() as conn:
+        cols_down = {
+            row[1]
+            for row in conn.execute(
+                text("PRAGMA table_info(f_note_page_content)")
+            ).fetchall()
+        }
+        assert "previous_text" not in cols_down
+    engine.dispose()
+
+
+def test_oauth_grants_migration_moves_refresh_tokens_out_of_key_values(
+    tmp_path: Path, alembic_config: Config
+) -> None:
+    """Verify c7d8e9f0a1b2 turns live refresh tokens into grants and drops plaintext tokens."""
+    db_path = tmp_path / "oauth_grants_migration.db"
+    shutil.copy(Path("tests/fixtures/db_v1.sqlite").absolute(), db_path)
+    url = f"sqlite:///{db_path}"
+    alembic_config.set_main_option("sqlalchemy.url", url)
+    command.upgrade(alembic_config, "b5c6d7e8f9a0")
+
+    future = 4102444800  # 2100-01-01
+    engine = create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO users (id, email, password_md5, is_active, total_capacity, is_admin) "
+                "VALUES (202, 'grantowner@example.com', '098f6bcd4621d373cade4e832627b4f6', 1, '0', 0)"
+            )
+        )
+        tokens = {
+            "mcp:refresh_token:rt_by_id": '{"user_id": 202, "client_id": "https://a.example.com/", "scopes": ["supernote:all"], "expires_at": %d}'
+            % future,
+            "mcp:refresh_token:rt_by_email": '{"user_id": "grantowner@example.com", "client_id": "https://b.example.com/", "scopes": ["supernote:all"], "expires_at": %d}'
+            % future,
+            "mcp:refresh_token:rt_expired": '{"user_id": 202, "client_id": "https://c.example.com/", "scopes": [], "expires_at": 1}',
+            "mcp:refresh_token:rt_unknown_user": '{"user_id": 999, "client_id": "https://d.example.com/", "scopes": [], "expires_at": %d}'
+            % future,
+            "mcp:refresh_token:rt_bad": "{not-json",
+            "mcp:refresh_token:rt_list": "[]",
+            "mcp:refresh_token:rt_bad_expiry": '{"user_id": 202, "client_id": "https://e.example.com/", "expires_at": "soon"}',
+            "mcp:refresh_token:rt_bad_scopes": '{"user_id": 202, "client_id": "https://f.example.com/", "scopes": "supernote:all", "expires_at": %d}'
+            % future,
+            "mcp:access_token:at_live": '{"user_id": 202, "client_id": "https://a.example.com/"}',
+            "mcp:auth_code:code_kept": "{}",
+        }
+        for key, value in tokens.items():
+            conn.execute(
+                text("INSERT INTO key_values (key, value, expiry) VALUES (:k, :v, :e)"),
+                {"k": key, "v": value, "e": future},
+            )
+
+    command.upgrade(alembic_config, "c7d8e9f0a1b2")
+
+    with engine.connect() as conn:
+        grants = conn.execute(
+            text(
+                "SELECT user_id, client_id, scopes, refresh_token_hash, access_token_hash, expires_at "
+                "FROM oauth_grants ORDER BY client_id"
+            )
+        ).fetchall()
+        keys = [r[0] for r in conn.execute(text("SELECT key FROM key_values"))]
+    assert [tuple(g) for g in grants] == [
+        (
+            202,
+            "https://a.example.com/",
+            "supernote:all",
+            hashlib.sha256(b"rt_by_id").hexdigest(),
+            None,
+            future,
+        ),
+        (
+            202,
+            "https://b.example.com/",
+            "supernote:all",
+            hashlib.sha256(b"rt_by_email").hexdigest(),
+            None,
+            future,
+        ),
+    ]
+    assert keys == ["mcp:auth_code:code_kept"]
+
+    command.downgrade(alembic_config, "b5c6d7e8f9a0")
+    reflected = MetaData()
+    reflected.reflect(bind=engine)
+    assert "oauth_grants" not in reflected.tables
     engine.dispose()

@@ -1,4 +1,10 @@
-"""Module for API base classes."""
+"""Base response envelope (`BaseResponse`), error codes, and shared enumerations.
+
+This module defines `BaseResponse` (the `mashumaro` `DataClassJSONMixin` base class inherited by all
+Supernote API response VOs), `create_error_response`, and core protocol enums (`BaseEnum`,
+`BooleanEnum`, `ErrorCode`, `ProcessingStatus`, `TaskType`). All models configure
+`serialize_by_alias = True` to preserve camelCase wire compatibility. See `supernote.models`.
+"""
 
 from dataclasses import dataclass, field
 from enum import Enum
@@ -151,6 +157,7 @@ class ErrorCode(str, Enum):
     FORBIDDEN = ("403", "Forbidden")
     NOT_FOUND = ("404", "Not Found")
     CONFLICT = ("409", "Conflict")
+    GONE = ("410", "Gone")
     INTERNAL_ERROR = ("500", "Internal Server Error")
 
     # Specific Error Codes from legacy system
@@ -304,6 +311,7 @@ class ErrorCode(str, Enum):
     CONFLICT_EXISTS = ("E0322", "File or directory already exists!")
     TASK_GROUP_NOT_EXIST = ("E0328", "Task list group does not exist")
     TASK_NOT_EXIST = ("E0329", "Task does not exist")
+    CYCLIC_MOVE = ("E0358", "Cannot move a folder into itself or its subdirectory")
     TIMEZONE_NOT_OBTAINED = (
         "E0844",
         "The time zone information for this area was not obtained",

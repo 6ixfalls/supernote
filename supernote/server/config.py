@@ -1,14 +1,40 @@
+"""Typed server configuration models and environment variable resolution.
+
+Defines `ServerConfig` along with nested configuration dataclasses (`AuthConfig`,
+`AiConfig`, `ProviderConfig`, `ModelConfig`) serialized via `mashumaro` YAML mixins.
+
+`ServerConfig.load` resolves settings in priority order:
+1. `SUPERNOTE_*` environment variables (highest priority)
+2. `config/config.yaml` (or `<SUPERNOTE_CONFIG_DIR>/config.yaml`)
+3. Dataclass defaults and persistent SQLite coordination keys (fallback)
+
+For a complete table of YAML keys and environment variables, see
+`supernote.guides.configuration` and `supernote.guides.bootstrap_guide`.
+"""
+
 import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import cast
-from urllib.parse import urlsplit
+from typing import Any, cast
 
 from mashumaro.config import TO_DICT_ADD_OMIT_NONE_FLAG, BaseConfig
 from mashumaro.mixins.yaml import DataClassYAMLMixin
 
 logger = logging.getLogger(__name__)
+
+VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+
+
+def _normalize_log_level(level_name: str) -> str:
+    """Validate and return an uppercase standard log level name."""
+    normalized = level_name.strip().upper()
+    if normalized not in VALID_LOG_LEVELS:
+        raise ValueError(
+            f"Invalid log level {level_name!r}; expected one of: "
+            f"{', '.join(VALID_LOG_LEVELS)}"
+        )
+    return normalized
 
 
 def _get_bool_env(name: str, default: bool) -> bool:
@@ -30,10 +56,16 @@ class AuthConfig(DataClassYAMLMixin):
     """
 
     expiration_hours: int = 24
-    """JWT expiration time in hours."""
+    """JWT expiration time in hours.
+
+    Env Var: `SUPERNOTE_JWT_EXPIRATION_HOURS`
+    """
 
     device_expiration_hours: int = 87600
-    """JWT expiration time for devices in hours (default: 10 years)."""
+    """JWT expiration time for devices in hours (default: 10 years).
+
+    Env Var: `SUPERNOTE_DEVICE_EXPIRATION_HOURS`
+    """
 
     enable_registration: bool = False
     """When disabled, registration is only allowed if there are no users in the system.
@@ -53,63 +85,6 @@ class AuthConfig(DataClassYAMLMixin):
 
 
 @dataclass
-class WebhookEndpointConfig(DataClassYAMLMixin):
-    """A single outbound webhook subscriber."""
-
-    url: str = ""
-    """The HTTP(S) endpoint that receives the webhook POST request."""
-
-    user: str = ""
-    """Email address of the user account whose events this endpoint receives."""
-
-    secret: str = ""
-    """Shared secret used to HMAC-SHA256 sign the payload.
-
-    Never logged. Sent to receivers via the `X-Supernote-Signature` header so
-    they can verify the payload was not tampered with in transit.
-    """
-
-    events: list[str] = field(default_factory=list)
-    """Event names this endpoint wants to receive, e.g. `note.sync_completed`.
-
-    If empty (the default), the endpoint receives every event for `user`.
-    """
-
-    def __post_init__(self) -> None:
-        parsed = urlsplit(self.url)
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            raise ValueError(
-                f"Webhook endpoint URL must use http or https scheme with a valid host: {self.url!r}"
-            )
-        if not self.user or not self.user.strip():
-            raise ValueError(
-                "Webhook endpoint must specify a non-empty user email address."
-            )
-
-    class Config(BaseConfig):
-        omit_none = True
-        code_generation_options = [TO_DICT_ADD_OMIT_NONE_FLAG]  # type: ignore[list-item]
-
-
-@dataclass
-class WebhookConfig(DataClassYAMLMixin):
-    """Outbound webhook dispatch configuration."""
-
-    enabled: bool = False
-    """Whether outbound webhook dispatch is enabled.
-
-    Env Var: `SUPERNOTE_WEBHOOKS_ENABLED`
-    """
-
-    endpoints: list[WebhookEndpointConfig] = field(default_factory=list)
-    """Configured webhook subscribers."""
-
-    class Config(BaseConfig):
-        omit_none = True
-        code_generation_options = [TO_DICT_ADD_OMIT_NONE_FLAG]  # type: ignore[list-item]
-
-
-@dataclass
 class ProviderConfig(DataClassYAMLMixin):
     """Connection and authentication settings for an AI model provider."""
 
@@ -118,6 +93,13 @@ class ProviderConfig(DataClassYAMLMixin):
 
     base_url: str | None = None
     """Optional custom base URL for the provider (e.g. local Ollama or vLLM server)."""
+
+    type: str | None = None
+    """Backend implementation (`'gemini'`, `'openai'`, `'apple'`, `'fake'`). Defaults to the entry's name.
+
+    Set it to configure several entries of one kind, e.g. two OpenAI-compatible
+    servers named `ollama` and `llamacpp`.
+    """
 
     class Config(BaseConfig):
         omit_none = True
@@ -129,13 +111,20 @@ class ModelConfig(DataClassYAMLMixin):
     """Configuration for a task-specific AI model (`ocr`, `summary`, `embedding`)."""
 
     provider: str = "gemini"
-    """Name of the provider entry in `ai.providers` (e.g. `'gemini'`, `'openai'`, `'mistral'`)."""
+    """Name of the provider entry in `ai.providers` (e.g. `'gemini'`, `'openai'`, `'ollama'`)."""
 
     model: str = ""
-    """Provider-specific model identifier (e.g. `'gemini-3.6-flash'`)."""
+    """Provider-specific model identifier (e.g. `'gemini-3.5-flash-lite'`)."""
 
     max_concurrency: int = 5
     """Maximum number of concurrent requests allowed for this model."""
+
+    prompt_override: str | None = None
+    """Optional fixed prompt that replaces the composed prompt for OCR models.
+
+    Useful for dedicated OCR models (such as DeepSeek-OCR or GLM-OCR) trained
+    on a single short instruction rather than the full metadata and legend prompt.
+    """
 
     def __post_init__(self) -> None:
         if not self.provider or not self.provider.strip():
@@ -144,6 +133,8 @@ class ModelConfig(DataClassYAMLMixin):
             raise ValueError("ModelConfig must specify a non-empty model.")
         if self.max_concurrency < 1:
             raise ValueError("ModelConfig max_concurrency must be >= 1.")
+        if self.prompt_override is not None and not self.prompt_override.strip():
+            raise ValueError("ModelConfig prompt_override must be non-empty when set.")
 
     class Config(BaseConfig):
         omit_none = True
@@ -165,6 +156,13 @@ class AiConfig(DataClassYAMLMixin):
 
     embedding: ModelConfig | None = None
     """Model configuration for page embedding generation."""
+
+    def provider_type(self, name: str) -> str:
+        """Return the backend implementation for the `ai.providers` entry `name`."""
+        provider_cfg = self.providers.get(name)
+        if provider_cfg is not None and provider_cfg.type:
+            return provider_cfg.type
+        return name
 
     class Config(BaseConfig):
         omit_none = True
@@ -208,6 +206,12 @@ class ServerConfig(DataClassYAMLMixin):
     Used for RFC 9728 discovery if the server is behind a proxy.
     """
 
+    log_level: str = "INFO"
+    """Server logging level (DEBUG, INFO, WARNING, ERROR).
+
+    Env Var: `SUPERNOTE_LOG_LEVEL`
+    """
+
     trace_log_file: str | None = None
     """Path to trace log file.
 
@@ -217,7 +221,7 @@ class ServerConfig(DataClassYAMLMixin):
     """
 
     trace_log_unsafe: bool = False
-    """Whether to disable credential and token redaction in the trace log for debugging.
+    """Whether to disable credential and token redaction across trace and access logs.
 
     Env Var: `SUPERNOTE_TRACE_LOG_UNSAFE`
     """
@@ -226,6 +230,20 @@ class ServerConfig(DataClassYAMLMixin):
     """Directory for storing files and database.
 
     Env Var: `SUPERNOTE_STORAGE_DIR`
+    """
+
+    default_user_quota: int = 0
+    """Default per-user storage quota in bytes (0 = unlimited, bounded by storage volume free space).
+
+    Individual users can override this via `UserDO.total_capacity` (`supernote admin user set-quota`).
+
+    Env Var: `SUPERNOTE_DEFAULT_USER_QUOTA`
+    """
+
+    event_log_retention_days: int = 90
+    """Number of days to retain domain events in `f_user_event` (0 = retain indefinitely).
+
+    Env Var: `SUPERNOTE_EVENT_LOG_RETENTION_DAYS`
     """
 
     proxy_mode: str | None = None
@@ -255,7 +273,7 @@ class ServerConfig(DataClassYAMLMixin):
     Env Var: `SUPERNOTE_GEMINI_API_KEY`
     """
 
-    gemini_ocr_model: str = "gemini-3.6-flash"
+    gemini_ocr_model: str = "gemini-3.5-flash-lite"
     """Legacy Gemini model to use for OCR and Summaries.
 
     Env Var: `SUPERNOTE_GEMINI_OCR_MODEL`
@@ -291,8 +309,8 @@ class ServerConfig(DataClassYAMLMixin):
     Env Var: `SUPERNOTE_METRICS_PATH`
     """
 
-    webhooks: WebhookConfig = field(default_factory=WebhookConfig)
-    """Outbound webhook dispatch configuration."""
+    webhooks: dict[str, Any] = field(default_factory=dict)
+    """Raw configuration section for the outbound webhooks component."""
 
     web_enabled: bool = True
     """Whether to serve the web frontend dashboard and static assets.
@@ -310,6 +328,11 @@ class ServerConfig(DataClassYAMLMixin):
     """
 
     def __post_init__(self) -> None:
+        self.log_level = _normalize_log_level(self.log_level)
+        if isinstance(self.default_user_quota, bool) or self.default_user_quota < 0:
+            raise ValueError("default_user_quota must be a non-negative integer")
+        if self.event_log_retention_days < 0:
+            raise ValueError("event_log_retention_days must be >= 0")
         self._sync_legacy_gemini_config()
 
     def _sync_legacy_gemini_config(self) -> None:
@@ -455,6 +478,36 @@ class ServerConfig(DataClassYAMLMixin):
             config.storage_dir = os.getenv("SUPERNOTE_STORAGE_DIR", config.storage_dir)
             logger.info(f"Using SUPERNOTE_STORAGE_DIR: {config.storage_dir}")
 
+        if (raw_quota := os.getenv("SUPERNOTE_DEFAULT_USER_QUOTA")) is not None:
+            try:
+                quota_val = int(raw_quota)
+                if quota_val < 0:
+                    raise ValueError("must be >= 0")
+                config.default_user_quota = quota_val
+                logger.info(
+                    f"Using SUPERNOTE_DEFAULT_USER_QUOTA: {config.default_user_quota}"
+                )
+            except ValueError as err:
+                logger.warning(
+                    f"Ignoring invalid SUPERNOTE_DEFAULT_USER_QUOTA {raw_quota!r}: {err}"
+                )
+
+        if (
+            raw_retention := os.getenv("SUPERNOTE_EVENT_LOG_RETENTION_DAYS")
+        ) is not None:
+            try:
+                retention_val = int(raw_retention)
+                if retention_val < 0:
+                    raise ValueError("must be >= 0")
+                config.event_log_retention_days = retention_val
+                logger.info(
+                    f"Using SUPERNOTE_EVENT_LOG_RETENTION_DAYS: {config.event_log_retention_days}"
+                )
+            except ValueError as err:
+                logger.warning(
+                    f"Ignoring invalid SUPERNOTE_EVENT_LOG_RETENTION_DAYS {raw_retention!r}: {err}"
+                )
+
         if os.getenv("SUPERNOTE_BASE_URL"):
             config._base_url = os.getenv("SUPERNOTE_BASE_URL")
             logger.info(f"Using SUPERNOTE_BASE_URL: {config._base_url}")
@@ -485,6 +538,28 @@ class ServerConfig(DataClassYAMLMixin):
             logger.info(
                 f"Remote Password Reset Enabled: {config.auth.enable_remote_password_reset}"
             )
+
+        if raw_exp := os.getenv("SUPERNOTE_JWT_EXPIRATION_HOURS"):
+            try:
+                exp_val = int(raw_exp)
+                if exp_val > 0:
+                    config.auth.expiration_hours = exp_val
+                    logger.info(
+                        f"Using SUPERNOTE_JWT_EXPIRATION_HOURS: {config.auth.expiration_hours}"
+                    )
+            except ValueError:
+                pass
+
+        if raw_dev_exp := os.getenv("SUPERNOTE_DEVICE_EXPIRATION_HOURS"):
+            try:
+                dev_exp_val = int(raw_dev_exp)
+                if dev_exp_val > 0:
+                    config.auth.device_expiration_hours = dev_exp_val
+                    logger.info(
+                        f"Using SUPERNOTE_DEVICE_EXPIRATION_HOURS: {config.auth.device_expiration_hours}"
+                    )
+            except ValueError:
+                pass
 
         if os.getenv("SUPERNOTE_PROXY_MODE"):
             config.proxy_mode = os.getenv("SUPERNOTE_PROXY_MODE")
@@ -553,10 +628,11 @@ class ServerConfig(DataClassYAMLMixin):
             logger.info(f"Using SUPERNOTE_METRICS_PATH: {config.metrics_path}")
 
         if os.getenv("SUPERNOTE_WEBHOOKS_ENABLED"):
-            config.webhooks.enabled = _get_bool_env(
-                "SUPERNOTE_WEBHOOKS_ENABLED", config.webhooks.enabled
+            config.webhooks["enabled"] = _get_bool_env(
+                "SUPERNOTE_WEBHOOKS_ENABLED",
+                bool(config.webhooks.get("enabled", False)),
             )
-            logger.info(f"Webhooks Enabled: {config.webhooks.enabled}")
+            logger.info(f"Webhooks Enabled: {config.webhooks['enabled']}")
 
         if os.getenv("SUPERNOTE_WEB_ENABLED"):
             config.web_enabled = _get_bool_env(
@@ -570,9 +646,13 @@ class ServerConfig(DataClassYAMLMixin):
             )
             logger.info(f"Web Notebook Preview: {config.web_notebook_preview}")
 
-        if trace_log_file := os.getenv("SUPERNOTE_TRACE_LOG_FILE"):
+        if raw_log_level := os.getenv("SUPERNOTE_LOG_LEVEL"):
+            config.log_level = _normalize_log_level(raw_log_level)
+            logger.info(f"Using SUPERNOTE_LOG_LEVEL: {config.log_level}")
+
+        if (trace_log_file := os.getenv("SUPERNOTE_TRACE_LOG_FILE")) is not None:
             config.trace_log_file = trace_log_file
-            logger.info(f"Using SUPERNOTE_TRACE_LOG_FILE: {config.trace_log_file}")
+            logger.info(f"Using SUPERNOTE_TRACE_LOG_FILE: {config.trace_log_file!r}")
 
         if os.getenv("SUPERNOTE_TRACE_LOG_UNSAFE"):
             config.trace_log_unsafe = _get_bool_env(

@@ -1,8 +1,21 @@
 [v-cloak] { display: none; }
 
+:root {
+    --bg-canvas: #F7F6F2;
+    --ink-primary: #141413;
+}
+
 body {
     font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    transition: background-color 0.3s ease, color 0.3s ease;
+    background-color: var(--bg-canvas);
+    color: var(--ink-primary);
+    transition: background-color 0.2s ease, color 0.2s ease;
+    -webkit-font-smoothing: antialiased;
+}
+
+.font-mono, code, kbd, pre, .tabular-nums {
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
 }
 
 /* Custom scrollbars */
@@ -16,65 +29,269 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-    background: rgba(148, 163, 184, 0.4);
+    background: rgba(120, 118, 112, 0.3);
     border-radius: 9999px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-    background: rgba(148, 163, 184, 0.7);
+    background: rgba(120, 118, 112, 0.55);
 }
 
-/* Dark Mode support */
-.dark body {
-    background-color: #0b0f19;
-    color: #f1f5f9;
+/* Touch & keyboard accessible progressive reveal */
+.hover-reveal {
+    opacity: 1;
+    transition: opacity 0.15s ease;
 }
 
-/* Glassmorphism utilities */
-.glass-header {
-    background: rgba(255, 255, 255, 0.75);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
+@media (hover: hover) and (pointer: fine) {
+    .hover-reveal {
+        opacity: 0;
+    }
+
+    .group:hover .hover-reveal,
+    .group:focus-within .hover-reveal,
+    .hover-reveal:focus,
+    .hover-reveal:focus-visible,
+    .hover-reveal.is-visible {
+        opacity: 1;
+    }
 }
 
-.dark .glass-header {
-    background: rgba(15, 23, 42, 0.8);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
+/* Subtle E-Ink Paper Texture & Card Shadows */
+.paper-surface {
+    background-color: #FAF9F5;
+    background-image: radial-gradient(#D8D5CE 0.65px, transparent 0.65px);
+    background-size: 16px 16px;
 }
 
-.glass-card {
-    background: rgba(255, 255, 255, 0.85);
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
+.notebook-page-shadow {
+    box-shadow:
+        0 1px 2px rgba(20, 20, 19, 0.06),
+        0 8px 24px -4px rgba(20, 20, 19, 0.08),
+        0 0 0 1px rgba(20, 20, 19, 0.05);
 }
 
-.dark .glass-card {
-    background: rgba(30, 41, 59, 0.7);
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
-}
-
-/* Subtle glow effects */
-.glow-indigo {
-    box-shadow: 0 0 25px -5px rgba(99, 102, 241, 0.25);
-}
-
-.glow-purple {
-    box-shadow: 0 0 25px -5px rgba(168, 85, 247, 0.25);
-}
-
-/* Micro-animations */
+/* Micro-animations (opacity-only so position: fixed children are never trapped by a transform) */
 @keyframes fadeIn {
-    from { opacity: 0; transform: translateY(6px); }
-    to { opacity: 1; transform: translateY(0); }
+    from { opacity: 0; }
+    to { opacity: 1; }
 }
 
 .animate-fade-in {
-    animation: fadeIn 0.25s ease-out forwards;
+    animation: fadeIn 0.18s ease-out;
 }
 
-/* Notebook Cover Canvas Shadow */
-.cover-shadow {
-    box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.15), 0 4px 10px -2px rgba(0, 0, 0, 0.05);
+/* Compact Markdown Typography for Notebook Summaries */
+.markdown-prose {
+    font-size: 0.75rem;
+    line-height: 1.625;
+    color: #1e293b;
+    overflow-wrap: anywhere;
+}
+
+.markdown-prose > :first-child {
+    margin-top: 0;
+}
+
+.markdown-prose > :last-child {
+    margin-bottom: 0;
+}
+
+.markdown-prose h1 {
+    font-size: 0.9375rem;
+    font-weight: 700;
+    color: #0f172a;
+    line-height: 1.35;
+    margin-top: 0.875rem;
+    margin-bottom: 0.375rem;
+}
+
+.markdown-prose h2 {
+    font-size: 0.8125rem;
+    font-weight: 700;
+    color: #0f172a;
+    line-height: 1.4;
+    margin-top: 0.875rem;
+    margin-bottom: 0.375rem;
+    padding-bottom: 0.25rem;
+    border-bottom: 1px solid rgba(214, 211, 209, 0.7);
+}
+
+.markdown-prose h3 {
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: #0f172a;
+    line-height: 1.4;
+    margin-top: 0.65rem;
+    margin-bottom: 0.25rem;
+}
+
+.markdown-prose h4,
+.markdown-prose h5,
+.markdown-prose h6 {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #334155;
+    line-height: 1.4;
+    margin-top: 0.5rem;
+    margin-bottom: 0.2rem;
+}
+
+.markdown-prose p {
+    margin-top: 0.45rem;
+    margin-bottom: 0.45rem;
+}
+
+.markdown-prose ul {
+    list-style-type: disc;
+    padding-left: 1.15rem;
+    margin-top: 0.375rem;
+    margin-bottom: 0.45rem;
+}
+
+.markdown-prose ol {
+    list-style-type: decimal;
+    padding-left: 1.25rem;
+    margin-top: 0.375rem;
+    margin-bottom: 0.45rem;
+}
+
+.markdown-prose ul ul {
+    list-style-type: circle;
+    margin-top: 0.2rem;
+    margin-bottom: 0.2rem;
+}
+
+.markdown-prose ul ul ul {
+    list-style-type: square;
+}
+
+.markdown-prose ol ol {
+    list-style-type: lower-alpha;
+    margin-top: 0.2rem;
+    margin-bottom: 0.2rem;
+}
+
+.markdown-prose li {
+    margin-top: 0.175rem;
+    margin-bottom: 0.175rem;
+}
+
+.markdown-prose li > p {
+    margin-top: 0.2rem;
+    margin-bottom: 0.2rem;
+}
+
+.markdown-prose li.md-task-item {
+    list-style-type: none;
+    margin-left: -1.15rem;
+}
+
+.markdown-prose .md-task-box {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 0.8125rem;
+    height: 0.8125rem;
+    margin-right: 0.35rem;
+    vertical-align: -0.125rem;
+    border: 1px solid #a8a29e;
+    border-radius: 0.2rem;
+    background-color: #ffffff;
+    font-size: 0.5625rem;
+    font-weight: 700;
+    line-height: 1;
+    color: transparent;
+}
+
+.markdown-prose .md-task-box.is-checked {
+    background-color: #0f172a;
+    border-color: #0f172a;
+    color: #ffffff;
+}
+
+.markdown-prose strong {
+    font-weight: 600;
+    color: #0f172a;
+}
+
+.markdown-prose em {
+    font-style: italic;
+}
+
+.markdown-prose del {
+    text-decoration: line-through;
+    color: #78716c;
+}
+
+.markdown-prose a {
+    color: #0369a1;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+
+.markdown-prose a:hover {
+    color: #0c4a6e;
+}
+
+.markdown-prose :not(pre) > code {
+    font-size: 0.6875rem;
+    background-color: rgba(231, 229, 228, 0.85);
+    color: #0f172a;
+    padding: 0.1rem 0.3rem;
+    border-radius: 0.25rem;
+}
+
+.markdown-prose pre {
+    background-color: #0f172a;
+    color: #f5f5f4;
+    padding: 0.6rem 0.75rem;
+    border-radius: 0.5rem;
+    overflow-x: auto;
+    font-size: 0.6875rem;
+    line-height: 1.5;
+    margin: 0.5rem 0;
+}
+
+.markdown-prose pre code {
+    background: transparent;
+    padding: 0;
+    color: inherit;
+    font-size: inherit;
+}
+
+.markdown-prose blockquote {
+    border-left: 2px solid #d6d3d1;
+    padding-left: 0.65rem;
+    margin: 0.5rem 0;
+    color: #57534e;
+    font-style: italic;
+}
+
+.markdown-prose hr {
+    border: 0;
+    border-top: 1px solid #e7e5e4;
+    margin: 0.75rem 0;
+}
+
+.markdown-prose table {
+    display: block;
+    width: 100%;
+    overflow-x: auto;
+    border-collapse: collapse;
+    margin: 0.5rem 0;
+    font-size: 0.6875rem;
+}
+
+.markdown-prose th,
+.markdown-prose td {
+    border: 1px solid #e7e5e4;
+    padding: 0.3rem 0.5rem;
+    text-align: left;
+}
+
+.markdown-prose th {
+    background-color: #f5f5f4;
+    font-weight: 600;
+    color: #0f172a;
 }

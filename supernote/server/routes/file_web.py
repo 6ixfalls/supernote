@@ -1,4 +1,14 @@
-import logging
+"""Web UI file browser, upload/download, and recycle bin routes (`/api/file/*`).
+
+Serves the browser-facing file management APIs consumed by the Web UI dashboard and
+`supernote.client.web.WebClient`, including sorted directory queries (`list_query`),
+breadcrumb path resolution (`path_query`), keyword search, folder creation, rename,
+move, copy, upload/download URL signing (`supernote.server.utils.url_signer.UrlSigner`),
+recycle bin management (`/api/file/recycle/*`), and synchronous `.note` to PNG/PDF export
+(`supernote.server.services.conversion.ConversionService`). Delegates VFS operations to
+`supernote.server.services.file.FileService`.
+"""
+
 import urllib.parse
 from pathlib import Path
 from typing import Protocol, TypeVar
@@ -45,15 +55,19 @@ from supernote.server.constants import (
     SYSTEM_ROOT_DIRECTORIES,
 )
 from supernote.server.exceptions import SupernoteError
+from supernote.server.keys import (
+    FILE_SERVICE_KEY,
+    REQUEST_USER_KEY,
+    URL_SIGNER_KEY,
+)
 from supernote.server.services.file import (
     FileEntity,
     FileService,
     FolderDetail,
 )
-from supernote.server.utils.paths import generate_inner_name
+from supernote.server.utils.paths import flatten_vfs_path, generate_inner_name
 from supernote.server.utils.url_signer import UrlSigner, get_request_base_url
 
-logger = logging.getLogger(__name__)
 routes = web.RouteTableDef()
 
 
@@ -97,31 +111,18 @@ def _sort_and_page(
     return page_items, total
 
 
-def _flatten_path(path: str) -> str:
-    """Flatten paths for items inside category containers (e.g., NOTE/Note -> Note)."""
-
-    path_parts = path.strip("/").split("/")
-    if len(path_parts) >= 2 and path_parts[0] in CATEGORY_CONTAINERS:
-        # Convert NOTE/Note/Sub -> Note/Sub
-        return "/".join(path_parts[1:])
-    if path_parts and path_parts[0] in SYSTEM_ROOT_DIRECTORIES:
-        path_parts[0] = path_parts[0].capitalize()
-        return "/".join(path_parts)
-    return path
-
-
 @routes.post("/api/file/capacity/query")
 async def handle_capacity_query_cloud(request: web.Request) -> web.Response:
     # Endpoint: POST /api/file/capacity/query
     # Purpose: Get storage capacity usage (Cloud).
     # Response: CapacityVO
 
-    user_email = request["user"]
-    file_service: FileService = request.app["file_service"]
+    user_email = request[REQUEST_USER_KEY]
+    file_service: FileService = request.app[FILE_SERVICE_KEY]
 
     try:
-        # TODO: Implement quota properly
         used = await file_service.get_storage_usage(user_email)
+        total_capacity = await file_service.get_storage_quota(user_email)
     except SupernoteError as err:
         return err.to_response()
     except Exception as err:
@@ -130,7 +131,7 @@ async def handle_capacity_query_cloud(request: web.Request) -> web.Response:
     return web.json_response(
         CapacityVO(
             used_capacity=used,
-            total_capacity=1024 * 1024 * 1024 * 10,  # 10GB total
+            total_capacity=total_capacity,
         ).to_dict()
     )
 
@@ -141,8 +142,8 @@ async def handle_recycle_list(request: web.Request) -> web.Response:
     # Purpose: List files in recycle bin.
 
     req_data = RecycleFileListDTO.from_dict(await request.json())
-    user_email = request["user"]
-    file_service: FileService = request.app["file_service"]
+    user_email = request[REQUEST_USER_KEY]
+    file_service: FileService = request.app[FILE_SERVICE_KEY]
 
     try:
         recycle_files = await file_service.list_recycle(
@@ -185,8 +186,8 @@ async def handle_recycle_delete(request: web.Request) -> web.Response:
     # Response: BaseVO
 
     req_data = RecycleFileDTO.from_dict(await request.json())
-    user_email = request["user"]
-    file_service: FileService = request.app["file_service"]
+    user_email = request[REQUEST_USER_KEY]
+    file_service: FileService = request.app[FILE_SERVICE_KEY]
 
     try:
         await file_service.delete_from_recycle(user_email, req_data.id_list)
@@ -202,8 +203,8 @@ async def handle_recycle_revert(request: web.Request) -> web.Response:
     # Response: BaseVO
 
     req_data = RecycleFileDTO.from_dict(await request.json())
-    user_email = request["user"]
-    file_service: FileService = request.app["file_service"]
+    user_email = request[REQUEST_USER_KEY]
+    file_service: FileService = request.app[FILE_SERVICE_KEY]
 
     try:
         await file_service.revert_from_recycle(user_email, req_data.id_list)
@@ -217,8 +218,8 @@ async def handle_recycle_clear(request: web.Request) -> web.Response:
     # Endpoint: POST /api/file/recycle/clear
     # Purpose: Empty the recycle bin.
 
-    user_email = request["user"]
-    file_service: FileService = request.app["file_service"]
+    user_email = request[REQUEST_USER_KEY]
+    file_service: FileService = request.app[FILE_SERVICE_KEY]
 
     try:
         await file_service.clear_recycle(user_email)
@@ -234,8 +235,8 @@ async def handle_path_query(request: web.Request) -> web.Response:
     # Response: FilePathQueryVO
 
     req_data = FilePathQueryDTO.from_dict(await request.json())
-    user_email = request["user"]
-    file_service: FileService = request.app["file_service"]
+    user_email = request[REQUEST_USER_KEY]
+    file_service: FileService = request.app[FILE_SERVICE_KEY]
 
     try:
         path_info = await file_service.get_path_info(user_email, req_data.id)
@@ -271,9 +272,9 @@ async def handle_download_url(request: web.Request) -> web.Response:
     # Response: FileDownloadUrlVO
 
     req_data = FileDownloadDTO.from_dict(await request.json())
-    user_email = request["user"]
-    file_service: FileService = request.app["file_service"]
-    url_signer: UrlSigner = request.app["url_signer"]
+    user_email = request[REQUEST_USER_KEY]
+    file_service: FileService = request.app[FILE_SERVICE_KEY]
+    url_signer: UrlSigner = request.app[URL_SIGNER_KEY]
 
     try:
         info = await file_service.get_file_info_by_id(user_email, req_data.id)
@@ -313,8 +314,8 @@ async def handle_file_list_query(request: web.Request) -> web.Response:
     # Response: FileListQueryVO
 
     req_data = FileListQueryDTO.from_dict(await request.json())
-    user_email = request["user"]
-    file_service: FileService = request.app["file_service"]
+    user_email = request[REQUEST_USER_KEY]
+    file_service: FileService = request.app[FILE_SERVICE_KEY]
 
     try:
         file_entities = await file_service.query_file_list(
@@ -394,8 +395,8 @@ async def handle_file_search(request: web.Request) -> web.Response:
     # Response: FileLabelSearchVO
 
     req_data = FileLabelSearchDTO.from_dict(await request.json())
-    user_email = request["user"]
-    file_service: FileService = request.app["file_service"]
+    user_email = request[REQUEST_USER_KEY]
+    file_service: FileService = request.app[FILE_SERVICE_KEY]
 
     try:
         search_term = req_data.keyword or req_data.file_name or ""
@@ -405,7 +406,7 @@ async def handle_file_search(request: web.Request) -> web.Response:
         search_vos: list[UserFileSearchVO] = []
         for entity in file_entities:
             # Web API expects flattened paths for system directories
-            path_display = _flatten_path(entity.full_path)
+            path_display = flatten_vfs_path(entity.full_path)
             parent_path = str(Path(path_display).parent)
             if parent_path == ".":
                 parent_path = ""
@@ -454,8 +455,8 @@ async def handle_folder_add(request: web.Request) -> web.Response:
     # Response: FolderVO
 
     req_data = FolderAddDTO.from_dict(await request.json())
-    user_email = request["user"]
-    file_service: FileService = request.app["file_service"]
+    user_email = request[REQUEST_USER_KEY]
+    file_service: FileService = request.app[FILE_SERVICE_KEY]
 
     try:
         new_dir = await file_service.create_directory_by_id(
@@ -491,8 +492,8 @@ async def handle_folder_list_query(request: web.Request) -> web.Response:
     # Response: FolderListQueryVO
 
     req_data = FolderListQueryDTO.from_dict(await request.json())
-    user_email = request["user"]
-    file_service: FileService = request.app["file_service"]
+    user_email = request[REQUEST_USER_KEY]
+    file_service: FileService = request.app[FILE_SERVICE_KEY]
 
     try:
         # Initial query
@@ -545,8 +546,8 @@ async def handle_file_move_web(request: web.Request) -> web.Response:
     # Response: BaseResponse
 
     req_data = FileMoveAndCopyDTO.from_dict(await request.json())
-    user_email = request["user"]
-    file_service: FileService = request.app["file_service"]
+    user_email = request[REQUEST_USER_KEY]
+    file_service: FileService = request.app[FILE_SERVICE_KEY]
 
     try:
         await file_service.move_items(
@@ -564,8 +565,8 @@ async def handle_file_copy_web(request: web.Request) -> web.Response:
     # Response: BaseResponse
 
     req_data = FileMoveAndCopyDTO.from_dict(await request.json())
-    user_email = request["user"]
-    file_service: FileService = request.app["file_service"]
+    user_email = request[REQUEST_USER_KEY]
+    file_service: FileService = request.app[FILE_SERVICE_KEY]
 
     try:
         await file_service.copy_items(
@@ -583,8 +584,8 @@ async def handle_file_rename_web(request: web.Request) -> web.Response:
     # Response: BaseResponse
 
     req_data = FileReNameDTO.from_dict(await request.json())
-    user_email = request["user"]
-    file_service: FileService = request.app["file_service"]
+    user_email = request[REQUEST_USER_KEY]
+    file_service: FileService = request.app[FILE_SERVICE_KEY]
 
     try:
         await file_service.rename_item(user_email, req_data.id, req_data.new_name)
@@ -600,8 +601,8 @@ async def handle_file_delete(request: web.Request) -> web.Response:
     # Response: BaseResponse
 
     req_data = FileDeleteDTO.from_dict(await request.json())
-    user_email = request["user"]
-    file_service: FileService = request.app["file_service"]
+    user_email = request[REQUEST_USER_KEY]
+    file_service: FileService = request.app[FILE_SERVICE_KEY]
 
     try:
         await file_service.delete_items(
@@ -621,10 +622,14 @@ async def handle_file_upload_apply(request: web.Request) -> web.Response:
     # Response: FileUploadApplyLocalVO
 
     req_data = FileUploadApplyDTO.from_dict(await request.json())
-    user_email = request["user"]
-    url_signer: UrlSigner = request.app["url_signer"]
+    user_email = request[REQUEST_USER_KEY]
+    file_service: FileService = request.app[FILE_SERVICE_KEY]
+    url_signer: UrlSigner = request.app[URL_SIGNER_KEY]
 
     try:
+        await file_service.check_upload_apply_web(
+            user_email, req_data.directory_id, req_data.file_name, req_data.size
+        )
         inner_name = generate_inner_name(req_data.file_name, None)
         encoded_name = urllib.parse.quote(inner_name)
 
@@ -657,8 +662,8 @@ async def handle_file_upload_finish(request: web.Request) -> web.Response:
     # Response: BaseResponse
 
     req_data = FileUploadFinishDTO.from_dict(await request.json())
-    user_email = request["user"]
-    file_service: FileService = request.app["file_service"]
+    user_email = request[REQUEST_USER_KEY]
+    file_service: FileService = request.app[FILE_SERVICE_KEY]
 
     try:
         await file_service.upload_finish_web(

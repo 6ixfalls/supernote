@@ -22,9 +22,7 @@ jobs:
         with:
           check_hidden: false
           ignore_words_list: folde
-      - name: Validate Renovate configuration
-        run: |
-          npx --package=renovate@38 -- renovate-config-validator .github/renovate.json5
+          skip: ./.git,./evals/ocr/dataset.yaml,./evals/ocr/results
       - name: Run yamllint
         uses: ibiqlik/action-yamllint@2576378a8e339169678f9939646ee3ee325e845c # v3
         with:
@@ -33,7 +31,7 @@ jobs:
           strict: true
 
       - name: Install uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           enable-cache: true
           cache-dependency-glob: "requirements_dev.txt"
@@ -51,4 +49,20 @@ jobs:
           ruff format --check .
       - name: Static typing with ty
         run: |
-          ty check . --ignore unresolved-import
+          ty check . --ignore import-not-found
+
+      - name: Cache npm packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-tsc-${{ hashFiles('.github/workflows/lint.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-tsc-
+
+      - name: Static typing for frontend JS (tsc)
+        run: |
+          npx --yes --package=typescript@7.0.2 -- tsc -p tsconfig.json --noEmit
+
+      - name: Lint and format check frontend JS (biome)
+        run: |
+          npx --yes --package=@biomejs/biome@2.6.8 -- biome check --error-on-warnings supernote/server/static/js tests/frontend

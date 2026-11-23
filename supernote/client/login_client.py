@@ -1,6 +1,12 @@
-"""Library for authenticating with the Supernote (Private) Cloud Server."""
+"""Challenge-response, SMS, and equipment authentication client (`LoginClient`).
 
-import logging
+This module implements `supernote.client.login_client.LoginClient` (accessible via `sn.login_client`
+on `supernote.client.Supernote`), orchestrating the two-step `SHA256(MD5(password) + randomCode)`
+challenge-response login (`login`, `device_login`), SMS verification flows (`request_sms_code`,
+`sms_login`), and hardware equipment binding (`bind_equipment`, `unbind_equipment`,
+`query_user_equipment`) using models from `supernote.models.auth` and `supernote.models.equipment`.
+"""
+
 from typing import TypeVar
 
 from mashumaro.mixins.json import DataClassJSONMixin
@@ -32,9 +38,6 @@ from supernote.models.user import UserCheckDTO, UserCheckVO
 from .client import Client
 from .exceptions import ApiException, SmsVerificationRequired
 from .hashing import get_token_salt, hash_password, hash_with_salt
-
-_LOGGER = logging.getLogger(__name__)
-
 
 _T = TypeVar("_T", bound=DataClassJSONMixin)
 

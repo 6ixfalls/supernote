@@ -1,12 +1,25 @@
+"""High-level file, folder, and recycle bin orchestration service.
+
+`FileService` coordinates metadata operations in `supernote.server.services.vfs.VirtualFileSystem`
+with physical blob lifecycle management in `supernote.server.services.blob.BlobStorage`
+and quota checks in `supernote.server.services.user.UserService`. When `.note` files or
+VFS entries are created, updated, moved, or deleted, `FileService` publishes domain
+events (`NoteUpdatedEvent`, `NoteDeletedEvent`, `VfsItemCreatedEvent`, `BlobCleanupEvent`)
+onto `supernote.server.events.LocalEventBus` so background processing and Socket.IO
+clients stay synchronized. See `supernote.guides.architecture`.
+"""
+
+import asyncio
 import logging
 import time
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select
 
-from supernote.models.base import BooleanEnum
+from supernote.models.base import BooleanEnum, ErrorCode
 from supernote.server.constants import (
     CACHE_BUCKET,
     CATEGORY_CONTAINERS,
@@ -20,20 +33,28 @@ from supernote.server.exceptions import (
     FileNotFound,
     HashMismatch,
     InvalidPath,
+    QuotaExceeded,
 )
-from supernote.server.utils.paths import get_conversion_pdf_path
+from supernote.server.utils.paths import get_conversion_pdf_prefix
 
 from ..db.models.file import RecycleFileDO, UserFileDO
 from ..db.models.summary import SummaryDO
+from ..db.models.user import FALLBACK_QUOTA, UNLIMITED_QUOTA
 from ..db.session import DatabaseSessionManager
 from ..events import (
     LocalEventBus,
     NoteDeletedEvent,
     NoteUpdatedEvent,
+    VfsContentUpdatedEvent,
     VfsItemCopiedEvent,
     VfsItemCreatedEvent,
     VfsItemDeletedEvent,
     VfsItemMovedEvent,
+)
+from ..metrics import (
+    NoteUploadSource,
+    init_oss_and_upload_metrics,
+    record_note_upload,
 )
 from .blob import BlobStorage
 from .user import UserService
@@ -150,6 +171,8 @@ class _FileUpsertResult:
     node: UserFileDO
     superseded_storage_key: str | None = None
     superseded_md5: str | None = None
+    was_existing: bool = False
+    previous_md5: str | None = None
 
 
 class FileService:
@@ -162,6 +185,7 @@ class FileService:
         user_service: UserService,
         session_manager: DatabaseSessionManager,
         event_bus: LocalEventBus | None = None,
+        default_user_quota: int = UNLIMITED_QUOTA,
     ) -> None:
         """Initialize the file service."""
         self.storage_root = storage_root
@@ -169,6 +193,11 @@ class FileService:
         self.user_service = user_service
         self.session_manager = session_manager
         self.event_bus = event_bus
+        self.default_user_quota = default_user_quota
+        self._staging_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
+        init_oss_and_upload_metrics()
 
     async def list_folder(
         self, user: str, path_str: str, recursive: bool = False
@@ -332,6 +361,87 @@ class FileService:
             id_path = "/".join(id_path_parts).strip()
             return PathInfo(path=path, id_path=id_path)
 
+    @staticmethod
+    def _extract_apply_parent_path(path_str: str, filename: str) -> str:
+        """Normalize parent directory path from a device upload-apply path."""
+        clean = path_str.strip("/")
+        if clean == filename:
+            return ""
+        suffix = f"/{filename}"
+        if clean.endswith(suffix):
+            return clean[: -len(suffix)].strip("/")
+        return clean
+
+    def _check_apply_quota_and_disk(
+        self, configured_limit: int, current_used: int, old_size: int, size: int
+    ) -> None:
+        """Validate prospective upload size against configured quota and free disk space."""
+        net_change = size - old_size
+        if (
+            configured_limit > 0
+            and net_change > 0
+            and current_used + net_change > configured_limit
+        ):
+            raise QuotaExceeded("Storage quota exceeded", ErrorCode.QUOTA_EXCEEDED)
+
+        available_disk = self.blob_storage.get_available_bytes()
+        if available_disk is not None and size > available_disk:
+            raise QuotaExceeded(
+                "Insufficient storage space available", ErrorCode.QUOTA_EXCEEDED
+            )
+
+    @staticmethod
+    def _is_commit_over_quota(
+        configured_limit: int, current_used: int, net_change: int
+    ) -> bool:
+        """Check whether committing a staged blob would exceed the configured quota."""
+        return (
+            configured_limit > 0
+            and net_change > 0
+            and current_used + net_change > configured_limit
+        )
+
+    async def check_upload_apply_device(
+        self, user: str, path_str: str, filename: str, size: int
+    ) -> None:
+        """Pre-flight quota and disk headroom check before issuing device upload URLs."""
+        if size <= 0:
+            return
+        user_id, configured_limit = await self._resolve_user_quota(user)
+        parent_path = self._extract_apply_parent_path(path_str, filename)
+
+        async with self.session_manager.session() as session:
+            vfs = VirtualFileSystem(session)
+            existing = None
+            if parent_path:
+                parent_dir = await vfs.resolve_path(user_id, parent_path)
+                if parent_dir:
+                    existing = await vfs.get_active_file(
+                        user_id, parent_dir.id, filename
+                    )
+            else:
+                existing = await vfs.get_active_file(user_id, 0, filename)
+            current_used = await vfs.get_total_usage(user_id)
+            old_size = existing.size if existing else 0
+
+        self._check_apply_quota_and_disk(configured_limit, current_used, old_size, size)
+
+    async def check_upload_apply_web(
+        self, user: str, directory_id: int, file_name: str, size: int
+    ) -> None:
+        """Pre-flight quota and disk headroom check before issuing Web upload URLs."""
+        if size <= 0:
+            return
+        user_id, configured_limit = await self._resolve_user_quota(user)
+
+        async with self.session_manager.session() as session:
+            vfs = VirtualFileSystem(session)
+            existing = await vfs.get_active_file(user_id, directory_id, file_name)
+            current_used = await vfs.get_total_usage(user_id)
+            old_size = existing.size if existing else 0
+
+        self._check_apply_quota_and_disk(configured_limit, current_used, old_size, size)
+
     async def finish_upload(
         self,
         user: str,
@@ -341,43 +451,73 @@ class FileService:
         inner_name: str,
     ) -> FileEntity:
         """Finish upload for a specific user."""
-        user_id = await self.user_service.get_user_id(user)
+        user_id, configured_limit = await self._resolve_user_quota(user)
 
-        # Verify blob and get metadata
-        # We need MD5 to verify integrity
-        try:
-            metadata = await self.blob_storage.get_metadata(
-                USER_DATA_BUCKET, inner_name, include_md5=True
-            )
-        except FileNotFoundError:
-            raise FileNotFound(f"Blob {inner_name} not found")
+        staging_lock = self._staging_locks.setdefault(inner_name, asyncio.Lock())
+        async with staging_lock:
+            # Verify blob and get metadata
+            # We need MD5 to verify integrity
+            try:
+                metadata = await self.blob_storage.get_metadata(
+                    USER_DATA_BUCKET, inner_name, include_md5=True
+                )
+            except FileNotFoundError:
+                raise FileNotFound(f"Blob {inner_name} not found")
 
-        if metadata.content_md5 != content_hash:
-            raise HashMismatch(
-                f"Hash mismatch: expected {content_hash}, got {metadata.content_md5}"
-            )
+            if metadata.content_md5 != content_hash:
+                raise HashMismatch(
+                    f"Hash mismatch: expected {content_hash}, got {metadata.content_md5}"
+                )
 
-        blob_size = metadata.size
+            blob_size = metadata.size
 
-        # Create metadata in VFS
-        async with self.session_manager.session() as session:
-            vfs = VirtualFileSystem(session)
-            clean_path = path_str.strip("/")
-            parent_id = 0
-            if clean_path:
-                parent_id = await vfs.ensure_directory_path(user_id, clean_path)
+            # Create metadata in VFS
+            async with self.session_manager.session() as session:
+                vfs = VirtualFileSystem(session)
+                clean_path = path_str.strip("/")
+                parent_id: int | None = 0 if not clean_path else None
+                existing = None
+                if clean_path:
+                    parent_dir = await vfs.resolve_path(user_id, clean_path)
+                    if parent_dir:
+                        parent_id = parent_dir.id
+                        existing = await vfs.get_active_file(
+                            user_id, parent_id, filename
+                        )
+                else:
+                    existing = await vfs.get_active_file(user_id, 0, filename)
 
-            upsert_result = await self._upsert_vfs_file(
-                vfs=vfs,
-                user_id=user_id,
-                parent_id=parent_id,
-                name=filename,
-                size=blob_size,
-                md5=content_hash,
-                storage_key=inner_name,
-            )
-            new_file = upsert_result.node
-            canonical_full_path = await vfs.get_full_path(user_id, new_file.id)
+                current_used = await vfs.get_total_usage(user_id)
+                old_size = existing.size if existing else 0
+                net_change = blob_size - old_size
+
+                if self._is_commit_over_quota(
+                    configured_limit, current_used, net_change
+                ):
+                    is_over_quota = True
+                else:
+                    is_over_quota = False
+                    if parent_id is None:
+                        parent_id = await vfs.ensure_directory_path(user_id, clean_path)
+
+                    upsert_result = await self._upsert_vfs_file(
+                        vfs=vfs,
+                        user_id=user_id,
+                        parent_id=parent_id,
+                        name=filename,
+                        size=blob_size,
+                        md5=content_hash,
+                        storage_key=inner_name,
+                    )
+                    new_file = upsert_result.node
+                    canonical_full_path = await vfs.get_full_path(user_id, new_file.id)
+
+            if is_over_quota:
+                await self.cleanup_unreferenced_blobs({inner_name})
+                raise QuotaExceeded("Storage quota exceeded", ErrorCode.QUOTA_EXCEEDED)
+
+        if filename.lower().endswith(".note"):
+            record_note_upload(source=NoteUploadSource.DEVICE_SYNC)
 
         await self._cleanup_superseded_artifacts(upsert_result)
 
@@ -388,26 +528,12 @@ class FileService:
 
         # Emit domain events (fire and forget)
         if self.event_bus:
-            if filename.endswith(".note"):
-                await self.event_bus.publish(
-                    NoteUpdatedEvent(
-                        file_id=new_file.id,
-                        user_id=user_id,
-                        file_path=full_path,
-                        defer_processing=True,
-                    )
-                )
-            await self.event_bus.publish(
-                VfsItemCreatedEvent(
-                    user_id=user_id,
-                    item_id=entity.id,
-                    parent_id=entity.parent_id,
-                    name=entity.name,
-                    is_folder=False,
-                    full_path=canonical_full_path,
-                    size=entity.size,
-                    md5=entity.md5,
-                )
+            await self._publish_file_upsert_events(
+                user_id=user_id,
+                upsert_result=upsert_result,
+                vfs_full_path=canonical_full_path,
+                note_file_path=full_path,
+                defer_note_processing=True,
             )
 
         return entity
@@ -421,61 +547,119 @@ class FileService:
         inner_name: str,
     ) -> None:
         """Finish upload (Web API)."""
-        user_id = await self.user_service.get_user_id(user)
+        user_id, configured_limit = await self._resolve_user_quota(user)
 
-        # Check/promote blob and verify integrity
-        try:
-            metadata = await self.blob_storage.get_metadata(
-                USER_DATA_BUCKET, inner_name, include_md5=True
-            )
-        except FileNotFoundError:
-            raise FileNotFound(f"Blob {inner_name} not found")
+        staging_lock = self._staging_locks.setdefault(inner_name, asyncio.Lock())
+        async with staging_lock:
+            # Check/promote blob and verify integrity
+            try:
+                metadata = await self.blob_storage.get_metadata(
+                    USER_DATA_BUCKET, inner_name, include_md5=True
+                )
+            except FileNotFoundError:
+                raise FileNotFound(f"Blob {inner_name} not found")
 
-        if metadata.content_md5 != md5:
-            # Note: The Web API might not expect a HashMismatch error, but it's correct for integrity.
-            # Convert to appropriate error if needed, but HashMismatch is fine for now.
-            raise HashMismatch(
-                f"Hash mismatch: expected {md5}, got {metadata.content_md5}"
-            )
+            if metadata.content_md5 != md5:
+                # Note: The Web API might not expect a HashMismatch error, but it's correct for integrity.
+                # Convert to appropriate error if needed, but HashMismatch is fine for now.
+                raise HashMismatch(
+                    f"Hash mismatch: expected {md5}, got {metadata.content_md5}"
+                )
 
-        blob_size = metadata.size
+            blob_size = metadata.size
 
-        # Create VFS node
-        async with self.session_manager.session() as session:
-            vfs = VirtualFileSystem(session)
+            # Create VFS node
+            async with self.session_manager.session() as session:
+                vfs = VirtualFileSystem(session)
+                current_used = await vfs.get_total_usage(user_id)
+                existing = await vfs.get_active_file(user_id, directory_id, file_name)
+                old_size = existing.size if existing else 0
+                net_change = blob_size - old_size
 
-            upsert_result = await self._upsert_vfs_file(
-                vfs=vfs,
-                user_id=user_id,
-                parent_id=directory_id,
-                name=file_name,
-                size=blob_size,
-                md5=md5,
-                storage_key=inner_name,
-            )
-            new_file = upsert_result.node
+                if self._is_commit_over_quota(
+                    configured_limit, current_used, net_change
+                ):
+                    is_over_quota = True
+                else:
+                    is_over_quota = False
+                    upsert_result = await self._upsert_vfs_file(
+                        vfs=vfs,
+                        user_id=user_id,
+                        parent_id=directory_id,
+                        name=file_name,
+                        size=blob_size,
+                        md5=md5,
+                        storage_key=inner_name,
+                    )
+                    new_file = upsert_result.node
+
+            if is_over_quota:
+                await self.cleanup_unreferenced_blobs({inner_name})
+                raise QuotaExceeded("Storage quota exceeded", ErrorCode.QUOTA_EXCEEDED)
+
+        if file_name.lower().endswith(".note"):
+            record_note_upload(source=NoteUploadSource.WEB)
 
         await self._cleanup_superseded_artifacts(upsert_result)
 
         # Emit domain events (fire and forget)
         if self.event_bus:
             full_path = await self.get_full_path_by_node(user_id, new_file.id)
-            if file_name.endswith(".note"):
+            await self._publish_file_upsert_events(
+                user_id=user_id,
+                upsert_result=upsert_result,
+                vfs_full_path=full_path,
+                note_file_path=full_path,
+                defer_note_processing=False,
+            )
+
+    async def _publish_file_upsert_events(
+        self,
+        *,
+        user_id: int,
+        upsert_result: _FileUpsertResult,
+        vfs_full_path: str,
+        note_file_path: str,
+        defer_note_processing: bool,
+    ) -> None:
+        """Publish VFS create/content-update and note processing events for a committed file upload."""
+        if not self.event_bus:
+            return
+        node = upsert_result.node
+        if upsert_result.was_existing:
+            if upsert_result.previous_md5 != node.md5:
                 await self.event_bus.publish(
-                    NoteUpdatedEvent(
-                        file_id=new_file.id, user_id=user_id, file_path=full_path
+                    VfsContentUpdatedEvent(
+                        user_id=user_id,
+                        item_id=node.id,
+                        parent_id=node.directory_id,
+                        name=node.file_name,
+                        full_path=vfs_full_path,
+                        size=node.size,
+                        old_md5=upsert_result.previous_md5,
+                        new_md5=node.md5,
                     )
                 )
+        else:
             await self.event_bus.publish(
                 VfsItemCreatedEvent(
                     user_id=user_id,
-                    item_id=new_file.id,
-                    parent_id=new_file.directory_id,
-                    name=new_file.file_name,
+                    item_id=node.id,
+                    parent_id=node.directory_id,
+                    name=node.file_name,
                     is_folder=False,
-                    full_path=full_path,
-                    size=new_file.size,
-                    md5=new_file.md5,
+                    full_path=vfs_full_path,
+                    size=node.size,
+                    md5=node.md5,
+                )
+            )
+        if node.file_name.endswith(".note"):
+            await self.event_bus.publish(
+                NoteUpdatedEvent(
+                    file_id=node.id,
+                    user_id=user_id,
+                    file_path=note_file_path,
+                    defer_processing=defer_note_processing,
                 )
             )
 
@@ -491,6 +675,7 @@ class FileService:
     ) -> _FileUpsertResult:
         """Create or update a VFS file node and record any superseded artifacts to clean up."""
         existing = await vfs.get_active_file(user_id, parent_id, name)
+        was_existing = existing is not None
         old_storage_key: str | None = existing.storage_key if existing else None
         old_md5: str | None = existing.md5 if existing else None
 
@@ -514,6 +699,8 @@ class FileService:
             node=new_file,
             superseded_storage_key=superseded_storage_key,
             superseded_md5=superseded_md5,
+            was_existing=was_existing,
+            previous_md5=old_md5,
         )
 
     async def _cleanup_superseded_artifacts(
@@ -534,11 +721,11 @@ class FileService:
     async def _delete_conversion_blobs(
         self, user_id: int, file_id: int, file_md5: str
     ) -> None:
-        """Delete cached on-demand PDF conversion blob for a specific file MD5."""
-        pdf_key = get_conversion_pdf_path(
+        """Delete cached on-demand PDF conversion blobs for a specific file MD5."""
+        prefix = get_conversion_pdf_prefix(
             user_id=user_id, file_id=file_id, file_md5=file_md5
         )
-        if await self.blob_storage.exists(CACHE_BUCKET, pdf_key):
+        for pdf_key in await self.blob_storage.list_blobs(CACHE_BUCKET, prefix):
             try:
                 await self.blob_storage.delete(CACHE_BUCKET, pdf_key)
             except (FileNotFoundError, OSError) as e:
@@ -699,6 +886,39 @@ class FileService:
             vfs = VirtualFileSystem(session)
             return await vfs.get_total_usage(user_id)
 
+    async def get_storage_quota(self, user: str) -> int:
+        """Get effective total storage capacity in bytes for a specific user.
+
+        Returns the user's configured byte cap when set (> 0), or ``used + available_disk``
+        when uncapped (falling back to ``FALLBACK_QUOTA`` if backend free space is unknown).
+        """
+        user_id, configured_limit = await self._resolve_user_quota(user)
+        if configured_limit > 0:
+            return configured_limit
+
+        available_disk = self.blob_storage.get_available_bytes()
+        if available_disk is None:
+            return FALLBACK_QUOTA
+
+        async with self.session_manager.session() as session:
+            vfs = VirtualFileSystem(session)
+            current_used = await vfs.get_total_usage(user_id)
+        return current_used + max(0, available_disk)
+
+    async def _resolve_user_quota(self, user: str) -> tuple[int, int]:
+        """Resolve user ID and configured byte quota via UserService (0 when uncapped)."""
+        user_do = await self.user_service.get_user_by_email(user)
+        if not user_do:
+            raise ValueError(f"User {user} not found")
+        if user_do.total_capacity:
+            try:
+                parsed = int(user_do.total_capacity)
+                if parsed > 0:
+                    return user_do.id, parsed
+            except (ValueError, TypeError):
+                pass
+        return user_do.id, max(UNLIMITED_QUOTA, self.default_user_quota)
+
     async def is_empty(self, user: str) -> bool:
         """Check if user storage is empty using VFS."""
         user_id = await self.user_service.get_user_id(user)
@@ -785,34 +1005,12 @@ class FileService:
             original_name = node.file_name
             original_full_path = await vfs.get_full_path(user_id, node.id)
 
-            # Resolve destination parent
-            clean_to_path = to_path.strip("/")
-            parent_id = 0
-            new_name = node.file_name
-
-            if clean_to_path:
-                dest_node = await vfs.resolve_path(user_id, clean_to_path)
-                if dest_node and dest_node.is_folder == "Y":
-                    # Destination is an existing folder, move INTO it
-                    parent_id = dest_node.id
-                else:
-                    # Destination is a new path (rename)
-                    parts = clean_to_path.rsplit("/", 1)
-                    if len(parts) == 2:
-                        parent_path, new_name = parts
-                        parent_id = await vfs.ensure_directory_path(
-                            user_id, parent_path
-                        )
-                    else:
-                        new_name = parts[0]
-                        parent_id = 0
-
-            new_node = await vfs.move_node(
-                user_id, item_id, parent_id, new_name, autorename
+            new_node = await vfs.move_node_to_path(
+                user_id, item_id, to_path, autorename
             )
 
             if not new_node:
-                raise FileError(f"Moving item {item_id} to {parent_id} failed")
+                raise FileError(f"Moving item {item_id} to {to_path} failed")
             # Re-fetch the new full path for simplicity rather than trying to
             # rebuild it.
             full_path = await vfs.get_full_path(user_id, new_node.id)

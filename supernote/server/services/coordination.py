@@ -1,4 +1,13 @@
-import logging
+"""Distributed lock and TTL key-value coordination service backed by SQLite.
+
+Defines `CoordinationService` and `SqliteCoordinationService`, which persist
+expiring key-value pairs in `supernote.server.db.models.kv.KeyValueDO`. Used across
+the server for stateful JWT session tokens (`supernote.server.services.user.UserService`),
+OAuth 2.1 authorization codes and tokens (`supernote.server.components.oauth.provider`), single-use
+signed URL nonces (`supernote.server.utils.url_signer.UrlSigner`), rate limiting
+(`supernote.server.utils.rate_limit.RateLimiter`), and queue pause state.
+"""
+
 import time
 from abc import ABC, abstractmethod
 
@@ -6,8 +15,6 @@ from sqlalchemy import delete, select, text
 
 from supernote.server.db.models.kv import KeyValueDO
 from supernote.server.db.session import DatabaseSessionManager
-
-logger = logging.getLogger(__name__)
 
 DEFAULT_TTL = 31536000  # 1 year in seconds
 

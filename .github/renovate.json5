@@ -7,6 +7,9 @@
   assignees: [
     'allenporter',
   ],
+  labels: [
+    'dependencies',
+  ],
   packageRules: [
     {
       description: 'Silent automerge for minor, patch, pin, and digest updates',
@@ -29,9 +32,63 @@
       assignees: [],
     },
     {
+      description: 'Group TypeScript updates across pre-commit and GitHub Actions workflows',
+      matchPackageNames: ['typescript'],
+      groupName: 'typescript',
+      automerge: true,
+      automergeType: 'branch',
+      assignees: [],
+    },
+    {
+      description: 'Group Biome updates across pre-commit and GitHub Actions workflows',
+      matchPackageNames: ['@biomejs/biome'],
+      groupName: 'biome',
+      automerge: true,
+      automergeType: 'branch',
+      assignees: [],
+    },
+    {
       description: 'Manage .python-version via cookiecutter/cruft template instead of Renovate',
       matchManagers: ['pyenv'],
       enabled: false,
+    },
+  ],
+  // Note: cdn.tailwindcss.com is pinned at 3.4.17 (the final v3 Play CDN build
+  // published by Tailwind Labs; 3.4.18+ exist on npm but return console.error on cdn.tailwindcss.com).
+  customManagers: [
+    {
+      customType: 'regex',
+      description: 'Track unpkg ESM/script CDN versions in static HTML',
+      fileMatch: [
+        '^supernote/server/static/.*\\.html$',
+      ],
+      matchStrings: [
+        'https://unpkg\\.com/(?<depName>@?[^@/]+(?:/[^@/]+)?)@(?<currentValue>[^/"\'\\s]+)/',
+      ],
+      datasourceTemplate: 'npm',
+    },
+    {
+      customType: 'regex',
+      description: 'Track Socket.IO CDN versions in static HTML',
+      fileMatch: [
+        '^supernote/server/static/.*\\.html$',
+      ],
+      matchStrings: [
+        'https://cdn\\.socket\\.io/(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)/socket\\.io\\.min\\.js',
+      ],
+      depNameTemplate: 'socket.io-client',
+      datasourceTemplate: 'npm',
+    },
+    {
+      customType: 'regex',
+      description: 'Track npx --package npm versions in GitHub Actions workflows',
+      fileMatch: [
+        '^\\.github/workflows/.*\\.ya?ml$',
+      ],
+      matchStrings: [
+        '--package=(?<depName>@?[^@\\s"\']+)@(?<currentValue>[0-9]+(?:\\.[0-9]+){0,2})',
+      ],
+      datasourceTemplate: 'npm',
     },
   ],
   pip_requirements: {

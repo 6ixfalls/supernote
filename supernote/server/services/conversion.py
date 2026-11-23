@@ -1,4 +1,12 @@
-"""Service for on-demand notebook PNG and PDF conversions and cache lookup."""
+"""On-demand `.note` to PNG and PDF conversion service with blob cache lookup.
+
+`ConversionService` serves page PNG previews and multi-page vector PDF exports
+requested by hardware devices (`supernote.server.routes.file_device`), the Web UI
+(`supernote.server.routes.file_web`), and signed OSS URLs (`supernote.server.routes.oss`).
+It checks `CACHE_BUCKET` via `supernote.server.services.blob.BlobStorage` first and
+delegates missing page PNGs to `supernote.server.services.processor.ProcessorService`
+or renders PDFs in a worker thread via `supernote.notebook.converter.PdfConverter`.
+"""
 
 import asyncio
 from dataclasses import dataclass
@@ -83,13 +91,19 @@ class ConversionService:
                 return None
             return user_id, node
 
-    async def convert_note_to_png(self, user: str, file_id: int) -> list[int]:
-        """Ensure all pages of a note are converted to PNG in CACHE_BUCKET and return page numbers."""
+    async def convert_note_to_png(
+        self,
+        user: str,
+        file_id: int,
+        page_indices: set[int] | None = None,
+    ) -> list[int]:
+        """Ensure requested (or all) pages of a note are converted to PNG in CACHE_BUCKET and return page numbers."""
         await self._get_required_note_node(user, file_id)
 
         if not await self.processor_service.process_file(
             file_id,
             task_types={TaskType.PAGE_HASHING, TaskType.PNG_CONVERSION},
+            page_indices=page_indices,
         ):
             raise FileError(f"Failed to convert note file {file_id} to PNG")
 
@@ -102,6 +116,8 @@ class ConversionService:
                 )
                 .order_by(NotePageContentDO.page_index)
             )
+            if page_indices is not None:
+                stmt = stmt.where(NotePageContentDO.page_index.in_(page_indices))
             return list((await session.execute(stmt)).scalars().all())
 
     async def get_note_png_page(
@@ -150,11 +166,16 @@ class ConversionService:
             _convert_note_to_pdf_sync, blob_content, page_no_list
         )
         pdf_storage_key = get_conversion_pdf_path(
-            user_id=user_id, file_id=file_id, file_md5=node.md5
+            user_id=user_id,
+            file_id=file_id,
+            file_md5=node.md5,
+            page_no_list=page_no_list,
         )
         await self.blob_storage.put(CACHE_BUCKET, pdf_storage_key, pdf_bytes)
 
-    async def get_note_pdf(self, user: str, file_id: int) -> ConvertedBlob | None:
+    async def get_note_pdf(
+        self, user: str, file_id: int, page_no_list: list[int] | None = None
+    ) -> ConvertedBlob | None:
         """Resolve the CACHE_BUCKET blob and user-friendly filename for a converted note PDF."""
         resolved = await self._get_note_node_or_none(user, file_id)
         if not resolved:
@@ -164,7 +185,10 @@ class ConversionService:
             return None
 
         pdf_storage_key = get_conversion_pdf_path(
-            user_id=user_id, file_id=file_id, file_md5=node.md5
+            user_id=user_id,
+            file_id=file_id,
+            file_md5=node.md5,
+            page_no_list=page_no_list,
         )
         if not await self.blob_storage.exists(CACHE_BUCKET, pdf_storage_key):
             return None

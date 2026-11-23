@@ -1,3 +1,12 @@
+"""Stage 2 of the `.note` processing pipeline: per-page PNG rasterization (`TaskType.PNG_CONVERSION`).
+
+`PngConversionModule` converts modified `.note` pages into PNG images using
+`supernote.notebook.converter.ImageConverter` in a thread pool and stores the rendered
+bytes in `CACHE_BUCKET` (`supernote.server.services.blob.BlobStorage`). These cached PNGs
+serve both Web UI page previews and the downstream `supernote.server.services.processor_modules.ocr.OcrModule`.
+See `supernote.guides.note_processing_design`.
+"""
+
 import asyncio
 import io
 import logging
@@ -62,6 +71,32 @@ class PngConversionModule(ProcessorModule):
             if not await self.file_service.blob_storage.exists(CACHE_BUCKET, png_path):
                 return True
         return False
+
+    async def cleanup_file(
+        self,
+        file_id: int,
+        user_id: int,
+        session_manager: DatabaseSessionManager,
+    ) -> None:
+        """Delete cached page PNG blobs for a deleted note."""
+        async with session_manager.session() as session:
+            result = await session.execute(
+                select(NotePageContentDO.page_id).where(
+                    NotePageContentDO.file_id == file_id
+                )
+            )
+            page_ids = result.scalars().all()
+
+        for page_id in page_ids:
+            if not page_id:
+                continue
+            png_path = get_page_png_path(file_id, page_id)
+            try:
+                await self.file_service.blob_storage.delete(CACHE_BUCKET, png_path)
+            except (FileNotFoundError, OSError) as e:
+                logger.warning(
+                    f"Failed to delete PNG for {file_id} page {page_id}: {e}"
+                )
 
     async def process(
         self,

@@ -1,4 +1,4 @@
-"""Shared fixtures for CLI tests backed by the shared in-process server harness."""
+"""CLI-specific fixtures layered onto the root in-process server harness."""
 
 import hashlib
 import os
@@ -13,49 +13,10 @@ from supernote.models.user import UserRegisterDTO
 from supernote.server.config import AiConfig, AuthConfig, ModelConfig, ServerConfig
 from supernote.server.db.session import DatabaseSessionManager
 from supernote.server.services.user import UserService
-from tests.server.conftest import (
-    TEST_PASSWORD,
-    TEST_USERNAME,
-    _session_manager_shared,
-    additional_users,
-    auth_headers_fixture,
-    client_fixture,
-    coordination_service,
-    ignore_aiossqllite_debug,
-    mcp_port,
-    patch_run_migrations,
-    server_port,
-    session_manager_fixture,
-    storage_root,
-    test_users,
-    user_service,
-)
+from tests.fixtures.server import TEST_PASSWORD, TEST_USERNAME
 
 ADMIN_EMAIL = TEST_USERNAME
 ADMIN_PASSWORD = TEST_PASSWORD
-
-__all__ = [
-    "ADMIN_EMAIL",
-    "ADMIN_PASSWORD",
-    "CliServerEnv",
-    "_session_manager_shared",
-    "additional_users",
-    "auth_headers_fixture",
-    "cli_env",
-    "client_fixture",
-    "coordination_service",
-    "create_test_user",
-    "ignore_aiossqllite_debug",
-    "isolated_cli_home",
-    "mcp_port",
-    "patch_run_migrations",
-    "server_config",
-    "server_port",
-    "session_manager_fixture",
-    "storage_root",
-    "test_users",
-    "user_service",
-]
 
 
 @dataclass
@@ -81,6 +42,7 @@ def isolated_cli_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def server_config(
     storage_root: Path,
     server_port: int,
+    mcp_enabled: bool,
     mcp_port: int,
 ) -> ServerConfig:
     """Create a ServerConfig with fake AI models enabled for CLI tests."""
@@ -88,6 +50,7 @@ def server_config(
         host="127.0.0.1",
         storage_dir=str(storage_root),
         port=server_port,
+        mcp_enabled=mcp_enabled,
         mcp_port=mcp_port,
         _mcp_base_url=f"http://127.0.0.1:{mcp_port}",
         auth=AuthConfig(

@@ -1,4 +1,11 @@
-"""Library for authentication."""
+"""Authentication token providers for the Supernote HTTP client.
+
+This module defines the `supernote.client.auth.AbstractAuth` interface consumed by
+`supernote.client.client.Client` and `supernote.client.Supernote.from_auth` (including optional
+reactive token rotation via `AbstractAuth.async_refresh_access_token`), along with concrete
+implementations for static in-memory tokens (`ConstantAuth`) and local disk-cached tokens
+(`FileCacheAuth`, stored in `~/.cache/supernote.pkl`).
+"""
 
 import logging
 import os
@@ -7,6 +14,12 @@ from abc import ABC, abstractmethod
 
 _LOGGER = logging.getLogger(__name__)
 
+__all__ = [
+    "AbstractAuth",
+    "ConstantAuth",
+    "FileCacheAuth",
+]
+
 
 class AbstractAuth(ABC):
     """Authentication library."""
@@ -14,6 +27,20 @@ class AbstractAuth(ABC):
     @abstractmethod
     async def async_get_access_token(self) -> str:
         """Return a valid access token."""
+
+    async def async_refresh_access_token(self, failed_token: str) -> bool:
+        """Refresh the access token after a token-invalid error.
+
+        Args:
+            failed_token: The exact non-empty token sent on the failed request,
+                allowing implementations with a refresh lock to skip redundant
+                refreshes if a concurrent caller already rotated the token.
+
+        Returns:
+            True if a refreshed token is now available and the caller should
+            retry once.
+        """
+        return False
 
 
 class ConstantAuth(AbstractAuth):
@@ -80,8 +107,16 @@ class FileCacheAuth(AbstractAuth):
         self._host = host
 
         # Ensure directory exists
-        os.makedirs(os.path.dirname(self._cache_path), exist_ok=True)
+        cache_dir = os.path.dirname(self._cache_path)
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
 
-        with open(self._cache_path, "wb") as f:
+        fd = os.open(
+            self._cache_path,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        with os.fdopen(fd, "wb") as f:
             data = {"access_token": token, "host": host}
             pickle.dump(data, f)
+        os.chmod(self._cache_path, 0o600)
